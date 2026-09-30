@@ -1,0 +1,228 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <parent>
+        <groupId>org.atmosphere</groupId>
+        <artifactId>atmosphere-project</artifactId>
+        <version>4.0.72-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <modelVersion>4.0.0</modelVersion>
+    <artifactId>atmosphere-spring-boot3-starter</artifactId>
+    <packaging>jar</packaging>
+    <name>atmosphere-spring-boot3-starter</name>
+    <description>Spring Boot 3.5 auto-configuration for Atmosphere Framework</description>
+    <url>https://github.com/Atmosphere/atmosphere</url>
+
+    <properties>
+        <atmosphere.module.name>org.atmosphere.spring.boot3</atmosphere.module.name>
+        <!-- 3.5.15 closes spring-boot-autoconfigure CVE-2026-41001; 3.5.14 closed spring-boot-starter-actuator
+             CVE-2026-22733 + spring-boot CVE-2026-40973, plus assertj-core
+             CVE-2026-24400 by pulling 3.27.7. -->
+        <spring-boot.version>3.5.15</spring-boot.version>
+        <spring-framework.version>6.2.19</spring-framework.version>
+        <!-- The root POM force-pins tomcat-embed-core to its Tomcat 11 baseline;
+             without this override the test classpath boots an 11.0.x core against
+             Boot 3.5's 10.1.x tomcat-embed-el / -websocket (the SocketWrapperBase
+             skew samples/spring-boot-chat's spring-boot3 profile documents). Keep
+             core on the 10.1 line of Boot 3.5.15's <tomcat.version> (10.1.55);
+             10.1.60 leads it to close CVE-2026-65182 / CVE-2026-65905 /
+             CVE-2026-68525 (GHSA lists 10.1.58 as first patched, but that
+             release vote failed and 10.1.59 is the first published fix); Boot
+             3.5.16 still manages the vulnerable 10.1.55. -->
+        <tomcat-version>10.1.60</tomcat-version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- Spring Framework BOM imported BEFORE spring-boot-dependencies
+                 so 6.2.19 wins over Spring Boot 3.5.x's older transitive pin.
+                 6.2.19 closes the spring-webmvc GHSA-3chg-m5w7-qfv5 (high) +
+                 GHSA-x23c-287f-qqv5 (high) batch, the spring-expression
+                 GHSA-r5w3-xv2f-j59q SpEL advisory and spring-core
+                 GHSA-659m-px2c-25wj, on top of 6.2.18's static-resource DoS
+                 + cache-poisoning + Multipart Temp Files DoS fixes.
+                 Maven first-declared-wins for imported BOMs. -->
+            <dependency>
+                <groupId>org.springframework</groupId>
+                <artifactId>spring-framework-bom</artifactId>
+                <version>${spring-framework.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-dependencies</artifactId>
+                <version>${spring-boot.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <!-- Override annotations to 2.21 for compatibility with Jackson 3.x databind (requires JsonSerializeAs) -->
+            <dependency>
+                <groupId>com.fasterxml.jackson.core</groupId>
+                <artifactId>jackson-annotations</artifactId>
+                <version>2.21</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-runtime</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-autoconfigure</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-configuration-processor</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>jakarta.servlet</groupId>
+            <artifactId>jakarta.servlet-api</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-annotations</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Spring Boot 3.x: spring-web is needed for @RestController (in SB4 it comes via spring-boot-web-server) -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-web</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Spring Boot 3.x: health is part of spring-boot-actuator (not separate spring-boot-health) -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-actuator</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-actuator-autoconfigure</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-core</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-api</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>jakarta.inject</groupId>
+            <artifactId>jakarta.inject-api</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-durable-sessions</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-grpc</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-ai</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-agent</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Bundled crash-durable SQLite effect journal for durable agent runs.
+             Optional: when absent and durable runs are enabled, the autoconfig
+             falls back to the in-memory journal and logs that it is not
+             crash-durable (Correctness Invariant #5). -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-checkpoint</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-coordinator</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-admin</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-mcp</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-a2a</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-agui</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- atmosphere-checkpoint declares sqlite-jdbc <optional> so it does not
+             transit; the durable-run SQLite journal test needs the driver. Same
+             version modules/checkpoint compiles against (not centrally managed —
+             keep in sync with modules/checkpoint/pom.xml). -->
+        <dependency>
+            <groupId>org.xerial</groupId>
+            <artifactId>sqlite-jdbc</artifactId>
+            <version>3.53.2.0</version>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>

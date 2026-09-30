@@ -1,0 +1,176 @@
+import { test, expect } from '@playwright/test';
+import { startSample, SAMPLES, type SampleServer } from './fixtures/sample-server';
+
+let server: SampleServer;
+
+test.beforeAll(async () => {
+  server = await startSample(SAMPLES['spring-boot-rag-chat']);
+});
+
+test.afterAll(async () => {
+  await server?.stop();
+});
+
+test.describe('RAG Chat', () => {
+  test('page loads with AI chat layout', async ({ page }) => {
+    await page.goto(server.baseUrl + '/atmosphere/console/');
+    await expect(page.getByTestId('chat-layout')).toBeVisible();
+    await expect(page.getByTestId('chat-input')).toBeVisible();
+    await expect(page.getByTestId('chat-send')).toBeVisible();
+  });
+
+  test('send button is disabled when input is empty', async ({ page }) => {
+    await page.goto(server.baseUrl + '/atmosphere/console/');
+    await expect(page.getByTestId('chat-send')).toBeDisabled();
+  });
+
+  test('user can send a prompt and receive streaming response', async ({ page }) => {
+    await page.goto(server.baseUrl + '/atmosphere/console/');
+    await page.getByTestId('chat-input').fill('What is Atmosphere?');
+    await page.getByTestId('chat-send').click();
+
+    // The user's message renders in its own bubble. Target .message--user so the
+    // assertion is unique — the keyless demo reply echoes the prompt text, so a
+    // bare getByText matches both the user bubble and the assistant reply
+    // (strict-mode violation).
+    await expect(page.locator('.message--user').filter({ hasText: 'What is Atmosphere?' })).toBeVisible();
+
+    // Should receive a response (demo or real API)
+    await expect(page.locator('.message--assistant').last())
+      .not.toBeEmpty({ timeout: 30_000 });
+  });
+
+  test('input clears after sending', async ({ page }) => {
+    await page.goto(server.baseUrl + '/atmosphere/console/');
+    await page.getByTestId('chat-input').fill('Test message');
+    await page.getByTestId('chat-send').click();
+
+    await expect(page.getByTestId('chat-input')).toHaveValue('');
+  });
+
+  test('RAG-specific prompt receives a response', async ({ page }) => {
+    await page.goto(server.baseUrl + '/atmosphere/console/');
+    await page.getByTestId('chat-input').fill('Tell me about RAG');
+    await page.getByTestId('chat-send').click();
+
+    // Should receive a response (demo or real API)
+    await expect(page.locator('.message--assistant').last())
+      .not.toBeEmpty({ timeout: 30_000 });
+  });
+
+  test('transport-specific prompt receives a response', async ({ page }) => {
+    await page.goto(server.baseUrl + '/atmosphere/console/');
+    await page.getByTestId('chat-input').fill('What about WebSocket transports?');
+    await page.getByTestId('chat-send').click();
+
+    // Should receive a response (demo or real API)
+    await expect(page.locator('.message--assistant').last())
+      .not.toBeEmpty({ timeout: 30_000 });
+  });
+
+  test('multi-turn conversation preserves history', async ({ page }) => {
+    await page.goto(server.baseUrl + '/atmosphere/console/');
+
+    // First message
+    await page.getByTestId('chat-input').fill('What is Atmosphere?');
+    await page.getByTestId('chat-send').click();
+    await expect(page.locator('.message--assistant').last())
+      .not.toBeEmpty({ timeout: 30_000 });
+
+    // Wait for streaming to finish (input re-enabled)
+    await expect(page.getByTestId('chat-input')).toBeEnabled({ timeout: 15_000 });
+
+    // Second message
+    await page.getByTestId('chat-input').fill('Tell me about RAG');
+    await page.getByTestId('chat-send').click();
+    await expect(page.locator('.message--assistant').last())
+      .not.toBeEmpty({ timeout: 30_000 });
+
+    // Both user messages must still be visible (history preserved). Target the
+    // user bubbles specifically — the demo reply echoes the prompt text, so a
+    // bare getByText would match two elements.
+    await expect(page.locator('.message--user').filter({ hasText: 'What is Atmosphere?' })).toBeVisible();
+    await expect(page.locator('.message--user').filter({ hasText: 'Tell me about RAG' })).toBeVisible();
+  });
+
+  // Non-flaky regression for the rag-chat failure: a prompt must produce an
+  // assistant response in the browser. Pre-fix, chat ran on the SpringAI
+  // runtime and crashed on the Gemini OpenAI-compat tool-call deltas before any
+  // answer streamed back; routing through the built-in runtime (pinned by the
+  // RuntimeSelectionTest unit test) makes the end-to-end flow work. With no API
+  // key in CI, the no-key DemoAgentRuntime fallback keeps the response
+  // deterministic so this is safe to run.
+  test('prompt produces an assistant response (browser e2e)', async ({ page }) => {
+    await page.goto(server.baseUrl + '/atmosphere/console/');
+    await page.getByTestId('chat-input').fill('What does the Atmosphere RAG agent do?');
+    await page.getByTestId('chat-send').click();
+
+    await expect(page.locator('.message--assistant').last())
+      .not.toBeEmpty({ timeout: 30_000 });
+  });
+
+  // Runtime-truth regression: the RAG chat endpoint declares a ContextProvider,
+  // so Atmosphere wraps it with the default-on injection-safety screen and the
+  // console /api/console/info reports it as live. Deterministic (no LLM call),
+  // and it asserts the specific feature — the screen is actually wired, not just
+  // configured. If the wiring regresses, ragSafety disappears and this fails.
+  test('console info advertises the active RAG injection-safety screen', async ({ request }) => {
+    const res = await request.get(server.baseUrl + '/api/console/info');
+    expect(res.ok()).toBeTruthy();
+    const info = await res.json();
+    expect(info.ragSafety).toBeTruthy();
+    expect(info.ragSafety.active).toBe(true);
+    expect(info.ragSafety.tier).toBe('RULE_BASED');
+    expect(info.ragSafety.breach).toBe('DROP');
+  });
+
+  // Runtime truth: the sample exposes the actuator metrics endpoint
+  // (management.endpoints.web.exposure.include: "*"), so the server resolves the
+  // plane off the web-exposure registry and names both the path and the wire
+  // format. A host that ships the MetricsEndpoint bean without exposing it must
+  // report hasMetrics false, which is why bean presence is not the gate.
+  test('console info resolves the live actuator metrics plane', async ({ request }) => {
+    const res = await request.get(server.baseUrl + '/api/console/info');
+    expect(res.ok()).toBeTruthy();
+    const info = await res.json();
+    expect(info.hasMetrics).toBe(true);
+    expect(info.metricsFormat).toBe('actuator');
+    expect(info.metricsPath).toBe('/actuator/metrics');
+
+    // The advertised path must genuinely answer — the whole point of the flag.
+    const metrics = await request.get(server.baseUrl + info.metricsPath);
+    expect(metrics.ok()).toBeTruthy();
+  });
+
+  // The Observability tab must decompose a meter by its tags and name the
+  // statistic it shows, not list meter names against measurements[0].
+  // atmosphere.ai.input.tokens is tagged by `stage`, and InputAssemblyTelemetry
+  // emits before the runtime is dispatched — so the rows exist on the keyless
+  // demo path too, where the turn itself fails and the latency timers (which
+  // only record on completion) are legitimately absent. Header text is matched
+  // case-insensitively: the panel uppercases column labels in CSS, so the
+  // rendered text is "STAGE" even though the tag is `stage`.
+  test('observability tab renders a tag-decomposed token metric', async ({ page }) => {
+    await page.goto(server.baseUrl + '/atmosphere/console/');
+    await page.getByTestId('chat-input').fill('What is retrieval augmented generation?');
+    await page.getByTestId('chat-send').click();
+    await expect(page.locator('.message--assistant').last())
+      .not.toBeEmpty({ timeout: 30_000 });
+
+    await page.getByTestId('tab-observability').click();
+    const panel = page.getByTestId('meter-atmosphere.ai.input.tokens');
+    await expect(panel).toBeVisible({ timeout: 20_000 });
+
+    // The split tag names the first column; the second names the statistic the
+    // value column holds ("total" for a counter), so no number is ever rendered
+    // under a label it does not belong to.
+    await expect(panel.locator('th').first()).toHaveText(/^stage$/i);
+    await expect(panel.locator('th').nth(1)).toHaveText(/^total$/i);
+
+    // One row per stage the turn actually used — the decomposition itself.
+    const stages = await panel.getByTestId('series-label').allInnerTexts();
+    expect(stages.map(s => s.trim())).toContain('user_message');
+    // Each decomposed row carries its own value, not an em-dash placeholder.
+    await expect(panel.getByTestId('series-headline').first()).not.toHaveText('—');
+  });
+});

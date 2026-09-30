@@ -1,0 +1,1517 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.ai;
+
+import org.atmosphere.ai.approval.ApprovalRegistry;
+import org.atmosphere.ai.approval.ApprovalStrategy;
+import org.atmosphere.ai.tool.ToolRegistry;
+import org.atmosphere.cpr.AtmosphereResource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+
+/**
+ * A {@link StreamingSession} wrapper that adds {@link #stream(String)} support.
+ * Created by the {@code @AiEndpoint} infrastructure to enable the simple pattern:
+ *
+ * <pre>{@code
+ * @Prompt
+ * public void onPrompt(String message, StreamingSession session) {
+ *     session.stream(message);
+ * }
+ * }</pre>
+ *
+ * <p>When {@code stream(message)} is called, this session:</p>
+ * <ol>
+ *   <li>Loads conversation history from {@link AiConversationMemory} (if enabled)</li>
+ *   <li>Builds an {@link AiRequest} from the message + stored system prompt + model + history</li>
+ *   <li>Runs {@link AiInterceptor#preProcess} in FIFO order</li>
+ *   <li>Wraps the delegate in a {@link MemoryCapturingSession} to capture the response</li>
+ *   <li>Wraps the {@link AiRequest} in an {@link AgentExecutionContext} and delegates to
+ *       {@link AgentRuntime#executeWithHandle(AgentExecutionContext, StreamingSession)},
+ *       retaining the returned {@link ExecutionHandle} so a client disconnect can cancel
+ *       the in-flight upstream call</li>
+ *   <li>Runs {@link AiInterceptor#beforeCompletion} in LIFO order from inside the
+ *       terminal {@link #complete()} — before the terminal complete frame is
+ *       forwarded, while the delegate still accepts outbound frames</li>
+ *   <li>Runs {@link AiInterceptor#postProcess} in LIFO order, after the terminal
+ *       frame has been forwarded</li>
+ * </ol>
+ */
+public class AiStreamingSession implements StreamingSession {
+
+    private static final Logger logger = LoggerFactory.getLogger(AiStreamingSession.class);
+
+    /**
+     * Active sessions keyed by {@link AtmosphereResource#uuid()}. The value is a
+     * {@link java.util.concurrent.CopyOnWriteArrayList} because Atmosphere
+     * explicitly allows overlapping prompts on a single resource (AG-UI,
+     * streaming-chat): two concurrent {@code @Prompt} invocations register two
+     * sessions under the same UUID, and registering the second must not clobber
+     * the first. Identity-checked removal on complete/error ensures prompt A
+     * finishing after prompt B started does not remove B's mapping. Approval
+     * routing walks every session in the list for the target UUID and
+     * short-circuits only on {@link ApprovalRegistry.ResolveResult#RESOLVED}.
+     */
+    private static final ConcurrentHashMap<String, java.util.concurrent.CopyOnWriteArrayList<AiStreamingSession>> ACTIVE_SESSIONS =
+            new ConcurrentHashMap<>();
+
+    /**
+     * Request attribute key under which the active {@link StreamingSession} is stored.
+     * The stored value is the composed decorator target for the current turn — the
+     * same session {@link AiInterceptor#beforeCompletion} receives as a parameter.
+     * By {@link AiInterceptor#postProcess} time the terminal frame has already been
+     * forwarded and the session drops outbound frames, so client-visible metadata
+     * belongs in {@code beforeCompletion}.
+     */
+    public static final String STREAMING_SESSION_ATTR = "ai.streaming.session";
+
+    private final StreamingSession delegate;
+    private final AgentRuntime runtime;
+    private final String systemPrompt;
+    private final String model;
+    private final List<AiInterceptor> interceptors;
+    private final AtmosphereResource resource;
+    private final AiConversationMemory memory;
+    private final ToolRegistry toolRegistry;
+    private final List<AiGuardrail> guardrails;
+    private final List<ContextProvider> contextProviders;
+    private final AiMetrics metrics;
+    private final Class<?> responseType;
+    private final AtomicReference<PostPromptHook> preStreamHook = new AtomicReference<>();
+    // Multi-modal input parts decoded from the inbound frame by the @AiEndpoint
+    // handler (MultiModalInput.decode). Consumed once by the next stream(message)
+    // call so a @Prompt method that simply calls session.stream(text) still
+    // threads the uploaded image/audio onto the model request. One-shot: reset to
+    // empty on read so parts never leak into a subsequent turn on the same session.
+    private final AtomicReference<List<Content>> pendingInputParts =
+            new AtomicReference<>(List.of());
+    private final AtomicBoolean handoffInProgress = new AtomicBoolean();
+    /**
+     * Per-{@code stream()} state consumed atomically ({@code getAndSet(null)})
+     * by the first terminal call. {@link #complete()} / {@link #complete(String)}
+     * consume it and run {@link AiInterceptor#beforeCompletion} while the
+     * delegate still accepts outbound frames; {@link #error(Throwable)} consumes
+     * it WITHOUT firing — no hook on error, by contract — so a later
+     * {@code complete()} from a runtime bridge (caller-initiated cancel completes
+     * the session after the error) cannot fire the hook for a turn that never
+     * completed. Re-armed on every {@code stream()} invocation — a
+     * {@code @Prompt} body may call {@code stream()} twice on one session and
+     * the hook must fire on each turn, exactly once.
+     */
+    private final AtomicReference<BeforeCompletionContext> beforeCompletionContext =
+            new AtomicReference<>();
+    /**
+     * Latched while {@link #fireBeforeCompletion} runs the hooks so a hook
+     * that (illegally) invokes a terminal method on its session cannot
+     * re-enter terminal processing — the re-entrant call logs WARN and
+     * returns, and the OUTER invocation forwards the terminal frame once the
+     * hooks finish. Hooks must not invoke terminal methods; see
+     * {@link AiInterceptor#beforeCompletion}.
+     */
+    private final AtomicBoolean firingBeforeCompletion = new AtomicBoolean();
+    private final ApprovalRegistry approvalRegistry = new ApprovalRegistry();
+    /**
+     * Session-scoped resources registered via {@link #onTerminate(AutoCloseable)},
+     * closed exactly once when the session reaches a terminal state. Copy-on-write
+     * because registration (a @Prompt VT) and teardown (complete/error, possibly a
+     * different thread) race.
+     */
+    private final java.util.concurrent.CopyOnWriteArrayList<AutoCloseable> terminateHooks =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
+    private final AtomicBoolean terminated = new AtomicBoolean();
+    /** Endpoint-configured prompt cache policy from {@code @AiEndpoint.promptCache()}. */
+    private volatile org.atmosphere.ai.llm.CacheHint.CachePolicy cachePolicy;
+    /**
+     * Endpoint-level response cache. Mirrors {@link AiPipeline}'s cache source so
+     * the same {@code atmosphere.ai.cache.*} configuration reaches both dispatch
+     * paths (Correctness Invariant #7). Null disables the gate, which is the
+     * default — an endpoint with no cache installed behaves exactly as before.
+     */
+    private volatile org.atmosphere.ai.cache.ResponseCache responseCache;
+    private volatile java.time.Duration responseCacheTtl = java.time.Duration.ofMinutes(5);
+    /** Endpoint-configured per-request retry policy from {@code @AiEndpoint.retry()}. */
+    private volatile org.atmosphere.ai.RetryPolicy endpointRetryPolicy;
+    /** Endpoint-scoped structured-output reprompt budget; 0 disables the loop. */
+    private volatile int endpointStructuredRetries;
+
+    /** Endpoint-scoped cap on tools injected per turn; 0 injects every tool. */
+    private volatile int endpointMaxToolsPerRequest;
+
+    /**
+     * Endpoint-scoped over-fetch + rerank retrieval policy resolved from
+     * {@code org.atmosphere.ai.rag.*} by the endpoint processor. The
+     * {@link RagRetrieval#disabled()} default preserves the legacy fetch-k
+     * behavior byte for byte — over-fetch only happens when a configured
+     * reranker will actually run.
+     */
+    private volatile RagRetrieval ragRetrieval = RagRetrieval.disabled();
+    /**
+     * Framework-scoped injectables stashed by the endpoint handler and
+     * threaded into {@code @AiTool} dispatch so tool methods can declare
+     * {@code AgentFleet}, {@code AgentIdentity}, etc. directly as parameters.
+     * Copied defensively by {@link #setInjectables(java.util.Map)}.
+     */
+    private volatile java.util.Map<Class<?>, Object> injectables = java.util.Map.of();
+
+    /**
+     * The runId assigned by {@code RunRegistry} when the endpoint handler
+     * registered this run; surfaced via {@link #runId()} so the client's
+     * first response carries the id and subsequent reconnects can reattach
+     * via {@code X-Atmosphere-Run-Id}.
+     */
+    private volatile String runId;
+
+    /**
+     * Handle returned by the runtime for the currently in-flight prompt.
+     * Captured inside {@link #stream(String)} so {@link #cancelInflight()}
+     * (called from the disconnect cleanup path) can abort the upstream LLM
+     * HTTP request and refund any tokens that would otherwise have been
+     * burned for a client who is no longer listening. Volatile because the
+     * disconnect path runs on a different thread (Atmosphere's lifecycle
+     * dispatcher) than the @Prompt VT.
+     */
+    private volatile ExecutionHandle currentHandle;
+
+    /**
+     * Latches a {@link #cancelInflight()} call that arrived before
+     * {@link #currentHandle} was published. Runtimes that publish their
+     * handle from a side channel (e.g. by completing a {@code CompletableFuture}
+     * inside {@code executeWithHandle}) can unblock the disconnect path
+     * before the @Prompt VT has assigned {@code this.currentHandle}. Without
+     * this latch the cancellation would be silently dropped and the VT would
+     * park on {@code whenDone().join()} forever. After assigning
+     * {@code currentHandle}, {@link #stream(String)} re-reads this flag and
+     * fires the cancel if it was set during the race window.
+     */
+    private final java.util.concurrent.atomic.AtomicBoolean cancelPending =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
+    /**
+     * Last-activity timestamp (epoch millis), refreshed on every delegated
+     * outbound call and on approval routing so {@link #sweepExpired} never
+     * reaps a session that is still in use. Package-private volatile so
+     * tests can age a session directly.
+     */
+    volatile long lastActivityMillis = System.currentTimeMillis();
+
+    /**
+     * @param delegate     the underlying streaming session
+     * @param runtime    the resolved AI support implementation
+     * @param systemPrompt the system prompt from {@code @AiEndpoint}
+     * @param model        the model name (may be null for provider default)
+     * @param interceptors the interceptor chain
+     * @param resource     the atmosphere resource for this client
+     */
+    public AiStreamingSession(StreamingSession delegate, AgentRuntime runtime,
+                              String systemPrompt, String model,
+                              List<AiInterceptor> interceptors,
+                              AtmosphereResource resource) {
+        this(delegate, runtime, systemPrompt, model, interceptors, resource, null,
+                null, List.of(), List.of(), AiMetrics.NOOP, null);
+    }
+
+    /**
+     * @param delegate     the underlying streaming session
+     * @param runtime    the resolved AI support implementation
+     * @param systemPrompt the system prompt from {@code @AiEndpoint}
+     * @param model        the model name (may be null for provider default)
+     * @param interceptors the interceptor chain
+     * @param resource     the atmosphere resource for this client
+     * @param memory       conversation memory (may be null if disabled)
+     */
+    public AiStreamingSession(StreamingSession delegate, AgentRuntime runtime,
+                              String systemPrompt, String model,
+                              List<AiInterceptor> interceptors,
+                              AtmosphereResource resource,
+                              AiConversationMemory memory) {
+        this(delegate, runtime, systemPrompt, model, interceptors, resource, memory,
+                null, List.of(), List.of(), AiMetrics.NOOP, null);
+    }
+
+    /**
+     * Full constructor with tools, guardrails, context providers, and metrics.
+     */
+    public AiStreamingSession(StreamingSession delegate, AgentRuntime runtime,
+                              String systemPrompt, String model,
+                              List<AiInterceptor> interceptors,
+                              AtmosphereResource resource,
+                              AiConversationMemory memory,
+                              ToolRegistry toolRegistry,
+                              List<AiGuardrail> guardrails,
+                              List<ContextProvider> contextProviders) {
+        this(delegate, runtime, systemPrompt, model, interceptors, resource, memory,
+                toolRegistry, guardrails, contextProviders, AiMetrics.NOOP, null);
+    }
+
+    /**
+     * Full constructor with metrics and structured output.
+     */
+    public AiStreamingSession(StreamingSession delegate, AgentRuntime runtime,
+                              String systemPrompt, String model,
+                              List<AiInterceptor> interceptors,
+                              AtmosphereResource resource,
+                              AiConversationMemory memory,
+                              ToolRegistry toolRegistry,
+                              List<AiGuardrail> guardrails,
+                              List<ContextProvider> contextProviders,
+                              AiMetrics metrics,
+                              Class<?> responseType) {
+        this.delegate = delegate;
+        this.runtime = runtime;
+        this.systemPrompt = systemPrompt != null ? systemPrompt : "";
+        this.model = model;
+        this.interceptors = interceptors != null ? interceptors : List.of();
+        this.resource = resource;
+        this.memory = memory;
+        this.toolRegistry = toolRegistry;
+        this.guardrails = guardrails != null ? guardrails : List.of();
+        this.contextProviders = contextProviders != null ? contextProviders : List.of();
+        this.metrics = org.atmosphere.ai.jfr.CompositeAiMetrics.withJfr(
+                metrics != null ? metrics : AiMetrics.NOOP);
+        this.responseType = responseType;
+    }
+
+    /**
+     * Register a session as an active session for its resource. Called by the
+     * handler after construction so approval responses can be routed to it.
+     * Multiple sessions may be registered under the same UUID (overlapping
+     * prompts on one resource); each registration appends to the list.
+     *
+     * @param session the session to register
+     */
+    public static void registerActive(AiStreamingSession session) {
+        var uuid = session.resource.uuid();
+        if (uuid != null) {
+            session.lastActivityMillis = System.currentTimeMillis();
+            ACTIVE_SESSIONS
+                    .computeIfAbsent(uuid, k -> new java.util.concurrent.CopyOnWriteArrayList<>())
+                    .add(session);
+            StreamingSessionSweeper.ensureStarted();
+        }
+    }
+
+    /**
+     * Remove sessions whose last activity is older than {@code ttlMs}.
+     * Invoked by {@link StreamingSessionSweeper} so a prompt whose runtime
+     * never fires a terminal event — or whose disconnect the container never
+     * delivered — cannot grow the process-global active map without bound
+     * (Correctness Invariant #3). A reaped session gets the same treatment
+     * as the disconnect path: {@link #cancelInflight()} aborts the upstream
+     * LLM call and releases parked approval futures, and the terminate hooks
+     * fire so session-scoped resources are closed (Invariant #2). Live
+     * sessions are safe: the TTL clock refreshes on every outbound frame and
+     * on approval routing, and pending approvals time out after minutes, not
+     * the 30-minute default TTL.
+     *
+     * @param ttlMs the idle TTL in milliseconds
+     * @return the number of sessions removed
+     */
+    static int sweepExpired(long ttlMs) {
+        var cutoff = System.currentTimeMillis() - ttlMs;
+        var removed = 0;
+        for (var entry : ACTIVE_SESSIONS.entrySet()) {
+            var sessions = entry.getValue();
+            for (var session : sessions) {
+                if (session.lastActivityMillis >= cutoff || !sessions.remove(session)) {
+                    continue;
+                }
+                removed++;
+                try {
+                    session.cancelInflight();
+                } catch (RuntimeException e) {
+                    logger.trace("cancelInflight threw during TTL sweep for {}: {}",
+                            entry.getKey(), e.getMessage(), e);
+                }
+                session.fireTerminate();
+                logger.debug("Swept idle AI session for resource {}", entry.getKey());
+            }
+            if (sessions.isEmpty()) {
+                // Only remove the outer entry if the list is still empty — a
+                // concurrent registerActive may have appended in between.
+                ACTIVE_SESSIONS.remove(entry.getKey(), sessions);
+            }
+        }
+        return removed;
+    }
+
+    /**
+     * Try to resolve an approval message against every session currently
+     * registered for the given resource UUID. Walks the list in registration
+     * order and short-circuits only on
+     * {@link ApprovalRegistry.ResolveResult#RESOLVED} so a newer session whose
+     * registry does not own the pending ID cannot swallow the message before
+     * an older overlapping session has a chance to claim it.
+     *
+     * @param resourceUuid the atmosphere resource UUID
+     * @param message      the incoming approval message
+     * @return {@code true} iff some session's registry owned the pending ID and
+     *     completed the approval future
+     */
+    public static boolean tryResolveApprovalForResource(String resourceUuid, String message) {
+        if (resourceUuid == null) {
+            return false;
+        }
+        var sessions = ACTIVE_SESSIONS.get(resourceUuid);
+        if (sessions == null) {
+            return false;
+        }
+        for (var session : sessions) {
+            if (session.approvalRegistry.resolve(message) == ApprovalRegistry.ResolveResult.RESOLVED) {
+                session.lastActivityMillis = System.currentTimeMillis();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Reconnect fallback: try to resolve an approval message against every
+     * active session across every resource UUID. Used when the resource UUID
+     * changed due to transport reconnect and the primary lookup returns null.
+     * Short-circuits only on {@link ApprovalRegistry.ResolveResult#RESOLVED};
+     * an {@link ApprovalRegistry.ResolveResult#UNKNOWN_ID} from one session is
+     * not allowed to consume the message — the next session may own it.
+     *
+     * @param message the incoming approval message
+     * @return {@code true} iff some session's registry owned the pending ID and
+     *     completed the approval future
+     */
+    public static boolean tryResolveAnySession(String message) {
+        for (var sessions : ACTIVE_SESSIONS.values()) {
+            for (var session : sessions) {
+                if (session.approvalRegistry.resolve(message) == ApprovalRegistry.ResolveResult.RESOLVED) {
+                    session.lastActivityMillis = System.currentTimeMillis();
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Remove every session registered for a given resource UUID. Called by
+     * {@code AiEndpointHandler#handleDisconnect} when the underlying socket
+     * is going away and all prompts on it are done.
+     *
+     * <p>Each removed session has {@link #cancelInflight()} fired before the
+     * map entry is dropped so any in-flight LLM call is aborted (refunding
+     * tokens for a client that is no longer listening) and any virtual
+     * thread parked on a {@code @RequiresApproval} future unblocks instead
+     * of waiting out its 5-minute timeout. Closes Correctness Invariant #2
+     * (Terminal Path Completeness) for the disconnect-while-streaming
+     * scenario.</p>
+     *
+     * @param resourceUuid the atmosphere resource UUID (may be null)
+     */
+    public static void removeAllForResource(String resourceUuid) {
+        if (resourceUuid == null) {
+            return;
+        }
+        var sessions = ACTIVE_SESSIONS.remove(resourceUuid);
+        if (sessions == null) {
+            return;
+        }
+        for (var session : sessions) {
+            try {
+                session.cancelInflight();
+            } catch (RuntimeException e) {
+                // Best-effort cleanup. Swallowing here would violate the
+                // project's no-swallow rule, so log at TRACE — the disconnect
+                // path is already past the point where errors can be returned
+                // to the client.
+                logger.trace("cancelInflight threw during disconnect cleanup for {}: {}",
+                        resourceUuid, e.getMessage(), e);
+            }
+        }
+    }
+
+    /**
+     * Abort the in-flight LLM call (if any) and release every pending tool
+     * approval registered on this session. Called from the disconnect cleanup
+     * path so the upstream HTTP request to the model provider is cancelled
+     * — refunding tokens for a client who has gone away — and any virtual
+     * thread parked on {@link ApprovalRegistry#awaitApproval} unblocks
+     * immediately with a denial outcome instead of waiting out its
+     * per-approval timeout.
+     *
+     * <p>Idempotent: subsequent calls are no-ops once {@link ExecutionHandle}
+     * is done. Safe to invoke from any thread.</p>
+     */
+    public void cancelInflight() {
+        // Set the latch BEFORE reading currentHandle so that a concurrent
+        // stream() VT publishing its handle after this read still observes
+        // the cancel intent and self-cancels post-publish.
+        cancelPending.set(true);
+        var handle = this.currentHandle;
+        if (handle != null && !handle.isDone()) {
+            handle.cancel();
+        }
+        int cancelledApprovals = approvalRegistry.cancelAllPending();
+        if (cancelledApprovals > 0 && logger.isDebugEnabled()) {
+            logger.debug("Disconnect cancelled {} pending approval(s) for resource {}",
+                    cancelledApprovals, resource != null ? resource.uuid() : "null");
+        }
+    }
+
+    /**
+     * @param resourceUuid the atmosphere resource UUID
+     * @return {@code true} if at least one {@link AiStreamingSession} is
+     *     registered for that uuid; {@code false} otherwise. Used by the admin
+     *     {@code cancel-inflight} endpoint to distinguish "no such session"
+     *     (404) from "session present, cancellation fired" (200).
+     */
+    public static boolean resourceHasActiveSessions(String resourceUuid) {
+        if (resourceUuid == null) {
+            return false;
+        }
+        var sessions = ACTIVE_SESSIONS.get(resourceUuid);
+        return sessions != null && !sessions.isEmpty();
+    }
+
+    /**
+     * Cancel the in-flight LLM call on every session registered for
+     * {@code resourceUuid} WITHOUT removing them from the active map. Used by
+     * the admin {@code POST /sessions/{uuid}/cancel-inflight} endpoint when
+     * an operator wants to abort the upstream call (refunding tokens,
+     * releasing approval futures) but keep the socket open for the next
+     * turn.
+     *
+     * <p>Contrast with {@link #removeAllForResource} which is fired from the
+     * full disconnect path — that variant cancels AND drops the map entry
+     * because the transport itself is going away.</p>
+     */
+    public static void cancelInflightForResource(String resourceUuid) {
+        if (resourceUuid == null) {
+            return;
+        }
+        var sessions = ACTIVE_SESSIONS.get(resourceUuid);
+        if (sessions == null) {
+            return;
+        }
+        for (var session : sessions) {
+            try {
+                session.cancelInflight();
+            } catch (RuntimeException e) {
+                logger.trace("cancelInflight threw during admin cancel-inflight for {}: {}",
+                        resourceUuid, e.getMessage(), e);
+            }
+        }
+    }
+
+    /**
+     * Remove a specific session from the active map on completion/error. Uses
+     * identity-checked removal so prompt A finishing after prompt B started on
+     * the same resource does not clobber B's mapping. When the list for a UUID
+     * becomes empty, the entry is removed from the outer map.
+     *
+     * @param session the session to remove (identity-checked)
+     */
+    public static void removeActiveSession(AiStreamingSession session) {
+        if (session == null || session.resource == null) {
+            return;
+        }
+        var uuid = session.resource.uuid();
+        if (uuid == null) {
+            return;
+        }
+        var sessions = ACTIVE_SESSIONS.get(uuid);
+        if (sessions == null) {
+            return;
+        }
+        sessions.remove(session);
+        if (sessions.isEmpty()) {
+            // Only remove the outer entry if the list is still empty — another
+            // thread may have appended between the isEmpty check and the remove.
+            ACTIVE_SESSIONS.remove(uuid, sessions);
+        }
+    }
+
+    /** Sets a hook to fire once at the start of the first {@code stream()} call. */
+    public void setPreStreamHook(PostPromptHook hook) {
+        this.preStreamHook.set(hook);
+    }
+
+    /**
+     * Set the endpoint-scoped prompt cache policy from {@code @AiEndpoint.promptCache()}.
+     * Every request built by this session attaches a {@link org.atmosphere.ai.llm.CacheHint}
+     * with the given policy to the context metadata.
+     */
+    public void setCachePolicy(org.atmosphere.ai.llm.CacheHint.CachePolicy policy) {
+        this.cachePolicy = policy;
+    }
+
+    /**
+     * Attach an endpoint-level {@link org.atmosphere.ai.cache.ResponseCache}, the
+     * websocket-path twin of {@link AiPipeline#setResponseCache}. When set AND the
+     * request's {@link org.atmosphere.ai.llm.CacheHint} is opted in, the session
+     * consults the cache before calling the runtime; on a miss it wraps the target
+     * in a {@link org.atmosphere.ai.cache.CachingStreamingSession} to capture the
+     * response for replay.
+     *
+     * <p>Before this existed the response cache was reachable only from
+     * {@code AiPipeline}, so an application that configured
+     * {@code atmosphere.ai.cache.semantic=true} got a cache on its
+     * {@code @Coordinator}/channel traffic and silently none on its
+     * {@code @AiEndpoint} traffic (Correctness Invariant #7).</p>
+     *
+     * @param cache cache instance, or {@code null} to disable
+     * @param ttl   entry TTL; defaults to 5 minutes when {@code null}
+     */
+    public void setResponseCache(org.atmosphere.ai.cache.ResponseCache cache,
+                                 java.time.Duration ttl) {
+        this.responseCache = cache;
+        if (ttl != null) {
+            this.responseCacheTtl = ttl;
+        }
+    }
+
+    /** The installed endpoint-level response cache, or {@code null} when none. */
+    public org.atmosphere.ai.cache.ResponseCache responseCache() {
+        return responseCache;
+    }
+
+    /**
+     * Set the endpoint-scoped per-request retry policy from {@code @AiEndpoint.retry()}.
+     * Every context built by this session uses this policy instead of the client-level default.
+     */
+    public void setRetryPolicy(org.atmosphere.ai.RetryPolicy policy) {
+        this.endpointRetryPolicy = policy;
+    }
+
+    /**
+     * Set the endpoint-scoped structured-output reprompt budget from
+     * {@code @AiEndpoint.structuredOutputRetries()}. Applies only to endpoints
+     * that declare a typed response; {@code 0} disables the self-healing loop.
+     * A per-request {@code ai.structured.retry} metadata override still wins.
+     */
+    public void setStructuredOutputRetries(int retries) {
+        this.endpointStructuredRetries = Math.max(0, retries);
+    }
+
+    /**
+     * Set the endpoint-scoped per-turn tool cap from
+     * {@code @AiEndpoint.maxToolsPerRequest()}. When the registered catalog
+     * exceeds the cap, tools are pre-filtered to the most relevant for the
+     * message; {@code 0} injects every tool.
+     */
+    public void setMaxToolsPerRequest(int maxToolsPerRequest) {
+        this.endpointMaxToolsPerRequest = Math.max(0, maxToolsPerRequest);
+    }
+
+    /**
+     * Set the endpoint-scoped over-fetch + rerank retrieval policy resolved
+     * from {@code org.atmosphere.ai.rag.*} (see {@link RagRetrieval}). With an
+     * active reranker each provider fetches {@code k * overfetch} candidates
+     * and the reranker scores them back down to {@code k}; {@code null} or a
+     * disabled policy restores the legacy fetch-k behavior.
+     */
+    public void setRagRetrieval(RagRetrieval retrieval) {
+        this.ragRetrieval = retrieval != null ? retrieval : RagRetrieval.disabled();
+    }
+
+    /**
+     * Publish the framework-scoped injectables the endpoint handler collected
+     * (live {@code AgentFleet}, {@code AgentIdentity}, {@code AgentState},
+     * ...). Threaded into the tool-call loop so {@code @AiTool} methods can
+     * declare these types directly — no {@link ThreadLocal} shim. Copied
+     * defensively so the handler can mutate its source map without affecting
+     * the session.
+     */
+    public void setInjectables(java.util.Map<Class<?>, Object> source) {
+        this.injectables = source == null || source.isEmpty()
+                ? java.util.Map.of()
+                : java.util.Map.copyOf(source);
+    }
+
+    /**
+     * Replace (or add) a single injectable entry, e.g. so {@code @Prompt} can
+     * swap a fleet wrapped in a {@code StreamingActivityListener} before tools
+     * dispatch. The internal map stays immutable-at-publish via copy-on-write
+     * so concurrent tool invocations see a consistent snapshot.
+     */
+    public void putInjectable(Class<?> key, Object value) {
+        var next = new java.util.LinkedHashMap<Class<?>, Object>(this.injectables);
+        next.put(key, value);
+        this.injectables = java.util.Map.copyOf(next);
+    }
+
+    @Override
+    public java.util.Map<Class<?>, Object> injectables() {
+        return injectables;
+    }
+
+    /** Publish the runId the {@code RunRegistry} assigned on registration. */
+    public void setRunId(String runId) {
+        this.runId = runId;
+        // Surface the assigned run id to the client as a metadata frame so a
+        // reconnect carries it back (X-Atmosphere-Run-Id) and a server with
+        // durable runs enabled resumes the in-flight run from its effect journal.
+        // The atmosphere.js streaming client captures this key into request.runId
+        // and re-sends it as the X-Atmosphere-Run-Id query parameter on reconnect.
+        if (runId != null && !runId.isBlank()) {
+            delegate.sendMetadata(
+                    org.atmosphere.ai.resume.RunReattachSupport.RUN_ID_HEADER, runId);
+        }
+    }
+
+    @Override
+    public java.util.Optional<String> runId() {
+        return java.util.Optional.ofNullable(runId);
+    }
+
+    @Override
+    public void stream(String message) {
+        // Drain any multi-modal parts the @AiEndpoint handler decoded from the
+        // inbound frame and stashed via setPendingInputParts. getAndSet keeps the
+        // consumption one-shot: the next plain stream(message) turn on this
+        // session starts clean (no stale image bleeding across prompts).
+        stream(message, pendingInputParts.getAndSet(List.of()));
+    }
+
+    /**
+     * Stash the multi-modal input parts decoded from the inbound frame so the
+     * next {@link #stream(String)} call threads them onto the model request.
+     * Set by the {@code @AiEndpoint} handler after
+     * {@link MultiModalInput#decode(String)} yields image/audio/file parts; the
+     * {@code @Prompt} method then only has to call {@code session.stream(text)}
+     * for the upload to reach the model (e.g. the OpenAI {@code image_url}
+     * block). A {@code null} or empty list clears the stash.
+     *
+     * @param parts the decoded parts, or {@code null}/empty to clear
+     */
+    public void setPendingInputParts(List<Content> parts) {
+        this.pendingInputParts.set(parts == null || parts.isEmpty()
+                ? List.of() : List.copyOf(parts));
+    }
+
+    @Override
+    public void stream(String message, List<Content> inputParts) {
+        // Fire pre-stream hook (e.g., journal emit) before LLM call starts.
+        // By the time stream() is called, all coordinator/agent work is done.
+        var hook = preStreamHook.getAndSet(null);
+        if (hook != null) {
+            hook.afterPrompt(this);
+        }
+
+        // Load conversation history if memory is enabled
+        var history = memory != null
+                ? memory.getHistory(resource.uuid())
+                : List.<org.atmosphere.ai.llm.ChatMessage>of();
+
+        // Populate identity fields from the AtmosphereResource
+        var userId = extractAttribute(resource, "ai.userId");
+        var sessionId = resource.uuid();
+        var agentId = extractAttribute(resource, "ai.agentId");
+        var conversationId = extractAttribute(resource, "ai.conversationId");
+        if (conversationId == null) {
+            conversationId = sessionId;
+        }
+
+        var request = new AiRequest(message, systemPrompt, model,
+                userId, sessionId, agentId, conversationId, Map.of(), history);
+
+        // Attach available tools, dynamically pre-filtered to the most relevant
+        // when maxToolsPerRequest caps a large catalog (Mode Parity with
+        // AiPipeline; <= 0 injects every tool).
+        if (toolRegistry != null && !toolRegistry.allTools().isEmpty()) {
+            request = request.withTools(org.atmosphere.ai.tool.ToolSelection.select(
+                    toolRegistry, message, endpointMaxToolsPerRequest));
+        }
+
+        // Guardrails: inspect request (pre)
+        for (var guardrail : guardrails) {
+            try {
+                var result = guardrail.inspectRequest(request);
+                switch (result) {
+                    case AiGuardrail.GuardrailResult.Block block -> {
+                        logger.warn("Request blocked by guardrail {}: {}",
+                                guardrail.getClass().getSimpleName(), block.reason());
+                        delegate.error(new SecurityException("Request blocked: " + block.reason()));
+                        return;
+                    }
+                    case AiGuardrail.GuardrailResult.Modify modify ->
+                            request = modify.modifiedRequest();
+                    case AiGuardrail.GuardrailResult.Pass ignored -> { }
+                }
+            } catch (Exception e) {
+                logger.error("AiGuardrail.inspectRequest failed: {}",
+                        guardrail.getClass().getName(), e);
+                delegate.error(e);
+                return;
+            }
+        }
+
+        // Context providers: RAG augmentation with query transform + filter/rerank/post-process
+        if (!contextProviders.isEmpty()) {
+            // Collect each retriever's ranked list, then fuse with Reciprocal
+            // Rank Fusion when more than one retriever is wired so documents the
+            // retrievers agree on rank first. A single retriever needs no fusion.
+            var perProvider = new java.util.ArrayList<java.util.List<ContextProvider.Document>>();
+            var retrieval = ragRetrieval;
+            for (var provider : contextProviders) {
+                try {
+                    var query = ContextProvider.normalizeQuery(provider.transformQuery(request.message()));
+                    if (!ContextProvider.shouldRetrieve(query)) {
+                        continue;
+                    }
+                    // With a configured reranker (org.atmosphere.ai.rag.reranker),
+                    // over-fetch k*overfetch candidates and rerank them back down
+                    // to top-k — per ranked list, before RRF fusion below, so the
+                    // fused order is built from already-reranked lists. Without
+                    // one, fetchSize(k) == k and retrieval.rerank is a pass-
+                    // through: legacy behavior, no extra model call. A
+                    // SafetyContextProvider wraps retrieve(), so injection
+                    // screening always runs before reranking.
+                    var docs = provider.retrieve(query,
+                            retrieval.fetchSize(RagRetrieval.DEFAULT_TOP_K));
+                    docs = provider.filter(query, docs);
+                    docs = provider.rerank(query, docs);
+                    docs = retrieval.rerank(query, docs, RagRetrieval.DEFAULT_TOP_K);
+                    docs = provider.postProcess(query, docs);
+                    perProvider.add(docs);
+                } catch (Exception e) {
+                    logger.error("ContextProvider.retrieve failed: {}",
+                            provider.getClass().getName(), e);
+                    delegate.sendMetadata("rag.error",
+                            provider.getClass().getSimpleName() + ": " + e.getMessage());
+                }
+            }
+            var fused = perProvider.size() > 1
+                    ? RrfFusion.fuse(perProvider, RrfFusion.DEFAULT_K, 8)
+                    : (perProvider.isEmpty() ? java.util.List.<ContextProvider.Document>of()
+                            : perProvider.get(0));
+            var contextBuilder = new StringBuilder();
+            for (var doc : fused) {
+                contextBuilder.append("\n---\nSource: ").append(ContextProvider.formatCitation(doc))
+                        .append("\n").append(doc.content());
+            }
+            if (!contextBuilder.isEmpty()) {
+                var augmented = request.message()
+                        + "\n\nRelevant context:" + contextBuilder;
+                request = request.withMessage(augmented);
+            }
+        }
+
+        // Pre-process: FIFO order
+        for (var interceptor : interceptors) {
+            try {
+                request = interceptor.preProcess(request, resource);
+            } catch (Exception e) {
+                logger.error("AiInterceptor.preProcess failed: {}", interceptor.getClass().getName(), e);
+                delegate.error(e);
+                return;
+            }
+        }
+
+        // Per-request ScopePolicy install — interceptors may have set a
+        // ScopeConfig under ScopePolicy.REQUEST_SCOPE_METADATA_KEY. Consume
+        // it now (mutating a copy of the metadata map) so the governance-
+        // internal key does not leak to the provider, then run pre-admission
+        // evaluate + system-prompt hardening, and append a PolicyAsGuardrail
+        // to the capturing list so the streamed response is measured against
+        // the narrowed scope when @AgentScope.postResponseCheck is enabled.
+        List<AiGuardrail> effectiveGuardrails = guardrails;
+        var mutableMeta = new java.util.HashMap<String, Object>(
+                request.metadata() != null ? request.metadata() : Map.of());
+        var requestScopePolicy =
+                org.atmosphere.ai.governance.scope.ScopePolicyInstaller.extract(mutableMeta);
+        if (requestScopePolicy != null) {
+            request = new AiRequest(request.message(), request.systemPrompt(),
+                    request.model(), request.userId(), request.sessionId(),
+                    request.agentId(), request.conversationId(),
+                    Map.copyOf(mutableMeta), request.history());
+            var ctx = org.atmosphere.ai.governance.PolicyContext.preAdmission(request);
+            var tracer = org.atmosphere.ai.governance.GovernanceTracer.start(requestScopePolicy, ctx);
+            var startNs = System.nanoTime();
+            try {
+                var decision = requestScopePolicy.evaluate(ctx);
+                var evalMs = (System.nanoTime() - startNs) / 1_000_000.0;
+                switch (decision) {
+                    case org.atmosphere.ai.governance.PolicyDecision.Deny deny -> {
+                        logger.warn("Request denied by per-request scope {}: {}",
+                                requestScopePolicy.name(), deny.reason());
+                        org.atmosphere.ai.governance.GovernanceDecisionLog.installed().record(
+                                org.atmosphere.ai.governance.GovernanceDecisionLog.entry(
+                                        requestScopePolicy, ctx, "deny", deny.reason(), evalMs));
+                        tracer.end("deny", deny.reason());
+                        delegate.error(new SecurityException("Request denied by per-request scope "
+                                + requestScopePolicy.name() + ": " + deny.reason()));
+                        return;
+                    }
+                    case org.atmosphere.ai.governance.PolicyDecision.Transform transform -> {
+                        org.atmosphere.ai.governance.GovernanceDecisionLog.installed().record(
+                                org.atmosphere.ai.governance.GovernanceDecisionLog.entry(
+                                        requestScopePolicy, ctx, "transform",
+                                        "request rewritten", evalMs));
+                        tracer.end("transform", "request rewritten");
+                        request = transform.modifiedRequest();
+                    }
+                    case org.atmosphere.ai.governance.PolicyDecision.Prefer prefer -> {
+                        // Soft governance: admit unchanged, record the preferred path.
+                        org.atmosphere.ai.governance.GovernanceDecisionLog.installed().record(
+                                org.atmosphere.ai.governance.GovernanceDecisionLog.preferEntry(
+                                        requestScopePolicy, ctx, prefer.preferred(),
+                                        prefer.reason(), evalMs));
+                        tracer.end("prefer", prefer.reason());
+                    }
+                    case org.atmosphere.ai.governance.PolicyDecision.Admit ignored -> {
+                        org.atmosphere.ai.governance.GovernanceDecisionLog.installed().record(
+                                org.atmosphere.ai.governance.GovernanceDecisionLog.entry(
+                                        requestScopePolicy, ctx, "admit", "", evalMs));
+                        tracer.end("admit", "");
+                    }
+                }
+            } catch (RuntimeException e) {
+                var evalMs = (System.nanoTime() - startNs) / 1_000_000.0;
+                logger.error("Per-request scope {} evaluate failed — fail-closed",
+                        requestScopePolicy.name(), e);
+                org.atmosphere.ai.governance.GovernanceDecisionLog.installed().record(
+                        org.atmosphere.ai.governance.GovernanceDecisionLog.entry(
+                                requestScopePolicy, ctx, "error",
+                                "evaluate threw: " + e.getMessage(), evalMs));
+                tracer.end("error", e.getMessage(), e);
+                delegate.error(new SecurityException("Per-request scope " + requestScopePolicy.name()
+                        + " evaluation failed: " + e.getMessage(), e));
+                return;
+            }
+            // Prepend the confinement preamble so the LLM call is fronted
+            // by the narrowed scope even when the interceptor overwrote
+            // the endpoint's @AiEndpoint.systemPromptResource.
+            var hardened = org.atmosphere.ai.governance.scope.ScopePolicyInstaller
+                    .hardenSystemPrompt(request.systemPrompt(), List.of(requestScopePolicy));
+            request = request.withSystemPrompt(hardened);
+            var augmented = new java.util.ArrayList<AiGuardrail>(guardrails.size() + 1);
+            augmented.addAll(guardrails);
+            augmented.add(new org.atmosphere.ai.governance.PolicyAsGuardrail(requestScopePolicy));
+            effectiveGuardrails = List.copyOf(augmented);
+        }
+
+        // Snapshot the system prompt as the developer (and ScopePolicy) shaped
+        // it, before structured-output / confidence augmentation appends text.
+        // The per-stage telemetry below attributes the input bill to the stage
+        // that introduced it instead of lumping schema into "system".
+        var baseSystemPrompt = request.systemPrompt();
+        var effectiveResponseType = responseType != null ? responseType : request.responseType();
+
+        // The shared decorator chain — ONE composer for both dispatch entry
+        // modes (Mode Parity, Invariant #7); see DispatchDecorators for the
+        // canonical order and rationale. The chain starts at `this` rather
+        // than `delegate` so every delegating method — critically,
+        // `injectables()` — reaches AiStreamingSession's live map. Existing
+        // capturing sessions forward all StreamingSession methods to their
+        // delegate, so starting at `this` doesn't change observable behaviour
+        // on any other method. The budget (ai.budget request metadata) and
+        // confidence-elicitation layers now apply on this path exactly as on
+        // the pipeline path — before the composer existed, @AiEndpoint could
+        // not enforce a budget at all.
+        var composed = DispatchDecorators.compose(this, new DispatchDecorators.Spec(
+                memory, resource.uuid(), message,
+                userId, agentId, conversationId,
+                metrics, model, runtime != null ? runtime.name() : "unknown",
+                request.model() != null ? request.model() : model,
+                AiBudget.from(request.metadata()),
+                effectiveGuardrails,
+                effectiveResponseType,
+                AiConfidenceElicitation.from(request.metadata()),
+                request));
+        StreamingSession target = composed.target();
+        var structuredSchemaText = composed.structuredSchemaText();
+        if (structuredSchemaText != null) {
+            // appendStableText keeps a trailing grounded-facts block the
+            // absolute suffix: schema text is stable per endpoint, so it must
+            // land inside the provider's cacheable prompt prefix, not after
+            // the volatile facts (cache-prefix contract).
+            request = request.withSystemPrompt(
+                    org.atmosphere.ai.facts.FactResolver.FactBundle.appendStableText(
+                            request.systemPrompt(), structuredSchemaText));
+        }
+        if (composed.confidenceCueText() != null) {
+            // Same cache-prefix splice as the schema branch above.
+            request = request.withSystemPrompt(
+                    org.atmosphere.ai.facts.FactResolver.FactBundle.appendStableText(
+                            request.systemPrompt(), composed.confidenceCueText()));
+        }
+
+        // Expose the session to interceptors via request attribute
+        resource.getRequest().setAttribute(STREAMING_SESSION_ATTR, target);
+
+        // Build execution context and delegate to runtime.
+        // The session-scoped ApprovalStrategy is carried on the context so every
+        // runtime bridge routes tool execution through ToolExecutionHelper.executeWithApproval().
+        // Tools come from the (potentially guardrail-modified) request, NOT from
+        // re-reading the registry, so a guardrail that narrows the tool set via
+        // {@code AiRequest#withTools} actually takes effect — without this,
+        // guardrails could only block the whole request, not drop specific tools.
+        var finalRequest = request;
+        // Arm the beforeCompletion hook for THIS stream() invocation. The
+        // terminal complete()/complete(String) consumes it exactly once —
+        // including the response-cache-hit early return below, which also
+        // routes through complete() on the composed target. The target is
+        // the same composed decorator chain stored under
+        // STREAMING_SESSION_ATTR: frames sent from the hook reach the wire
+        // and the streaming observers, but layers that finalize on complete()
+        // (e.g. LineageCapturingSession) have already snapshotted their state
+        // by the time the hook runs.
+        beforeCompletionContext.set(new BeforeCompletionContext(finalRequest, target));
+        var tools = finalRequest.tools() != null
+                ? finalRequest.tools()
+                : java.util.List.<org.atmosphere.ai.tool.ToolDefinition>of();
+        var strategy = ApprovalStrategy.virtualThread(approvalRegistry);
+        // Merge endpoint-scoped CacheHint into request metadata if configured.
+        java.util.Map<String, Object> effectiveMetadata = request.metadata();
+        var policy = this.cachePolicy;
+        if (policy != null && policy != org.atmosphere.ai.llm.CacheHint.CachePolicy.NONE) {
+            var merged = new java.util.HashMap<String, Object>(
+                    effectiveMetadata != null ? effectiveMetadata : java.util.Map.of());
+            merged.putIfAbsent(org.atmosphere.ai.llm.CacheHint.METADATA_KEY,
+                    new org.atmosphere.ai.llm.CacheHint(policy,
+                            java.util.Optional.empty(), java.util.Optional.empty()));
+            effectiveMetadata = merged;
+        }
+        var context = new AgentExecutionContext(
+                request.message(), request.systemPrompt(), request.model(),
+                request.agentId(), request.sessionId(), request.userId(),
+                request.conversationId(),
+                java.util.List.copyOf(tools), null, memory,
+                contextProviders, effectiveMetadata, request.history(),
+                effectiveResponseType, strategy);
+        // Multi-modal input: attach the image/audio/file parts the caller passed
+        // to stream(message, parts) so the runtime can encode them onto the
+        // provider wire request (e.g. OpenAiCompatibleClient → input_audio /
+        // image_url). Empty on the text-only stream(message) path.
+        if (inputParts != null && !inputParts.isEmpty()) {
+            context = context.withParts(inputParts);
+        }
+        // Apply endpoint-scoped retry policy if configured.
+        var endpointRetry = this.endpointRetryPolicy;
+        if (endpointRetry != null) {
+            context = context.withRetryPolicy(endpointRetry);
+        }
+        // Lift the tool-loop ceiling for code-as-action: an agent that drives a
+        // sandbox iterates many write→run→observe rounds, far more than the
+        // default five. Keyed off the tool's presence (only registered when the
+        // feature is enabled); an explicitly-attached policy is left untouched.
+        if (org.atmosphere.ai.llm.ToolLoopPolicies.from(context) == null
+                && tools.stream().anyMatch(
+                        t -> org.atmosphere.ai.code.CodeExecTool.TOOL_NAME.equals(t.name()))) {
+            context = org.atmosphere.ai.llm.ToolLoopPolicies.attach(context,
+                    org.atmosphere.ai.llm.ToolLoopPolicy.maxIterations(
+                            org.atmosphere.ai.code.CodeExecSupport.CODE_ACTION_MAX_ROUNDS));
+        }
+        // Per-stage input breakdown — emitted on the websocket @AiEndpoint
+        // path to match AiPipeline's channel-bridge instrumentation. Mode
+        // parity (Invariant #7): runtime turn-cost telemetry must look the
+        // same regardless of which entry the request came in on.
+        InputAssemblyTelemetry.emit(metrics, request.model(),
+                baseSystemPrompt, structuredSchemaText, composed.confidenceCueText(),
+                tools, request.history(), request.message());
+
+        // Endpoint-level response cache — the websocket twin of AiPipeline's gate
+        // (Correctness Invariant #7). Same five safety preconditions, same keying,
+        // same ai.cache.hit wire signal, so a request behaves identically whichever
+        // entry mode it arrived on. Caching is skipped in any of these cases because
+        // CachingStreamingSession only captures text via send()/usage() — tool calls,
+        // tool results, structured-output field events and intermediate lifecycle
+        // frames are NOT replayable, so serving a cached text-only response for any
+        // of them would silently drop frames and could produce wrong answers:
+        //   1. this turn's tools non-empty      2. registry holds latent tools
+        //   3. structured output declared        4. RAG providers augment the prompt
+        //   5. guardrails may mutate the request at runtime
+        var cache = responseCache;
+        var cacheHint = org.atmosphere.ai.llm.CacheHint.from(context);
+        var hasTools = tools != null && !tools.isEmpty();
+        var registryHasTools = toolRegistry != null && !toolRegistry.allTools().isEmpty();
+        var hasStructuredForCache = effectiveResponseType != null
+                && effectiveResponseType != Void.class;
+        var hasRag = contextProviders != null && !contextProviders.isEmpty();
+        var hasGuardrailsForCache = (effectiveGuardrails != null && !effectiveGuardrails.isEmpty())
+                || requestScopePolicy != null;
+        var cacheSafe = !hasTools && !registryHasTools && !hasStructuredForCache
+                && !hasRag && !hasGuardrailsForCache;
+        org.atmosphere.ai.cache.CachingStreamingSession cacheCaptor = null;
+        StreamingSession cacheTarget = target;
+        if (cache != null && cacheHint.enabled() && cacheSafe) {
+            // A SemanticResponseCache matches near-duplicate prompts by embedding
+            // similarity, so it keys on the RAW message rather than the exact
+            // CacheKey hash. Exact caches (the default) key on the hash.
+            var cacheKey = cache instanceof org.atmosphere.ai.cache.SemanticResponseCache
+                    ? request.message()
+                    : org.atmosphere.ai.cache.CacheKey.compute(context);
+            var hit = cache.get(cacheKey);
+            if (hit.isPresent()) {
+                logger.debug("Endpoint response-cache HIT: key={}", cacheKey);
+                var cached = hit.get();
+                var cacheTurn = new org.atmosphere.ai.jfr.AgentTurnEvent();
+                cacheTurn.runtime = runtime != null ? runtime.name() : "unknown";
+                cacheTurn.model = request.model() != null ? request.model()
+                        : (model != null ? model : "unknown");
+                cacheTurn.clientId = resource != null ? resource.uuid() : null;
+                cacheTurn.cacheHit = true;
+                cacheTurn.begin();
+                // Fire lifecycle listeners so observers see a clean start/completion
+                // pair on the hit path too — on a miss AbstractAgentRuntime.execute
+                // fires these internally. Without it, audit/metrics observers go
+                // blind on exactly the requests the cache serves.
+                AbstractAgentRuntime.fireStart(context);
+                try {
+                    target.sendMetadata(AiPipeline.CACHE_HIT_METADATA_KEY, Boolean.TRUE);
+                    target.send(cached.text());
+                    if (cached.usage() != null) {
+                        target.usage(cached.usage());
+                    }
+                    target.complete();
+                    AbstractAgentRuntime.fireCompletion(context);
+                    cacheTurn.status = "success";
+                } catch (RuntimeException e) {
+                    cacheTurn.status = "error";
+                    cacheTurn.errorType = e.getClass().getSimpleName();
+                    AbstractAgentRuntime.fireError(context, e);
+                    throw e;
+                } finally {
+                    cacheTurn.commit();
+                }
+                return;
+            }
+            logger.debug("Endpoint response-cache MISS: key={}", cacheKey);
+            // Emit the false signal on miss too so a client can distinguish
+            // "consulted but missed" from "skipped entirely" (gate short-circuited).
+            target.sendMetadata(AiPipeline.CACHE_HIT_METADATA_KEY, Boolean.FALSE);
+            cacheCaptor = new org.atmosphere.ai.cache.CachingStreamingSession(
+                    target, cacheKey, responseCacheTtl, cache::put);
+            cacheTarget = cacheCaptor;
+        } else if (cache != null && cacheHint.enabled() && logger.isDebugEnabled()) {
+            logger.debug("Endpoint response-cache SKIP: hasTools={} registryHasTools={} "
+                            + "hasStructured={} hasRag={} hasGuardrails={}",
+                    hasTools, registryHasTools, hasStructuredForCache, hasRag,
+                    hasGuardrailsForCache);
+        }
+
+        var streamingTarget = cacheTarget;
+        // Session tape: record the final input prompt (system + history + user)
+        // as an `input` step so the tape captures both sides of the turn — the
+        // self-contained (prompt → completion) record the distillation extractor
+        // reads. The tape sits at `delegate`; no-op when the tape is not installed.
+        if (delegate instanceof org.atmosphere.ai.tape.TapeRecordingSession tape) {
+            tape.recordInput(request.systemPrompt(), request.history(), request.message());
+        }
+
+        var turnEvent = new org.atmosphere.ai.jfr.AgentTurnEvent();
+        turnEvent.runtime = runtime != null ? runtime.name() : "unknown";
+        turnEvent.model = request.model() != null ? request.model() : (model != null ? model : "unknown");
+        turnEvent.clientId = resource != null ? resource.uuid() : null;
+        turnEvent.cacheHit = false;
+        turnEvent.begin();
+        try {
+            // executeWithHandle returns a handle the disconnect path can
+            // use to abort the upstream LLM call. For runtimes that haven't
+            // overridden it (default impl) execute() runs synchronously and
+            // a COMPLETED handle is returned — whenDone().join() is a no-op
+            // and the cancel knob is harmless. Runtimes that override it
+            // (BuiltInAgentRuntime, etc.) return a real handle backed by
+            // their native cancel primitive, so cancelInflight() actually
+            // closes the HTTP stream and unwinds the tool loop.
+            // Self-healing structured-output reprompt loop (Mode Parity with the
+            // AiPipeline channel-bridge path). Only active when a typed response
+            // is declared AND a retry budget is configured — endpoint-scoped via
+            // @AiEndpoint.structuredOutputRetries(), per-request override via the
+            // ai.structured.retry metadata key. Disabled → identical single-shot
+            // behavior.
+            var hasStructured = effectiveResponseType != null
+                    && effectiveResponseType != Void.class;
+            var requestRetry = AiStructuredRetry.from(effectiveMetadata);
+            var effectiveRetries = requestRetry != null
+                    ? requestRetry.maxRetries()
+                    : endpointStructuredRetries;
+            var handle = hasStructured && effectiveRetries > 0
+                    ? StructuredOutputRetry.executeWithHandle(runtime, context, streamingTarget,
+                            StructuredOutputParser.resolve(), effectiveResponseType, effectiveRetries)
+                    : runtime.executeWithHandle(context, streamingTarget);
+            this.currentHandle = handle;
+            // Bind the budget's cancel hook to the runtime handle so a
+            // wall-clock or token trip cancels the in-flight runtime call
+            // instead of leaving the provider hung after the error frame
+            // (Terminal Path, Invariant #2 — same binding as AiPipeline).
+            if (composed.budgetSession() != null) {
+                composed.budgetSession().setOnTrip(handle::cancel);
+            }
+            // Close the publish-then-cancel race: a disconnect that fired
+            // between executeWithHandle returning and currentHandle being
+            // assigned would have read null and dropped the cancel. Re-check
+            // the latch here so we catch up on that intent before parking.
+            if (cancelPending.get() && !handle.isDone()) {
+                handle.cancel();
+            }
+            try {
+                handle.whenDone().join();
+                turnEvent.status = streamingTarget.hasErrored() ? "error" : "success";
+                // Persist the captured response only after the runtime returned
+                // without throwing and the session is not errored. complete() is
+                // NOT a valid commit signal — runtime bridges call it on a
+                // caller-initiated cancel, which would cache a partial answer and
+                // replay it as authoritative. The captor reference is held
+                // directly rather than recovered with instanceof, so a later
+                // re-wrap of the target cannot silently skip the commit.
+                if (cacheCaptor != null && !cacheCaptor.hasErrored()) {
+                    cacheCaptor.commit();
+                }
+            } catch (java.util.concurrent.CompletionException ce) {
+                // Runtime completed exceptionally via Settable.completeExceptionally.
+                // The streamingTarget.error(...) path was already invoked by the
+                // runtime, so the client has been notified — no further action.
+                turnEvent.status = "error";
+                var cause = ce.getCause();
+                turnEvent.errorType = cause != null ? cause.getClass().getSimpleName() : ce.getClass().getSimpleName();
+                if (logger.isTraceEnabled()) {
+                    logger.trace("Execution completed exceptionally for {}: {}",
+                            resource != null ? resource.uuid() : "null",
+                            cause != null ? cause.getMessage() : ce.getMessage());
+                }
+            }
+        } catch (Exception e) {
+            turnEvent.status = "error";
+            turnEvent.errorType = e.getClass().getSimpleName();
+            metrics.recordError(model != null ? model : "unknown", "stream_error");
+            logger.error("Streaming error", e);
+            streamingTarget.error(e);
+        } finally {
+            turnEvent.commit();
+        }
+        try {
+            // Post-process follows execution
+        } finally {
+            // Post-process: LIFO order (matching AtmosphereInterceptor convention)
+            for (int i = interceptors.size() - 1; i >= 0; i--) {
+                try {
+                    interceptors.get(i).postProcess(finalRequest, resource);
+                } catch (Exception e) {
+                    logger.error("AiInterceptor.postProcess failed: {}",
+                            interceptors.get(i).getClass().getName(), e);
+                }
+            }
+        }
+    }
+
+    @Override
+    public void handoff(String agentName, String message) {
+        if (!handoffInProgress.compareAndSet(false, true)) {
+            throw new IllegalStateException("Nested handoffs not supported");
+        }
+
+        logger.info("Handoff from {} to agent '{}'", resource.uuid(), agentName);
+        emit(new AiEvent.Handoff(
+                extractAttribute(resource, "ai.agentId"),
+                agentName,
+                "User request routed to " + agentName));
+
+        // Copy conversation history to the target agent's memory
+        if (memory != null) {
+            var fromId = resource.uuid();
+            var toId = agentName + ":" + fromId;
+            memory.copyTo(fromId, toId);
+        }
+
+        // Dispatch to the target agent via its handler. We look up the
+        // AtmosphereHandlerWrapper and invoke the handler's onStateChange
+        // with the message, so the target's @Prompt method runs — including
+        // demo mode, tool registration, and all pipeline hooks.
+        var framework = resource.getAtmosphereConfig().framework();
+        var targetPath = "/atmosphere/agent/" + agentName;
+        var handlerWrapper = framework.getAtmosphereHandlers().get(targetPath);
+        if (handlerWrapper == null) {
+            delegate.error(new IllegalArgumentException(
+                    "Agent '" + agentName + "' not found at " + targetPath));
+            handoffInProgress.set(false);
+            return;
+        }
+
+        try {
+            // Use the handler's public API: get the handler via the wrapper's
+            // accessor and call onStateChange with a crafted event.
+            var handler = handlerWrapper.atmosphereHandler();
+            var event = new org.atmosphere.cpr.AtmosphereResourceEventImpl(
+                    (org.atmosphere.cpr.AtmosphereResourceImpl) resource);
+            event.setMessage(message);
+            handler.onStateChange(event);
+        } catch (Exception e) {
+            logger.error("Handoff to '{}' failed", agentName, e);
+            delegate.error(e);
+        } finally {
+            handoffInProgress.set(false);
+        }
+    }
+
+    /**
+     * Check if an incoming message is an approval response and route it
+     * to the approval registry. Called by the handler before dispatching to @Prompt.
+     *
+     * <p>Only returns {@code true} when the registry matched and resolved a
+     * pending approval in <em>this</em> session. Stale / unknown IDs and
+     * non-approval messages fall through so the handler dispatches them to
+     * @Prompt as normal user input.
+     *
+     * @param message the incoming message
+     * @return true if the message resolved a pending approval in this session
+     */
+    public boolean tryResolveApproval(String message) {
+        return approvalRegistry.resolve(message) == ApprovalRegistry.ResolveResult.RESOLVED;
+    }
+
+    /** The session-scoped approval registry, exposed for the endpoint handler to route responses. */
+    public ApprovalRegistry approvalRegistry() {
+        return approvalRegistry;
+    }
+
+    /**
+     * Resolve the {@code AiStreamingSession} behind an arbitrarily-decorated
+     * session. The session handed to a {@code @Prompt} method is wrapped in
+     * decorators (e.g. {@code RunEventCapturingSession} for reattach replay),
+     * so application code that needs the session-scoped machinery — above all
+     * {@link #approvalRegistry()}, the registry the endpoint handler routes
+     * {@code /__approval/<id>/...} client responses to — must unwrap the
+     * decorator chain first. Returns empty when no {@code AiStreamingSession}
+     * is behind the chain (ad-hoc test sessions, channel-bridge leaves).
+     *
+     * @param session the (possibly decorated) session, may be {@code null}
+     * @return the underlying {@code AiStreamingSession}, if present
+     */
+    public static java.util.Optional<AiStreamingSession> unwrap(StreamingSession session) {
+        var current = session;
+        while (current != null) {
+            if (current instanceof AiStreamingSession ai) {
+                return java.util.Optional.of(ai);
+            }
+            if (current instanceof DelegatingStreamingSession decorator) {
+                current = decorator.delegate;
+                continue;
+            }
+            return java.util.Optional.empty();
+        }
+        return java.util.Optional.empty();
+    }
+
+    // -- Delegate all StreamingSession methods --
+
+    @Override
+    public String sessionId() {
+        return delegate.sessionId();
+    }
+
+    @Override
+    public void send(String text) {
+        lastActivityMillis = System.currentTimeMillis();
+        delegate.send(text);
+    }
+
+    @Override
+    public void sendContent(Content content) {
+        // Forward multi-modal content to the wrapped leaf session. Without
+        // this override AiStreamingSession inherits the interface default,
+        // which drops binary parts to a metadata breadcrumb — that is the
+        // wrong shape for an AiEndpoint-attached session where the delegate
+        // is typically a DefaultStreamingSession that can emit the binary
+        // frame on the wire.
+        lastActivityMillis = System.currentTimeMillis();
+        delegate.sendContent(content);
+    }
+
+    @Override
+    public void sendMetadata(String key, Object value) {
+        lastActivityMillis = System.currentTimeMillis();
+        delegate.sendMetadata(key, value);
+    }
+
+    @Override
+    public void progress(String message) {
+        lastActivityMillis = System.currentTimeMillis();
+        delegate.progress(message);
+    }
+
+    @Override
+    public void onTerminate(AutoCloseable resource) {
+        if (resource == null) {
+            return;
+        }
+        if (terminated.get()) {
+            // Already terminated — close immediately rather than leak.
+            closeQuietly(resource);
+            return;
+        }
+        terminateHooks.add(resource);
+        if (terminated.get() && terminateHooks.remove(resource)) {
+            // Lost the race with fireTerminate(); ensure it still gets closed.
+            closeQuietly(resource);
+        }
+    }
+
+    /**
+     * Close every registered teardown resource exactly once. Invoked from all
+     * terminal paths so a session-scoped resource is released on success,
+     * failure, and cancel alike (Correctness Invariant #2).
+     */
+    private void fireTerminate() {
+        if (!terminated.compareAndSet(false, true)) {
+            return;
+        }
+        for (var resource : terminateHooks) {
+            closeQuietly(resource);
+        }
+        terminateHooks.clear();
+    }
+
+    private void closeQuietly(AutoCloseable resource) {
+        try {
+            resource.close();
+        } catch (Exception e) {
+            // Best-effort per resource: one failure must not block the rest.
+            logger.warn("Failed to close session-scoped resource {}: {}",
+                    resource.getClass().getName(), e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public void complete() {
+        if (firingBeforeCompletion.get()) {
+            logger.warn("AiInterceptor.beforeCompletion invoked complete() on its session; "
+                    + "ignoring — hooks must not invoke terminal methods");
+            return;
+        }
+        fireBeforeCompletion();
+        fireTerminate();
+        removeActiveSession(this);
+        delegate.complete();
+    }
+
+    @Override
+    public void complete(String summary) {
+        if (firingBeforeCompletion.get()) {
+            logger.warn("AiInterceptor.beforeCompletion invoked complete(summary) on its session; "
+                    + "ignoring — hooks must not invoke terminal methods");
+            return;
+        }
+        fireBeforeCompletion();
+        fireTerminate();
+        removeActiveSession(this);
+        delegate.complete(summary);
+    }
+
+    @Override
+    public void error(Throwable t) {
+        if (firingBeforeCompletion.get()) {
+            logger.warn("AiInterceptor.beforeCompletion invoked error() on its session; "
+                    + "ignoring — hooks must not invoke terminal methods");
+            return;
+        }
+        // The hook's contract is "the turn completed", so the error terminal
+        // path never fires it — but it MUST consume the armed context, or a
+        // later complete() from a runtime bridge (caller-initiated cancel
+        // completes the session after the error) would fire the hook for a
+        // turn that did not complete.
+        beforeCompletionContext.set(null);
+        fireTerminate();
+        removeActiveSession(this);
+        delegate.error(t);
+    }
+
+    /**
+     * Run {@link AiInterceptor#beforeCompletion} in LIFO order (mirroring
+     * postProcess) against the composed decorator target of the current turn,
+     * BEFORE the terminal complete frame is forwarded to the delegate — the
+     * last moment {@code sendMetadata}/{@code emit} still reach the wire. The
+     * armed context is CONSUMED atomically ({@code getAndSet(null)}), so
+     * concurrent or repeated terminal calls can never double-fire the hooks.
+     * A throwing hook — including an {@link Error} such as
+     * {@link AssertionError} — is logged and skipped so it can never suppress
+     * the terminal frame (Correctness Invariant #2). No-op when no
+     * {@code stream()} armed a context (e.g. a {@code @Prompt} that completes
+     * without streaming).
+     *
+     * <p>Bounded residual edge: a pathological trailing terminal call from a
+     * cancelled PRIOR turn may consume the context the next {@code stream()}
+     * just armed, firing that turn's hooks early. The atomic consume bounds
+     * the damage to one early fire — never two fires, never a hang.</p>
+     */
+    private void fireBeforeCompletion() {
+        var ctx = beforeCompletionContext.getAndSet(null);
+        if (ctx == null) {
+            return;
+        }
+        firingBeforeCompletion.set(true);
+        try {
+            for (int i = interceptors.size() - 1; i >= 0; i--) {
+                try {
+                    interceptors.get(i).beforeCompletion(ctx.request(), ctx.target(), resource);
+                } catch (Throwable t) {
+                    // Throwable, not Exception: an AssertionError escaping here
+                    // would skip the terminal frame below and hang the client.
+                    logger.warn("AiInterceptor.beforeCompletion failed: {}",
+                            interceptors.get(i).getClass().getName(), t);
+                }
+            }
+        } finally {
+            firingBeforeCompletion.set(false);
+        }
+    }
+
+    /**
+     * The final {@link AiRequest} and composed decorator target of one
+     * {@code stream()} turn. Consumed atomically from
+     * {@link #beforeCompletionContext} by the first terminal call, so
+     * overlapping terminal calls (a runtime that calls {@code complete()}
+     * twice) fire the hook once.
+     */
+    private record BeforeCompletionContext(AiRequest request, StreamingSession target) {
+    }
+
+    @Override
+    public void emit(AiEvent event) {
+        lastActivityMillis = System.currentTimeMillis();
+        delegate.emit(event);
+    }
+
+    @Override
+    public boolean isClosed() {
+        return delegate.isClosed();
+    }
+
+    @Override
+    public boolean hasErrored() {
+        return delegate.hasErrored();
+    }
+
+    // visible for testing
+    AgentRuntime runtime() {
+        return runtime;
+    }
+
+    List<AiInterceptor> interceptors() {
+        return interceptors;
+    }
+
+    String systemPrompt() {
+        return systemPrompt;
+    }
+
+    private static String extractAttribute(org.atmosphere.cpr.AtmosphereResource resource, String key) {
+        var attr = resource.getRequest().getAttribute(key);
+        return attr != null ? attr.toString() : null;
+    }
+}

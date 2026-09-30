@@ -1,0 +1,840 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.ai.cohere;
+
+import org.atmosphere.ai.AgentExecutionContext;
+import org.atmosphere.ai.AiEvent;
+import org.atmosphere.ai.StreamingSession;
+import org.atmosphere.ai.TokenUsage;
+import org.atmosphere.ai.approval.ToolApprovalPolicy;
+import org.atmosphere.ai.llm.AbstractSseLlmClient;
+import org.atmosphere.ai.llm.ChatMessage;
+import org.atmosphere.ai.llm.ToolCallAccumulator;
+import org.atmosphere.ai.llm.ToolLoopGuard;
+import org.atmosphere.ai.llm.ToolLoopPolicies;
+import org.atmosphere.ai.tool.ToolDefinition;
+import org.atmosphere.ai.tool.ToolExecutionHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.node.ObjectNode;
+
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Stateless HTTP client for the Cohere v2 Chat API
+ * ({@code POST /v2/chat}). Owns the SSE parse and the client-side tool
+ * loop; everything observability-related (JFR, AiMetrics, approval gates)
+ * is delegated to the {@link CohereAgentRuntime} caller and the shared
+ * {@link ToolExecutionHelper}.
+ *
+ * <p>Wire shape verified against the Cohere v2 Chat API docs:</p>
+ * <ul>
+ *   <li>Headers: {@code Authorization: Bearer &lt;key&gt;},
+ *       {@code Content-Type: application/json},
+ *       {@code Accept: text/event-stream}.</li>
+ *   <li>Required body fields: {@code model}, {@code messages},
+ *       {@code stream: true}.</li>
+ *   <li>Optional body fields used here: {@code max_tokens},
+ *       {@code temperature}, {@code p}, {@code stop_sequences},
+ *       {@code tools}.</li>
+ *   <li>Message roles: {@code system}, {@code user}, {@code assistant},
+ *       {@code tool} (tool result carries {@code tool_call_id} and
+ *       {@code content}).</li>
+ *   <li>SSE events: {@code message-start}, {@code content-start},
+ *       {@code content-delta} (text in {@code delta.message.content.text}),
+ *       {@code content-end}, {@code tool-plan-delta} (free-text plan
+ *       preamble fragments in {@code delta.message.tool_plan},
+ *       accumulated per round and forwarded as one
+ *       {@link AiEvent.Progress} frame — see
+ *       {@link #handleToolPlanDelta}), {@code tool-call-start} (carries
+ *       {@code delta.message.tool_calls[N]} with {@code id}, {@code function.name}),
+ *       {@code tool-call-delta} (argument fragment in
+ *       {@code delta.message.tool_calls[N].function.arguments}),
+ *       {@code tool-call-end}, {@code citation-start},
+ *       {@code citation-end}, {@code message-end} (carries
+ *       {@code delta.usage.billed_units}/{@code tokens} and
+ *       {@code delta.finish_reason}).</li>
+ * </ul>
+ *
+ * <p>Vision / multi-modal input is staged for the end-of-phase parity
+ * pass — text and tool calling ship first per the
+ * {@code docs/audits/vision-parity-2026-05-22.md} plan.</p>
+ */
+public final class CohereChatClient extends AbstractSseLlmClient {
+
+    private static final Logger logger = LoggerFactory.getLogger(CohereChatClient.class);
+    private static final String DEFAULT_BASE_URL = "https://api.cohere.com";
+    private static final int DEFAULT_MAX_TOKENS = 4096;
+
+    /**
+     * Opt-in framework-level generation overrides. Never {@code null} — the
+     * builder defaults it to {@link org.atmosphere.ai.GenerationParams#defaults()}
+     * (all unset). {@code temperature}, {@code p}, and {@code stop_sequences}
+     * are applied in {@link #buildRequestBody} when set; {@code maxTokens} is
+     * handled by the runtime's builder wiring (it feeds the base
+     * {@code max_tokens} field, preserving the {@code cohere.max.tokens}
+     * sysprop precedence). An unset component leaves the request body
+     * byte-identical to today.
+     */
+    private final org.atmosphere.ai.GenerationParams generation;
+
+    private CohereChatClient(Builder b) {
+        super(new SseClientConfig(b.baseUrl, b.apiKey, b.httpClient, b.timeout,
+                b.maxTokens, b.customHeaders, b.retryPolicy));
+        this.generation = b.generation != null
+                ? b.generation : org.atmosphere.ai.GenerationParams.defaults();
+    }
+
+    public static Builder builder() {
+        return new Builder();
+    }
+
+    /**
+     * Returns the framework-level generation overrides applied to every
+     * request body. Never {@code null}. Package-private so the wiring tests can
+     * assert that {@link CohereAgentRuntime#createNativeClient} threaded the
+     * {@code AiConfig} generation through without reaching into private state.
+     */
+    org.atmosphere.ai.GenerationParams generationForTest() {
+        return generation;
+    }
+
+    /**
+     * Returns the resolved {@code max_tokens} this client emits on every
+     * request. Package-private — exists so the wiring tests can pin the
+     * sysprop / GenerationParams / default precedence the runtime resolves.
+     */
+    int maxTokensForTest() {
+        return maxTokens;
+    }
+
+    @Override
+    protected String providerName() {
+        return "Cohere";
+    }
+
+    /**
+     * Run one or more rounds of: build request → POST → SSE-parse → if the
+     * model emitted tool calls, dispatch them and feed
+     * {@code role: "tool"} result messages back into the next round.
+     * Forwards text deltas via {@link StreamingSession#send} and tool
+     * start/result frames via {@link AiEvent}. Calls
+     * {@link StreamingSession#complete} once the final round emits no
+     * further tool requests.
+     *
+     * @param model    Cohere model identifier (e.g. {@code command-a-plus-05-2026})
+     * @param history  conversation history threaded by the framework
+     * @param system   system prompt; null or blank is skipped
+     * @param userMessage incoming user turn text
+     * @param context  pipeline execution context (carries tools, approval
+     *                 policy, strategy, injectables, listeners — exactly the
+     *                 surface {@link ToolExecutionHelper#executeWithApproval}
+     *                 needs)
+     * @param session  streaming sink the runtime writes through
+     * @param cancelled cooperative cancel flag set by the caller's handle
+     */
+    public void stream(String model,
+                       List<ChatMessage> history,
+                       String system,
+                       String userMessage,
+                       AgentExecutionContext context,
+                       StreamingSession session,
+                       AtomicBoolean cancelled) {
+        Objects.requireNonNull(model, "model");
+        Objects.requireNonNull(session, "session");
+        var effectiveCancel = cancelled != null ? cancelled : new AtomicBoolean();
+        // Per-request tool-loop policy controls both the iteration cap and the
+        // overflow behavior, exactly like the Built-in OpenAiCompatibleClient.
+        // fromOrDefault returns ToolLoopPolicy.DEFAULT (5,
+        // COMPLETE_WITHOUT_TOOLS) when no policy is attached, so callers that
+        // do not opt in keep the pre-policy behavior bit-identical.
+        var loopPolicy = ToolLoopPolicies.fromOrDefault(context);
+        var rounds = 0;
+        // Working messages list starts with optional system prompt + history,
+        // then accumulates assistant + tool messages across rounds.
+        var working = new ArrayList<ObjectNode>();
+        if (system != null && !system.isBlank()) {
+            working.add(textMessage("system", system));
+        }
+        for (var msg : (history != null ? history : List.<ChatMessage>of())) {
+            var converted = toCohereMessage(msg);
+            if (converted != null) {
+                working.add(converted);
+            }
+        }
+        var parts = context != null ? context.parts() : List.<org.atmosphere.ai.Content>of();
+        if (!parts.isEmpty()) {
+            // Multi-modal path: Cohere v2 chat expects a content array when
+            // any part of the message is non-text.
+            working.add(userMessageWithParts(userMessage, parts));
+        } else if (userMessage != null && !userMessage.isEmpty()) {
+            // Text-only fast path: keep the legacy string-content shape so
+            // existing wire-format assertions and lighter-weight inference
+            // backends that don't parse content arrays continue to work.
+            working.add(textMessage("user", userMessage));
+        }
+
+        // Provider-native structured output: the pipeline stamps the apply flag +
+        // generated schema when the request declares a response type and
+        // NativeStructuredOutputMode is not DISABLED. Resolved once per request; a
+        // NativeStructuredOutputMode.AUTO graceful fall-back re-dispatches with the
+        // flag cleared (so nativeSchema becomes null) if Cohere rejects it.
+        var nativeSchema = context != null && context.responseType() != null
+                && org.atmosphere.ai.NativeStructuredOutput.shouldApply(context)
+                ? org.atmosphere.ai.NativeStructuredOutput.schema(context) : null;
+
+        while (true) {
+            if (effectiveCancel.get()) {
+                session.error(new InterruptedException("Cancelled before round " + rounds));
+                return;
+            }
+            switch (ToolLoopGuard.checkRoundCap(rounds, loopPolicy, session, providerName())) {
+                case CONTINUE -> { /* below the cap — run the round below */ }
+                case FAILED -> {
+                    // checkRoundCap already fired session.error(...).
+                    return;
+                }
+                case COMPLETE_WITHOUT_TOOLS -> {
+                    session.complete();
+                    return;
+                }
+            }
+            var requestBody = buildRequestBody(model, working, context.tools(), nativeSchema);
+            HttpRequest httpRequest;
+            try {
+                httpRequest = buildHttpRequest(requestBody);
+            } catch (RuntimeException e) {
+                session.error(e);
+                return;
+            }
+
+            var roundOutcome = parseRound(httpRequest, context, session, effectiveCancel);
+            if (roundOutcome.errored()) {
+                // The round already emitted session.error / session.complete.
+                return;
+            }
+            working.add(buildAssistantMessage(roundOutcome.assistantText(),
+                    roundOutcome.toolCalls()));
+            if (roundOutcome.toolCalls().isEmpty()) {
+                session.complete();
+                return;
+            }
+            for (var entry : roundOutcome.toolResults().entrySet()) {
+                working.add(toolResultMessage(entry.getKey(), entry.getValue()));
+            }
+            rounds++;
+        }
+    }
+
+    private RoundOutcome parseRound(HttpRequest httpRequest,
+                                    AgentExecutionContext context,
+                                    StreamingSession session,
+                                    AtomicBoolean cancelled) {
+        var assistantText = new StringBuilder();
+        // Cohere emits a free-text "tool plan" preamble before its tool
+        // calls, streamed as tool-plan-delta fragments. Accumulated here per
+        // round; forwarded once the round parses (see below).
+        var toolPlan = new StringBuilder();
+        // Tool-call accumulators keyed by tool-call index (Cohere assigns
+        // a stable index on tool-call-start within a stream).
+        var toolBuffers = new LinkedHashMap<Integer, ToolCallAccumulator>();
+        // (ToolCallAccumulator is the shared org.atmosphere.ai.llm type; the
+        // Cohere-specific tool-call index is the local map key, not a field.)
+        // Mutable holder so the per-event mapper lambda can update the running
+        // usage across message-end events.
+        var usageHolder = new TokenUsage[1];
+
+        // The shared base owns the HTTP send, non-2xx error string, and the
+        // data:-framed readLine scaffolding; this lambda is the only
+        // Cohere-specific part — the per-event switch.
+        var completed = runRound(httpRequest, session, cancelled, event -> {
+            var type = event.path("type").asString("");
+            switch (type) {
+                case "content-delta" -> handleContentDelta(event, session, assistantText);
+                case "tool-plan-delta" -> handleToolPlanDelta(event, toolPlan);
+                case "tool-call-start" -> handleToolCallStart(event, toolBuffers);
+                case "tool-call-delta" -> handleToolCallDelta(event, session, toolBuffers);
+                case "message-end" -> {
+                    var parsed = parseUsage(event, usageHolder[0]);
+                    if (parsed != null) {
+                        usageHolder[0] = parsed;
+                    }
+                }
+                // Grounded-generation citations stream as first-class
+                // AiEvents so the "citations render without lossy
+                // translation" pitch is real (registre#16).
+                case "citation-start" -> handleCitationStart(event, session);
+                // Lifecycle events with no SPI mapping — silently tracked so
+                // future capability passes can wire them up.
+                case "message-start", "content-start", "content-end",
+                        "tool-call-end", "citation-end" -> { /* no-op */ }
+                default -> logger.trace("Unhandled Cohere SSE event: {}", type);
+            }
+        });
+        if (!completed) {
+            // runRound already emitted session.error for the IO/non-2xx paths;
+            // the cancel path leaves the session untouched (matches original).
+            return RoundOutcome.failure();
+        }
+
+        var plan = toolPlan.toString();
+        if (!plan.isBlank()) {
+            // Cohere's tool_plan is a read-only, per-turn preamble — free
+            // text the model emits before its tool calls, NOT a maintained
+            // plan with steps and statuses. Forwarding it as Progress (and
+            // not AiEvent.PlanUpdate) keeps runtime truth: this runtime does
+            // not declare AiCapability.PLANNING, and a synthetic plan step
+            // would carry a fabricated status no later event ever completes.
+            // Emitted before the ToolStart frames, mirroring the wire order.
+            session.emit(new AiEvent.Progress(plan, null));
+        }
+
+        var usage = usageHolder[0];
+        if (usage != null && usage.hasCounts()) {
+            session.usage(usage);
+        }
+
+        // Dispatch every tool call via the shared ToolExecutionHelper so
+        // @RequiresApproval gates, ToolPermissionPolicy, and JFR events fire
+        // uniformly across runtimes.
+        var toolResults = new LinkedHashMap<String, String>();
+        var toolCalls = new ArrayList<ToolCallAccumulator>();
+        for (var entry : toolBuffers.entrySet()) {
+            var acc = entry.getValue();
+            toolCalls.add(acc);
+            var args = acc.argumentsAsMap(MAPPER);
+            session.emit(new AiEvent.ToolStart(acc.functionName(), args));
+            var resultText = dispatchTool(context, session, acc, args);
+            session.emit(new AiEvent.ToolResult(acc.functionName(), resultText));
+            toolResults.put(acc.id(), resultText);
+        }
+
+        return new RoundOutcome(assistantText.toString(), toolCalls, toolResults, false);
+    }
+
+    private void handleContentDelta(JsonNode event,
+                                    StreamingSession session,
+                                    StringBuilder assistantText) {
+        // Cohere streams text under delta.message.content.text. Defensive
+        // path-walk: the SDK has shifted these field names across betas
+        // (content.text vs content[0].text) — accept either.
+        var delta = event.path("delta").path("message").path("content");
+        String chunk = "";
+        if (delta.isObject() && delta.has("text")) {
+            chunk = delta.path("text").asString("");
+        } else if (delta.isArray() && delta.size() > 0) {
+            chunk = delta.get(0).path("text").asString("");
+        }
+        if (!chunk.isEmpty()) {
+            session.send(chunk);
+            assistantText.append(chunk);
+        }
+    }
+
+    /**
+     * Accumulate one {@code tool-plan-delta} fragment. Cohere streams the
+     * tool-plan preamble as text fragments under
+     * {@code delta.message.tool_plan} (shape verified against cohere-java
+     * 1.7.0's {@code ChatToolPlanDeltaEventDeltaMessage#getToolPlan}); the
+     * complete text is forwarded as a single {@link AiEvent.Progress} frame
+     * once the round parses, so consoles show what the model is about to do
+     * without rendering partial-sentence fragments.
+     */
+    private void handleToolPlanDelta(JsonNode event, StringBuilder toolPlan) {
+        var chunk = event.path("delta").path("message").path("tool_plan").asString("");
+        if (!chunk.isEmpty()) {
+            toolPlan.append(chunk);
+        }
+    }
+
+    private void handleToolCallStart(JsonNode event,
+                                     Map<Integer, ToolCallAccumulator> toolBuffers) {
+        var index = event.path("index").asInt(-1);
+        if (index < 0) {
+            return;
+        }
+        var toolCall = event.path("delta").path("message").path("tool_calls");
+        // Cohere documents tool_calls as an object in delta on tool-call-start;
+        // some SDK versions ship an array — accept either.
+        JsonNode call = toolCall.isArray() && toolCall.size() > 0
+                ? toolCall.get(0) : toolCall;
+        if (call.isMissingNode() || call.isNull()) {
+            return;
+        }
+        var acc = new ToolCallAccumulator();
+        acc.setId(call.path("id").asString(""));
+        acc.setFunctionName(call.path("function").path("name").asString(""));
+        var seedArgs = call.path("function").path("arguments");
+        if (seedArgs.isString()) {
+            acc.appendArguments(seedArgs.asString(""));
+        } else if (seedArgs.isObject() && !seedArgs.isEmpty()) {
+            acc.appendArguments(seedArgs.toString());
+        }
+        toolBuffers.put(index, acc);
+    }
+
+    /**
+     * Map a Cohere v2 {@code citation-start} frame to
+     * {@link org.atmosphere.ai.AiEvent.Citation}: the cited answer span plus
+     * the source ids backing it.
+     */
+    private void handleCitationStart(JsonNode event, StreamingSession session) {
+        var citation = event.path("delta").path("message").path("citations");
+        if (citation.isMissingNode() || citation.isNull()) {
+            return;
+        }
+        var sources = new java.util.ArrayList<String>();
+        var sourceNodes = citation.path("sources");
+        if (sourceNodes.isArray()) {
+            for (var source : sourceNodes) {
+                var id = source.path("id").asString("");
+                if (!id.isEmpty()) {
+                    sources.add(id);
+                }
+            }
+        }
+        session.emit(new org.atmosphere.ai.AiEvent.Citation(
+                citation.path("text").asString(""),
+                citation.path("start").asInt(-1),
+                citation.path("end").asInt(-1),
+                sources));
+    }
+
+    private void handleToolCallDelta(JsonNode event,
+                                     StreamingSession session,
+                                     Map<Integer, ToolCallAccumulator> toolBuffers) {
+        var index = event.path("index").asInt(-1);
+        var toolCall = event.path("delta").path("message").path("tool_calls");
+        JsonNode call = toolCall.isArray() && toolCall.size() > 0
+                ? toolCall.get(0) : toolCall;
+        var chunk = call.path("function").path("arguments").asString("");
+        if (!chunk.isEmpty()) {
+            var acc = toolBuffers.get(index);
+            if (acc != null) {
+                acc.appendArguments(chunk);
+                // Forward the incremental fragment so browser UIs can render
+                // partial tool-argument JSON as the model types it — same
+                // posture as OpenAiCompatibleClient's chat-completions loop.
+                // The accumulator id is set by tool-call-start; if Cohere ever
+                // ships a tool-call-delta before tool-call-start (it does not
+                // today), the empty id is dropped by StreamingSession's null/
+                // empty guard rather than producing a stray frame.
+                session.toolCallDelta(acc.id(), chunk);
+            }
+        }
+    }
+
+    private TokenUsage parseUsage(JsonNode event, TokenUsage prior) {
+        // Cohere reports usage under two parallel shapes:
+        //   delta.usage.billed_units.{input_tokens,output_tokens}
+        //   delta.usage.tokens.{input_tokens,output_tokens}
+        // Both can appear together; prefer the `tokens` block (raw counts)
+        // when present, since `billed_units` reflects pricing model and
+        // may exclude cached tokens.
+        var usage = event.path("delta").path("usage");
+        if (usage.isMissingNode() || usage.isNull()) {
+            return prior;
+        }
+        var tokens = usage.has("tokens") ? usage.get("tokens")
+                : usage.path("billed_units");
+        if (tokens.isMissingNode() || tokens.isNull()) {
+            return prior;
+        }
+        long input = tokens.has("input_tokens") ? tokens.get("input_tokens").asLong()
+                : (prior != null ? prior.input() : 0L);
+        long output = tokens.has("output_tokens") ? tokens.get("output_tokens").asLong()
+                : (prior != null ? prior.output() : 0L);
+        long cached = usage.has("cached_tokens") ? usage.get("cached_tokens").asLong()
+                : (prior != null ? prior.cachedInput() : 0L);
+        return TokenUsage.fromCounts(input, output, cached, null);
+    }
+
+    private String dispatchTool(AgentExecutionContext context,
+                                StreamingSession session,
+                                ToolCallAccumulator acc,
+                                Map<String, Object> args) {
+        var definition = findToolDefinition(context.tools(), acc.functionName());
+        if (definition == null) {
+            return "{\"error\":\"Unknown tool: " + acc.functionName() + "\"}";
+        }
+        // Forward the session's framework injectables (AgentFleet, AgentIdentity,
+        // CodeSandbox, ...) to the tool, plus the live session — mirroring the
+        // built-in runtime's OpenAiCompatibleClient. Without this, @AiTool methods
+        // that declare framework types (or the code_exec tool's CodeSandbox) would
+        // be unavailable on the Cohere path (Correctness Invariant #7 — Mode Parity).
+        var injectables = new java.util.LinkedHashMap<Class<?>, Object>(session.injectables());
+        injectables.putIfAbsent(StreamingSession.class, session);
+        var approvalPolicy = context.approvalPolicy() != null
+                ? context.approvalPolicy() : ToolApprovalPolicy.annotated();
+        return ToolExecutionHelper.executeWithApproval(
+                acc.functionName(), definition, args, session,
+                context.approvalStrategy(), approvalPolicy, injectables);
+    }
+
+    private static ToolDefinition findToolDefinition(List<ToolDefinition> tools, String name) {
+        if (tools == null || name == null) {
+            return null;
+        }
+        for (var tool : tools) {
+            if (name.equals(tool.name())) {
+                return tool;
+            }
+        }
+        return null;
+    }
+
+    private ObjectNode toCohereMessage(ChatMessage msg) {
+        if (msg == null || msg.role() == null) {
+            return null;
+        }
+        return switch (msg.role()) {
+            case "user" -> textMessage("user", msg.content() != null ? msg.content() : "");
+            case "assistant" -> textMessage("assistant", msg.content() != null ? msg.content() : "");
+            case "system" -> textMessage("system", msg.content() != null ? msg.content() : "");
+            case "tool" -> toolResultMessage(msg.toolCallId() != null ? msg.toolCallId() : "",
+                    msg.content() != null ? msg.content() : "");
+            default -> null;
+        };
+    }
+
+    private ObjectNode textMessage(String role, String text) {
+        var message = MAPPER.createObjectNode();
+        message.put("role", role);
+        message.put("content", text != null ? text : "");
+        return message;
+    }
+
+    /**
+     * Assemble a user-role message that combines optional text with any
+     * multi-modal parts. Cohere v2 chat uses OpenAI-compatible content
+     * arrays — text blocks ({@code {"type":"text"}}) and image_url blocks
+     * ({@code {"type":"image_url","image_url":{"url":"data:..."}}}) — when
+     * a single message carries multiple parts.
+     *
+     * <p>{@link org.atmosphere.ai.Content.Image} translates to an
+     * {@code image_url} block with a base64 data URI;
+     * {@link org.atmosphere.ai.Content.Audio} and
+     * {@link org.atmosphere.ai.Content.File} are dropped with a debug log
+     * because the Cohere v2 chat content array has no audio or file block
+     * type. Declaring AUDIO without the wire path would lie about runtime
+     * truth.</p>
+     */
+    private ObjectNode userMessageWithParts(String text, List<org.atmosphere.ai.Content> parts) {
+        var message = MAPPER.createObjectNode();
+        message.put("role", "user");
+        var content = message.putArray("content");
+        if (text != null && !text.isEmpty()) {
+            var textBlock = content.addObject();
+            textBlock.put("type", "text");
+            textBlock.put("text", text);
+        }
+        for (var part : parts) {
+            if (part instanceof org.atmosphere.ai.Content.Image img) {
+                var imageBlock = content.addObject();
+                imageBlock.put("type", "image_url");
+                var imageUrl = imageBlock.putObject("image_url");
+                imageUrl.put("url", "data:" + img.mimeType() + ";base64,"
+                        + java.util.Base64.getEncoder().encodeToString(img.data()));
+            } else if (part instanceof org.atmosphere.ai.Content.Text t) {
+                var textBlock = content.addObject();
+                textBlock.put("type", "text");
+                textBlock.put("text", t.text());
+            } else {
+                logger.debug("Dropping unsupported multi-modal part {} — "
+                        + "Cohere v2 chat content array has no matching block type",
+                        part.getClass().getSimpleName());
+            }
+        }
+        return message;
+    }
+
+    private ObjectNode toolResultMessage(String toolCallId, String content) {
+        var message = MAPPER.createObjectNode();
+        message.put("role", "tool");
+        message.put("tool_call_id", toolCallId != null ? toolCallId : "");
+        message.put("content", content != null ? content : "");
+        return message;
+    }
+
+    private ObjectNode buildAssistantMessage(String text, List<ToolCallAccumulator> toolCalls) {
+        var message = MAPPER.createObjectNode();
+        message.put("role", "assistant");
+        message.put("content", text != null ? text : "");
+        if (toolCalls != null && !toolCalls.isEmpty()) {
+            var array = message.putArray("tool_calls");
+            for (var call : toolCalls) {
+                var node = array.addObject();
+                node.put("id", call.id());
+                node.put("type", "function");
+                var fn = node.putObject("function");
+                fn.put("name", call.functionName());
+                fn.put("arguments", call.arguments());
+            }
+        }
+        return message;
+    }
+
+    private String buildRequestBody(String model, List<ObjectNode> messages,
+                                    List<ToolDefinition> tools, String jsonSchema) {
+        var root = MAPPER.createObjectNode();
+        root.put("model", model);
+        root.put("max_tokens", maxTokens);
+        root.put("stream", true);
+        // Framework-level GenerationParams overrides ride through to the
+        // Cohere v2 Chat wire when set. Cohere names the nucleus-sampling
+        // field p (not top_p) and the stop field stop_sequences (array).
+        // Unset components are omitted so the body stays byte-identical to
+        // today. maxTokens is NOT applied here — it is already folded into
+        // the base `max_tokens` field by the runtime's builder wiring, which
+        // preserves the cohere.max.tokens precedence.
+        if (generation.temperature() != null) {
+            root.put("temperature", generation.temperature());
+        }
+        if (generation.topP() != null) {
+            root.put("p", generation.topP());
+        }
+        if (generation.stop() != null && !generation.stop().isEmpty()) {
+            var stopArray = root.putArray("stop_sequences");
+            for (var s : generation.stop()) {
+                stopArray.add(s);
+            }
+        }
+        var msgs = root.putArray("messages");
+        for (var m : messages) {
+            msgs.add(m);
+        }
+        if (tools != null && !tools.isEmpty()) {
+            var toolArray = root.putArray("tools");
+            for (var t : tools) {
+                toolArray.add(toolDefinitionNode(t));
+            }
+        }
+        if (jsonSchema != null && !jsonSchema.isBlank()) {
+            // Cohere v2 native structured output. Verified wire shape from the
+            // Cohere v2 structured-outputs docs: response_format with
+            // type=json_object carries the schema under the "schema" sub-field
+            // (NOT "json_schema"). A malformed schema must not break the request —
+            // on a parse failure we skip native enforcement and let the pipeline's
+            // prompt-injection path carry the schema instead.
+            //   "response_format": { "type": "json_object", "schema": {...} }
+            try {
+                var schemaNode = MAPPER.readTree(jsonSchema);
+                var responseFormat = root.putObject("response_format");
+                responseFormat.put("type", "json_object");
+                responseFormat.set("schema", schemaNode);
+            } catch (RuntimeException e) {
+                logger.debug("Skipping Cohere response_format — schema not parseable", e);
+            }
+        }
+        try {
+            return MAPPER.writeValueAsString(root);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to serialise Cohere request body", e);
+        }
+    }
+
+    private ObjectNode toolDefinitionNode(ToolDefinition def) {
+        var root = MAPPER.createObjectNode();
+        root.put("type", "function");
+        var function = root.putObject("function");
+        function.put("name", def.name());
+        function.put("description", def.description());
+        // Wrap the shared inner schema object (built by the base) in Cohere's
+        // {@code function.parameters} envelope.
+        function.set("parameters", toolSchemaObjectNode(def, MAPPER));
+        return root;
+    }
+
+    /**
+     * Live model enumeration against Cohere's {@code GET /v1/models}.
+     * Response shape: {@code {"models":[{"name":"command-a-...","endpoints":
+     * [...]}, ...],"next_page_token":...}} — Cohere keys each entry by
+     * {@code name} (not {@code id}), which
+     * {@link org.atmosphere.ai.llm.ModelListJson} accepts alongside the
+     * OpenAI/Anthropic {@code data[].id} shape. Pagination is ignored; the
+     * parser bounds the result regardless.
+     *
+     * <p>Best-effort by contract: any transport failure, non-2xx status, or
+     * unparseable body returns an empty list (logged at DEBUG) so enumeration
+     * can never break discovery or dispatch. Runs with a short timeout
+     * independent of the streaming timeout.</p>
+     *
+     * @return immutable list of model identifiers; never {@code null}
+     */
+    public List<String> listModels() {
+        var enumTimeout = timeout.compareTo(Duration.ofSeconds(10)) < 0
+                ? timeout : Duration.ofSeconds(10);
+        var builder = HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl + "/v1/models"))
+                .header("accept", "application/json")
+                .GET()
+                .timeout(enumTimeout);
+        if (apiKey != null && !apiKey.isBlank()) {
+            builder.header("authorization", "Bearer " + apiKey);
+        }
+        applyReservedFilteredHeaders(builder,
+                Set.of("authorization", "content-type", "accept"));
+        try {
+            var response = httpClient.send(builder.build(),
+                    java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() / 100 != 2) {
+                logger.debug("Cohere model enumeration returned {}", response.statusCode());
+                return List.of();
+            }
+            return org.atmosphere.ai.llm.ModelListJson.parse(MAPPER, response.body());
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            logger.debug("Cohere model enumeration interrupted", ie);
+            return List.of();
+        } catch (Exception e) {
+            logger.debug("Cohere model enumeration failed", e);
+            return List.of();
+        }
+    }
+
+    private HttpRequest buildHttpRequest(String body) {
+        var builder = HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl + "/v2/chat"))
+                .header("content-type", "application/json")
+                .header("accept", "text/event-stream")
+                .POST(HttpRequest.BodyPublishers.ofString(body))
+                .timeout(timeout);
+        if (apiKey != null && !apiKey.isBlank()) {
+            builder.header("authorization", "Bearer " + apiKey);
+        }
+        // Custom headers carry observability / proxy / tenant metadata.
+        // Reserved protocol headers are filtered out — same posture as
+        // OpenAiCompatibleClient.applyCustomHeaders and
+        // AnthropicMessagesClient.buildHttpRequest.
+        applyReservedFilteredHeaders(builder,
+                Set.of("authorization", "content-type", "accept"));
+        return builder.build();
+    }
+
+    /** Per-round outcome — accumulated assistant text, tool calls dispatched
+     *  during the round, and the {@code tool_call_id → result} map ready for
+     *  the next round. */
+    private record RoundOutcome(
+            String assistantText,
+            List<ToolCallAccumulator> toolCalls,
+            Map<String, String> toolResults,
+            boolean errored) {
+        static RoundOutcome failure() {
+            return new RoundOutcome("", List.of(), Map.of(), true);
+        }
+    }
+
+    /** Builder for {@link CohereChatClient}. */
+    public static final class Builder {
+        private String baseUrl = DEFAULT_BASE_URL;
+        private String apiKey;
+        private HttpClient httpClient;
+        private Duration timeout = Duration.ofSeconds(120);
+        private int maxTokens = DEFAULT_MAX_TOKENS;
+        private final LinkedHashMap<String, String> customHeaders = new LinkedHashMap<>();
+        private org.atmosphere.ai.RetryPolicy retryPolicy;
+        private org.atmosphere.ai.GenerationParams generation =
+                org.atmosphere.ai.GenerationParams.defaults();
+
+        private Builder() {
+        }
+
+        public Builder baseUrl(String baseUrl) {
+            this.baseUrl = baseUrl;
+            return this;
+        }
+
+        public Builder apiKey(String apiKey) {
+            this.apiKey = apiKey;
+            return this;
+        }
+
+        public Builder httpClient(HttpClient httpClient) {
+            this.httpClient = httpClient;
+            return this;
+        }
+
+        public Builder timeout(Duration timeout) {
+            this.timeout = timeout;
+            return this;
+        }
+
+        public Builder maxTokens(int maxTokens) {
+            this.maxTokens = maxTokens;
+            return this;
+        }
+
+        /**
+         * HTTP-layer retry policy applied inside the shared SSE base: 429 /
+         * 500 / 502 / 503 / 408 are retried with exponential backoff and a
+         * {@code Retry-After} header on 429 is honored (capped at 60s).
+         * Defaults to {@link org.atmosphere.ai.RetryPolicy#DEFAULT}; pass
+         * {@link org.atmosphere.ai.RetryPolicy#NONE} to disable.
+         */
+        public Builder retryPolicy(org.atmosphere.ai.RetryPolicy retryPolicy) {
+            this.retryPolicy = retryPolicy;
+            return this;
+        }
+
+        /**
+         * Framework-level generation overrides applied to every request body
+         * (temperature → {@code temperature}, topP → {@code p}, stop →
+         * {@code stop_sequences}). {@code maxTokens} is intentionally NOT
+         * consumed here — the runtime folds it into {@link #maxTokens(int)}
+         * so the {@code cohere.max.tokens} sysprop precedence is preserved.
+         * A {@code null} argument collapses to
+         * {@link org.atmosphere.ai.GenerationParams#defaults()} (all unset,
+         * byte-identical request body).
+         */
+        public Builder generation(org.atmosphere.ai.GenerationParams generation) {
+            this.generation = generation != null
+                    ? generation : org.atmosphere.ai.GenerationParams.defaults();
+            return this;
+        }
+
+        public Builder customHeader(String name, String value) {
+            if (name != null && !name.isBlank() && value != null) {
+                this.customHeaders.put(name, value);
+            }
+            return this;
+        }
+
+        public Builder customHeaders(Map<String, String> headers) {
+            this.customHeaders.clear();
+            if (headers != null) {
+                for (var entry : headers.entrySet()) {
+                    customHeader(entry.getKey(), entry.getValue());
+                }
+            }
+            return this;
+        }
+
+        public CohereChatClient build() {
+            return new CohereChatClient(this);
+        }
+    }
+}

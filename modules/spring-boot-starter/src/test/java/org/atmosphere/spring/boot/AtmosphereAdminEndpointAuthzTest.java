@@ -1,0 +1,292 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.spring.boot;
+
+import org.atmosphere.admin.AtmosphereAdmin;
+import org.atmosphere.admin.ControlAuthorizer;
+import org.atmosphere.admin.ai.VerifierController;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
+import org.springframework.http.MediaType;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+
+import java.security.Principal;
+import java.util.Map;
+
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+/**
+ * Regression for P0: admin HTTP write endpoints consulted only the
+ * {@code atmosphere.admin.http-write-enabled} feature flag. Once the flag
+ * was flipped, every mutating POST/DELETE was open to anonymous callers —
+ * direct violation of Correctness Invariant #6 (authn + authz on every
+ * mutating surface).
+ *
+ * <p>Fixed by {@code guardWrite(HttpServletRequest, action, target)} which
+ * now enforces (in order): feature flag → servlet Principal → installed
+ * {@link ControlAuthorizer}. Every decision is recorded in the control
+ * audit log.</p>
+ */
+class AtmosphereAdminEndpointAuthzTest {
+
+    private AtmosphereAdmin admin;
+    private MockMvc mockMvcGateClosed;
+    private MockMvc mockMvcGateOpen;
+    private MockMvc mockMvcRoleGated;
+
+    @BeforeEach
+    void setUp() {
+        // Explicit stubs so test setup is readable; adding a new call site
+        // to AtmosphereAdminEndpoint fails fast with a clear NPE rather
+        // than silently succeeding through a RETURNS_DEEP_STUBS chain.
+        admin = Mockito.mock(AtmosphereAdmin.class);
+        var framework = Mockito.mock(
+                org.atmosphere.admin.framework.FrameworkController.class);
+        Mockito.when(admin.auditLog()).thenReturn(
+                new org.atmosphere.admin.ControlAuditLog(100));
+        Mockito.when(admin.framework()).thenReturn(framework);
+        Mockito.when(framework.broadcast(Mockito.anyString(), Mockito.anyString()))
+                .thenReturn(true);
+        // Each MockMvc instance gets its own Environment so the feature
+        // flag is consulted on every guardWrite call (runtime-flippable
+        // in production, fixed per-instance in tests).
+        mockMvcGateClosed = MockMvcBuilders.standaloneSetup(
+                        new AtmosphereAdminEndpoint(admin, envWithWrite(false)))
+                .build();
+        mockMvcGateOpen = MockMvcBuilders.standaloneSetup(
+                        new AtmosphereAdminEndpoint(admin, envWithWrite(true)))
+                .build();
+        // Write enabled AND a required role configured — exercises the
+        // opt-in atmosphere.admin.required-role gate.
+        mockMvcRoleGated = MockMvcBuilders.standaloneSetup(
+                        new AtmosphereAdminEndpoint(admin,
+                                envWithWriteAndRole(true, "atmosphere-admin")))
+                .build();
+    }
+
+    private static org.springframework.core.env.Environment envWithWrite(boolean enabled) {
+        var env = new org.springframework.mock.env.MockEnvironment();
+        env.setProperty("atmosphere.admin.http-write-enabled", String.valueOf(enabled));
+        return env;
+    }
+
+    private static org.springframework.core.env.Environment envWithWriteAndRole(
+            boolean enabled, String role) {
+        var env = new org.springframework.mock.env.MockEnvironment();
+        env.setProperty("atmosphere.admin.http-write-enabled", String.valueOf(enabled));
+        env.setProperty("atmosphere.admin.required-role", role);
+        return env;
+    }
+
+    @Test
+    void writeEndpointsReturn403WhenFeatureFlagDisabled() throws Exception {
+        mockMvcGateClosed.perform(post("/api/admin/broadcasters/broadcast")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"broadcasterId\":\"/chat\",\"message\":\"x\"}"))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    void writeEndpointsReturn401ForAnonymousCallerWhenFlagEnabled() throws Exception {
+        // Principal == null on a plain MockMvc request.
+        Mockito.when(admin.authorizer()).thenReturn(ControlAuthorizer.REQUIRE_PRINCIPAL);
+        mockMvcGateOpen.perform(post("/api/admin/broadcasters/broadcast")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"broadcasterId\":\"/chat\",\"message\":\"x\"}"))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void writeEndpointsReturn200ForAuthenticatedCallerUnderRequirePrincipal()
+            throws Exception {
+        Mockito.when(admin.authorizer()).thenReturn(ControlAuthorizer.REQUIRE_PRINCIPAL);
+        Principal alice = () -> "alice@example.com";
+        mockMvcGateOpen.perform(post("/api/admin/broadcasters/broadcast")
+                        .principal(alice)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"broadcasterId\":\"/chat\",\"message\":\"x\"}"))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void customAuthorizerThatDeniesReturns403ForAuthenticatedCaller()
+            throws Exception {
+        ControlAuthorizer roleCheck = (action, target, principal) -> false;
+        Mockito.when(admin.authorizer()).thenReturn(roleCheck);
+        Principal alice = () -> "alice@example.com";
+        mockMvcGateOpen.perform(post("/api/admin/broadcasters/broadcast")
+                        .principal(alice)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"broadcasterId\":\"/chat\",\"message\":\"x\"}"))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    void denyAllAuthorizerBlocksEvenAuthenticatedCallers() throws Exception {
+        Mockito.when(admin.authorizer()).thenReturn(ControlAuthorizer.DENY_ALL);
+        Principal alice = () -> "alice@example.com";
+        mockMvcGateOpen.perform(post("/api/admin/broadcasters/broadcast")
+                        .principal(alice)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"broadcasterId\":\"/chat\",\"message\":\"x\"}"))
+                .andExpect(status().isForbidden());
+    }
+
+    // ── Opt-in role authorization (atmosphere.admin.required-role) ──
+    // Parity with the Quarkus AdminResourceAuthzTest (Correctness
+    // Invariant #7). A servlet/Spring Security principal carrying the
+    // configured role writes; one without it is rejected; the
+    // X-Atmosphere-Auth token path stays ungated.
+
+    @Test
+    void writeAllowedWhenContainerPrincipalCarriesRequiredRole() throws Exception {
+        Mockito.when(admin.authorizer()).thenReturn(ControlAuthorizer.REQUIRE_PRINCIPAL);
+        Principal alice = () -> "alice@example.com";
+        mockMvcRoleGated.perform(post("/api/admin/broadcasters/broadcast")
+                        .principal(alice)
+                        .with(req -> {
+                            req.addUserRole("atmosphere-admin");
+                            return req;
+                        })
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"broadcasterId\":\"/chat\",\"message\":\"x\"}"))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void writeRejectedWhenContainerPrincipalLacksRequiredRole() throws Exception {
+        Mockito.when(admin.authorizer()).thenReturn(ControlAuthorizer.REQUIRE_PRINCIPAL);
+        Principal mallory = () -> "mallory@example.com";
+        mockMvcRoleGated.perform(post("/api/admin/broadcasters/broadcast")
+                        .principal(mallory)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"broadcasterId\":\"/chat\",\"message\":\"x\"}"))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    void requiredRoleDoesNotGateTheAtmosphereTokenPath() throws Exception {
+        // Simulate AdminApiAuthFilter's token wrapper: getUserPrincipal() is
+        // set AND the org.atmosphere.auth.principal attribute is present. The
+        // role gate must treat this as the (role-less) token path and defer to
+        // the ControlAuthorizer rather than 403 it for a missing role.
+        Mockito.when(admin.authorizer()).thenReturn(ControlAuthorizer.REQUIRE_PRINCIPAL);
+        Principal token = () -> "atmosphere-admin-token";
+        mockMvcRoleGated.perform(post("/api/admin/broadcasters/broadcast")
+                        .principal(token)
+                        .requestAttr("org.atmosphere.auth.principal", token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"broadcasterId\":\"/chat\",\"message\":\"x\"}"))
+                .andExpect(status().isOk());
+    }
+
+    // ── Eval dataset runner (POST /api/admin/evals/run) ──
+    // Same write gate as every other mutating admin route: feature flag →
+    // authenticated principal → ControlAuthorizer. The runner must never be
+    // reachable anonymously — it drives live LLM traffic.
+
+    @Test
+    void evalRunReturns403WhenFeatureFlagDisabled() throws Exception {
+        var evals = Mockito.mock(org.atmosphere.admin.evals.EvalController.class);
+        Mockito.when(admin.evalController()).thenReturn(evals);
+        mockMvcGateClosed.perform(post("/api/admin/evals/run")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"baseline\":\"smoke\"}"))
+                .andExpect(status().isForbidden());
+        Mockito.verify(evals, Mockito.never()).startRun(Mockito.any(), Mockito.any());
+    }
+
+    @Test
+    void evalRunReturns401ForAnonymousCallerWhenFlagEnabled() throws Exception {
+        var evals = Mockito.mock(org.atmosphere.admin.evals.EvalController.class);
+        Mockito.when(admin.evalController()).thenReturn(evals);
+        Mockito.when(admin.authorizer()).thenReturn(ControlAuthorizer.REQUIRE_PRINCIPAL);
+        mockMvcGateOpen.perform(post("/api/admin/evals/run")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"baseline\":\"smoke\"}"))
+                .andExpect(status().isUnauthorized());
+        Mockito.verify(evals, Mockito.never()).startRun(Mockito.any(), Mockito.any());
+    }
+
+    @Test
+    void evalRunReturns202ForAuthenticatedCallerUnderRequirePrincipal() throws Exception {
+        var evals = Mockito.mock(org.atmosphere.admin.evals.EvalController.class);
+        Mockito.when(admin.evalController()).thenReturn(evals);
+        Mockito.when(evals.runnerEnabled()).thenReturn(true);
+        Mockito.when(evals.startRun(Mockito.any(), Mockito.eq("alice@example.com")))
+                .thenReturn(new org.atmosphere.admin.evals.EvalRunner.StartedRun(
+                        "smoke-1", "smoke", 3));
+        Mockito.when(admin.authorizer()).thenReturn(ControlAuthorizer.REQUIRE_PRINCIPAL);
+        Principal alice = () -> "alice@example.com";
+        mockMvcGateOpen.perform(post("/api/admin/evals/run")
+                        .principal(alice)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"baseline\":\"smoke\"}"))
+                .andExpect(status().isAccepted());
+        Mockito.verify(evals).startRun(Mockito.any(), Mockito.eq("alice@example.com"));
+    }
+
+    @Test
+    void evalRunReturns503WhenRunnerNotWired() throws Exception {
+        var evals = Mockito.mock(org.atmosphere.admin.evals.EvalController.class);
+        Mockito.when(admin.evalController()).thenReturn(evals);
+        Mockito.when(evals.runnerEnabled()).thenReturn(false);
+        Mockito.when(admin.authorizer()).thenReturn(ControlAuthorizer.REQUIRE_PRINCIPAL);
+        Principal alice = () -> "alice@example.com";
+        mockMvcGateOpen.perform(post("/api/admin/evals/run")
+                        .principal(alice)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"baseline\":\"smoke\"}"))
+                .andExpect(status().isServiceUnavailable());
+        Mockito.verify(evals, Mockito.never()).startRun(Mockito.any(), Mockito.any());
+    }
+
+    @Test
+    void verifierCheckReturns401ForAnonymousCallerWhenFlagEnabled() throws Exception {
+        var verifier = Mockito.mock(VerifierController.class);
+        Mockito.when(admin.verifierController()).thenReturn(verifier);
+        Mockito.when(admin.authorizer()).thenReturn(ControlAuthorizer.REQUIRE_PRINCIPAL);
+
+        mockMvcGateOpen.perform(post("/api/admin/verifier/check")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"goal\":\"send a newsletter\"}"))
+                .andExpect(status().isUnauthorized());
+
+        Mockito.verify(verifier, Mockito.never()).check(Mockito.anyString());
+    }
+
+    @Test
+    void verifierCheckReturns200ForAuthenticatedCallerUnderRequirePrincipal()
+            throws Exception {
+        var verifier = Mockito.mock(VerifierController.class);
+        Mockito.when(verifier.check("send a newsletter"))
+                .thenReturn(Map.of("status", "executed"));
+        Mockito.when(admin.verifierController()).thenReturn(verifier);
+        Mockito.when(admin.authorizer()).thenReturn(ControlAuthorizer.REQUIRE_PRINCIPAL);
+        Principal alice = () -> "alice@example.com";
+
+        mockMvcGateOpen.perform(post("/api/admin/verifier/check")
+                        .principal(alice)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"goal\":\"send a newsletter\"}"))
+                .andExpect(status().isOk());
+
+        Mockito.verify(verifier).check("send a newsletter");
+    }
+}

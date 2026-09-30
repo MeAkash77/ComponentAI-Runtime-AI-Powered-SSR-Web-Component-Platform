@@ -1,0 +1,86 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.mcp.protocol;
+
+/**
+ * MCP protocol method constants.
+ */
+public final class McpMethod {
+
+    private McpMethod() {}
+
+    // Lifecycle
+    public static final String INITIALIZE = "initialize";
+    public static final String INITIALIZED = "notifications/initialized";
+    public static final String PING = "ping";
+
+    // Discovery (MCP 2026-07-28, SEP-2575) — stateless replacement for the
+    // initialize handshake. Servers MUST implement it; clients MAY call it to
+    // fetch supported versions + capabilities up front. Version negotiation can
+    // also happen inline via per-request {@code _meta}.
+    public static final String SERVER_DISCOVER = "server/discover";
+
+    // Tools
+    public static final String TOOLS_LIST = "tools/list";
+    public static final String TOOLS_CALL = "tools/call";
+
+    // Resources
+    public static final String RESOURCES_LIST = "resources/list";
+    public static final String RESOURCES_READ = "resources/read";
+    public static final String RESOURCES_SUBSCRIBE = "resources/subscribe";
+    public static final String RESOURCES_UNSUBSCRIBE = "resources/unsubscribe";
+    public static final String RESOURCES_TEMPLATES_LIST = "resources/templates/list";
+
+    // Completion (MCP 2025-06-18+) — argument autocompletion for prompts and
+    // resource templates, gated on the server's "completions" capability.
+    public static final String COMPLETION_COMPLETE = "completion/complete";
+
+    // Prompts
+    public static final String PROMPTS_LIST = "prompts/list";
+    public static final String PROMPTS_GET = "prompts/get";
+
+    // Notifications
+    public static final String PROGRESS = "notifications/progress";
+    public static final String CANCELLED = "notifications/cancelled";
+    public static final String RESOURCES_UPDATED = "notifications/resources/updated";
+
+    // Elicitation (MCP 2025-06-18+) — server requests info from user via the
+    // client. Issued as a request from server to client; the client returns an
+    // ElicitResult envelope with the user's response.
+    public static final String ELICITATION_CREATE = "elicitation/create";
+
+    // Sampling (MCP 2024-11-05+) — the server asks the client to run an LLM
+    // completion on its behalf. Issued server-to-client; the client returns a
+    // CreateMessageResult envelope. Gated on the client's advertised
+    // "sampling" capability.
+    public static final String SAMPLING_CREATE_MESSAGE = "sampling/createMessage";
+
+    // Roots (MCP 2024-11-05+) — the server asks the client which filesystem
+    // roots it exposes. Issued server-to-client; gated on the client's
+    // advertised "roots" capability.
+    public static final String ROOTS_LIST = "roots/list";
+
+    // Tasks (MCP 2025-11-25, experimental) — durable request tracking.
+    public static final String TASKS_GET = "tasks/get";
+    public static final String TASKS_RESULT = "tasks/result";
+    public static final String TASKS_LIST = "tasks/list";
+    public static final String TASKS_CANCEL = "tasks/cancel";
+    public static final String TASKS_STATUS = "notifications/tasks/status";
+
+    // tasks/update — client-to-server input for the stateless Tasks extension
+    // (SEP-2663). Supplies inputResponses to an input_required task.
+    public static final String TASKS_UPDATE = "tasks/update";
+}

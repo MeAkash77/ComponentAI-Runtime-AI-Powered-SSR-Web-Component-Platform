@@ -1,0 +1,963 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.quarkus.deployment;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import io.quarkus.arc.deployment.AdditionalBeanBuildItem;
+import io.quarkus.deployment.Capabilities;
+import io.quarkus.deployment.Capability;
+import io.quarkus.deployment.annotations.BuildProducer;
+import io.quarkus.deployment.annotations.BuildStep;
+import io.quarkus.deployment.annotations.ExecutionTime;
+import io.quarkus.deployment.annotations.Record;
+import io.quarkus.deployment.builditem.ApplicationIndexBuildItem;
+import io.quarkus.deployment.builditem.CombinedIndexBuildItem;
+import io.quarkus.deployment.builditem.FeatureBuildItem;
+import io.quarkus.deployment.builditem.IndexDependencyBuildItem;
+import io.quarkus.deployment.builditem.ShutdownContextBuildItem;
+import io.quarkus.deployment.builditem.nativeimage.NativeImageResourceBuildItem;
+import io.quarkus.deployment.builditem.nativeimage.ReflectiveClassBuildItem;
+import io.quarkus.deployment.builditem.nativeimage.RuntimeInitializedClassBuildItem;
+import io.quarkus.smallrye.health.deployment.spi.HealthBuildItem;
+import io.quarkus.undertow.deployment.IgnoredServletContainerInitializerBuildItem;
+import io.quarkus.undertow.deployment.ServletBuildItem;
+import io.quarkus.vertx.http.deployment.RouteBuildItem;
+import io.quarkus.vertx.http.deployment.NonApplicationRootPathBuildItem;
+import io.quarkus.websockets.client.deployment.ServerWebSocketContainerBuildItem;
+import org.atmosphere.cpr.AtmosphereAnnotations;
+import org.atmosphere.cpr.AtmosphereReflectiveTypes;
+import org.atmosphere.quarkus.runtime.AtmosphereConfig;
+import org.atmosphere.quarkus.runtime.AtmosphereConsoleInfoServlet;
+import org.atmosphere.quarkus.runtime.AtmosphereRecorder;
+import org.atmosphere.quarkus.runtime.QuarkusAtmosphereServlet;
+import org.eclipse.microprofile.config.ConfigProvider;
+import org.jboss.jandex.AnnotationInstance;
+import org.jboss.jandex.AnnotationTarget;
+import org.jboss.jandex.DotName;
+import org.jboss.jandex.IndexView;
+import org.jboss.jandex.Type;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Quarkus build-time processor for the Atmosphere extension. Scans for Atmosphere annotations,
+ * registers discovered classes for reflection, configures the Atmosphere servlet, and sets up
+ * JSR 356 WebSocket endpoints.
+ */
+class AtmosphereProcessor {
+
+    private static final Logger logger = LoggerFactory.getLogger(AtmosphereProcessor.class);
+
+    private static final String FEATURE = "atmosphere";
+
+    // Source of truth: AtmosphereAnnotations.coreAnnotationNames(), augmented with
+    // optional annotations resolved by string so the extension keeps no hard
+    // dependency on the modules that declare them. If a module is absent the
+    // index returns no instances and the slot is simply dropped.
+    //   - @AiEndpoint  (atmosphere-ai)
+    //   - @Agent       (atmosphere-agent) — drives MCP / A2A / AG-UI registration
+    //                  via AgentProcessor; without it @Agent-based endpoints
+    //                  (including MCP) never register on Quarkus.
+    //   - @Coordinator (atmosphere-coordinator) — drives fleet wiring via
+    //                  CoordinatorProcessor; without it @Coordinator classes
+    //                  silently never register on Quarkus while the same class
+    //                  works on Spring Boot / plain servlet (Invariant #7).
+    private static final List<String> OPTIONAL_ANNOTATIONS = List.of(
+            "org.atmosphere.ai.annotation.AiEndpoint",
+            "org.atmosphere.agent.annotation.Agent",
+            "org.atmosphere.coordinator.annotation.Coordinator");
+
+    private static final DotName[] ATMOSPHERE_ANNOTATIONS =
+            java.util.stream.Stream.concat(
+                            AtmosphereAnnotations.coreAnnotationNames().stream(),
+                            OPTIONAL_ANNOTATIONS.stream())
+                    .map(DotName::createSimple)
+                    .toArray(DotName[]::new);
+
+    @BuildStep
+    FeatureBuildItem feature() {
+        return new FeatureBuildItem(FEATURE);
+    }
+
+    @BuildStep
+    IndexDependencyBuildItem indexAtmosphereRuntime() {
+        return new IndexDependencyBuildItem("org.atmosphere", "atmosphere-runtime");
+    }
+
+    /**
+     * Index the optional {@code atmosphere-agent} and {@code atmosphere-mcp} jars
+     * so their {@code @AtmosphereAnnotation} processors — notably
+     * {@code AgentProcessor}, which turns an {@code @Agent} class into MCP / A2A /
+     * AG-UI endpoints — are in the Jandex index and registered as annotation
+     * handlers. Gated on the application actually declaring an {@code @Agent}
+     * class: indexing them unconditionally would pull {@code AgentProcessor} into
+     * native link-at-build-time even for apps that don't use {@code @Agent}, and
+     * {@code AgentProcessor} references optional sibling modules (e.g. AG-UI
+     * {@code RunContext}) that may be absent — which fails native image analysis.
+     */
+    @BuildStep
+    void indexOptionalAgentModules(ApplicationIndexBuildItem applicationIndex,
+                                   BuildProducer<IndexDependencyBuildItem> indexDependency) {
+        var agent = DotName.createSimple("org.atmosphere.agent.annotation.Agent");
+        if (applicationIndex.getIndex().getAnnotations(agent).isEmpty()) {
+            return;
+        }
+        indexDependency.produce(new IndexDependencyBuildItem("org.atmosphere", "atmosphere-agent"));
+        indexDependency.produce(new IndexDependencyBuildItem("org.atmosphere", "atmosphere-mcp"));
+    }
+
+    /**
+     * Index the optional {@code atmosphere-coordinator} jar so its
+     * {@code @AtmosphereAnnotation} processor — {@code CoordinatorProcessor},
+     * which turns an {@code @Coordinator} class into an agent endpoint with
+     * fleet wiring — is in the Jandex index and registered as an annotation
+     * handler. Gated on the application actually declaring an
+     * {@code @Coordinator} class, for the same reason {@code atmosphere-agent}
+     * indexing is gated above: {@code CoordinatorProcessor} references optional
+     * sibling modules (a2a transport, mcp, agui, channels) that may be absent,
+     * which fails native image analysis when pulled into link-at-build-time
+     * unconditionally.
+     */
+    @BuildStep
+    void indexOptionalCoordinatorModule(ApplicationIndexBuildItem applicationIndex,
+                                        BuildProducer<IndexDependencyBuildItem> indexDependency) {
+        var coordinator = DotName.createSimple("org.atmosphere.coordinator.annotation.Coordinator");
+        if (applicationIndex.getIndex().getAnnotations(coordinator).isEmpty()) {
+            return;
+        }
+        indexDependency.produce(new IndexDependencyBuildItem("org.atmosphere", "atmosphere-coordinator"));
+    }
+
+
+    @BuildStep
+    void ignoreAtmosphereScis(BuildProducer<IgnoredServletContainerInitializerBuildItem> ignored) {
+        // Suppress both Atmosphere SCIs. We manage annotation scanning at build time
+        // via Jandex, and framework initialization via QuarkusAtmosphereServlet.
+        // ContainerInitializer would create a redundant AtmosphereFramework and
+        // attempt to register JSR356AsyncSupport which fails in Quarkus (UT003017).
+        ignored.produce(new IgnoredServletContainerInitializerBuildItem(
+                "org.atmosphere.cpr.AnnotationScanningServletContainerInitializer"));
+        ignored.produce(new IgnoredServletContainerInitializerBuildItem(
+                "org.atmosphere.cpr.ContainerInitializer"));
+    }
+
+    @BuildStep
+    AtmosphereAnnotationsBuildItem scanAnnotations(CombinedIndexBuildItem combinedIndex) {
+        IndexView index = combinedIndex.getIndex();
+        Map<String, List<String>> annotationClassNames = new HashMap<>();
+
+        for (DotName annotationName : ATMOSPHERE_ANNOTATIONS) {
+            Collection<AnnotationInstance> instances = index.getAnnotations(annotationName);
+            if (!instances.isEmpty()) {
+                List<String> classNames = new ArrayList<>();
+                for (AnnotationInstance instance : instances) {
+                    if (instance.target() != null && instance.target().asClass() != null) {
+                        classNames.add(instance.target().asClass().name().toString());
+                    }
+                }
+                if (!classNames.isEmpty()) {
+                    annotationClassNames.put(annotationName.toString(), classNames);
+                    logger.debug("Found {} classes annotated with @{}",
+                            classNames.size(), annotationName.local());
+                }
+            }
+        }
+
+        logger.info("Atmosphere build-time scan found {} annotated classes across {} annotation types",
+                annotationClassNames.values().stream().mapToInt(List::size).sum(),
+                annotationClassNames.size());
+
+        return new AtmosphereAnnotationsBuildItem(annotationClassNames);
+    }
+
+    @BuildStep
+    void registerRuntimeInit(BuildProducer<RuntimeInitializedClassBuildItem> runtimeInit) {
+        // ExecutorsFactory creates ScheduledExecutorService with named threads.
+        // These threads must not start during native image build.
+        runtimeInit.produce(new RuntimeInitializedClassBuildItem(
+                "org.atmosphere.util.ExecutorsFactory"));
+        // JettyHttp3AsyncSupport has compile-time Jetty imports (the Atmosphere
+        // pattern for auto-discovered transports). On standard JVM the resolver
+        // only loads the class when Jetty is present. GraalVM native image
+        // eagerly verifies all classes — defer to runtime so Quarkus/Undertow
+        // builds don't fail on missing Jetty classes.
+        runtimeInit.produce(new RuntimeInitializedClassBuildItem(
+                "org.atmosphere.container.JettyHttp3AsyncSupport"));
+        // MetricsController has compile-time Micrometer imports. The admin
+        // module is optional — on standard JVM the class is only loaded when
+        // Micrometer is present. GraalVM/JDK 25+ eagerly links it.
+        runtimeInit.produce(new RuntimeInitializedClassBuildItem(
+                "org.atmosphere.admin.metrics.MetricsController"));
+    }
+
+    /**
+     * In native image builds the servlet's init() is skipped at STATIC_INIT to avoid
+     * creating thread pools that would be captured in the image heap. This step triggers
+     * the actual framework initialization at RUNTIME_INIT after the Undertow deployment
+     * is ready and the server is about to start accepting connections.
+     */
+    @BuildStep
+    @Record(ExecutionTime.RUNTIME_INIT)
+    void deferredFrameworkInit(AtmosphereRecorder recorder, AtmosphereConfig config) {
+        if (config.container() != AtmosphereConfig.Container.SERVLET) {
+            return;
+        }
+        recorder.performDeferredInit();
+    }
+
+    @BuildStep
+    void registerReflection(AtmosphereAnnotationsBuildItem annotations,
+                            BuildProducer<ReflectiveClassBuildItem> reflectiveClasses,
+                            BuildProducer<NativeImageResourceBuildItem> nativeResources) {
+        List<String> allClassNames = new ArrayList<>();
+        for (List<String> classNames : annotations.getAnnotationClassNames().values()) {
+            allClassNames.addAll(classNames);
+        }
+
+        if (!allClassNames.isEmpty()) {
+            reflectiveClasses.produce(
+                    ReflectiveClassBuildItem.builder(allClassNames.toArray(new String[0]))
+                            .constructors()
+                            .methods()
+                            .fields()
+                            .reason("Atmosphere annotated classes require reflection")
+                            .build());
+        }
+
+        // Quarkus runtime classes (not in the shared registry — Quarkus-specific)
+        reflectiveClasses.produce(
+                ReflectiveClassBuildItem.builder(
+                                "org.atmosphere.quarkus.runtime.QuarkusAtmosphereObjectFactory",
+                                "org.atmosphere.quarkus.runtime.QuarkusAtmosphereServlet",
+                                "org.atmosphere.quarkus.runtime.QuarkusJSR356AsyncSupport",
+                                "org.atmosphere.quarkus.runtime.LazyAtmosphereConfigurator")
+                        .constructors()
+                        .methods()
+                        .fields()
+                        .reason("Quarkus Atmosphere runtime classes require reflection")
+                        .build());
+
+        // Everything the modules declare for themselves. This was a direct read
+        // of AtmosphereReflectiveTypes.coreTypes(), which covered only
+        // atmosphere-runtime — atmosphere-ai, -mcp, -agent and -coordinator all
+        // load classes by name and had no way to say so, and the same list was
+        // transcribed again in both Spring starters. NativeImageMetadata merges
+        // every provider on the classpath, so adding a module adds its types
+        // here without touching this build step.
+        var metadata = org.atmosphere.nativeimage.NativeImageMetadata.collect(
+                Thread.currentThread().getContextClassLoader());
+
+        if (!metadata.reflectiveTypes().isEmpty()) {
+            reflectiveClasses.produce(
+                    ReflectiveClassBuildItem.builder(
+                                    metadata.reflectiveTypes().toArray(new String[0]))
+                            .constructors()
+                            .methods()
+                            .fields()
+                            .reason("Declared by Atmosphere native metadata providers: "
+                                    + metadata.providerNames())
+                            .build());
+        }
+
+        for (String pattern : metadata.resourcePatterns()) {
+            nativeResources.produce(new NativeImageResourceBuildItem(pattern));
+        }
+
+        logger.info("Atmosphere native metadata: {} reflective type(s), {} resource(s) "
+                        + "from provider(s) {}",
+                metadata.reflectiveTypes().size(), metadata.resourcePatterns().size(),
+                metadata.providerNames());
+    }
+
+    @BuildStep
+    void registerPoolReflection(BuildProducer<ReflectiveClassBuildItem> reflectiveClasses) {
+        // Pool implementations depend on optional commons-pool2; only register if available
+        try {
+            Class.forName("org.apache.commons.pool2.PooledObjectFactory", false,
+                    Thread.currentThread().getContextClassLoader());
+            reflectiveClasses.produce(
+                    ReflectiveClassBuildItem.builder(
+                                    AtmosphereReflectiveTypes.poolTypes().toArray(new String[0]))
+                            .constructors()
+                            .methods()
+                            .fields()
+                            .reason("Atmosphere pool implementations (commons-pool2 present)")
+                            .build());
+        } catch (ClassNotFoundException ex) {
+            logger.trace("commons-pool2 not on classpath; skip pool class registration", ex);
+        }
+    }
+
+    @BuildStep
+    void registerServiceResources(BuildProducer<NativeImageResourceBuildItem> resources) {
+        resources.produce(new NativeImageResourceBuildItem(
+                "META-INF/services/org.atmosphere.inject.Injectable",
+                "META-INF/services/org.atmosphere.inject.CDIProducer"));
+    }
+
+    @BuildStep
+    void registerEncoderDecoderClasses(CombinedIndexBuildItem combinedIndex,
+                                       BuildProducer<ReflectiveClassBuildItem> reflectiveClasses) {
+        IndexView index = combinedIndex.getIndex();
+        Set<String> classes = new HashSet<>();
+
+        // @Message has encoders() and decoders()
+        var messageName = DotName.createSimple("org.atmosphere.config.service.Message");
+        for (AnnotationInstance ann : index.getAnnotations(messageName)) {
+            extractClassArrayValues(ann, "encoders", classes);
+            extractClassArrayValues(ann, "decoders", classes);
+        }
+
+        // @Ready has encoders() only
+        var readyName = DotName.createSimple("org.atmosphere.config.service.Ready");
+        for (AnnotationInstance ann : index.getAnnotations(readyName)) {
+            extractClassArrayValues(ann, "encoders", classes);
+        }
+
+        if (!classes.isEmpty()) {
+            reflectiveClasses.produce(
+                    ReflectiveClassBuildItem.builder(classes.toArray(new String[0]))
+                            .constructors()
+                            .methods()
+                            .reason("Atmosphere Encoder/Decoder classes from @Message/@Ready")
+                            .build());
+        }
+
+        // Registering the codecs is not enough: a @Message method's payload type
+        // is materialized by the user's decoder — typically Jackson — which
+        // introspects the payload's constructors, fields and accessors
+        // reflectively. Without these the handler registers, the decoder loads,
+        // and the first real message dies inside the image while the same code
+        // passes every JVM test.
+        Set<String> payloadTypes = boundPayloadTypes(index);
+        if (!payloadTypes.isEmpty()) {
+            reflectiveClasses.produce(
+                    ReflectiveClassBuildItem.builder(payloadTypes.toArray(new String[0]))
+                            .constructors()
+                            .methods()
+                            .fields()
+                            .reason("Atmosphere @Message/@Ready payload types bound by user codecs")
+                            .build());
+        }
+    }
+
+    /**
+     * The parameter and return types of every {@code @Message} / {@code @Ready}
+     * method in the index, minus primitives and JDK/Jakarta types. Framework
+     * types slip through and get registered redundantly — deliberate: an
+     * exclusion list broad enough to catch them also caught
+     * {@code org.atmosphere.samples.*}, the very payload classes this exists to
+     * register. Over-registration is a few spare hints; under-registration is a
+     * silent native-only dispatch failure.
+     */
+    static Set<String> boundPayloadTypes(IndexView index) {
+        Set<String> out = new HashSet<>();
+        for (String annotation : List.of("org.atmosphere.config.service.Message",
+                "org.atmosphere.config.service.Ready")) {
+            for (AnnotationInstance ann : index.getAnnotations(DotName.createSimple(annotation))) {
+                if (ann.target().kind() != AnnotationTarget.Kind.METHOD) {
+                    continue;
+                }
+                var method = ann.target().asMethod();
+                var types = new ArrayList<>(method.parameterTypes());
+                types.add(method.returnType());
+                for (var type : types) {
+                    while (type.kind() == Type.Kind.ARRAY) {
+                        type = type.asArrayType().constituent();
+                    }
+                    if (type.kind() != Type.Kind.CLASS
+                            && type.kind() != Type.Kind.PARAMETERIZED_TYPE) {
+                        continue;
+                    }
+                    String name = type.name().toString();
+                    if (name.startsWith("java.") || name.startsWith("jakarta.")) {
+                        continue;
+                    }
+                    out.add(name);
+                }
+            }
+        }
+        return out;
+    }
+
+    private void extractClassArrayValues(AnnotationInstance ann, String member, Set<String> out) {
+        var value = ann.value(member);
+        if (value != null) {
+            for (var type : value.asClassArray()) {
+                out.add(type.name().toString());
+            }
+        }
+    }
+
+    /**
+     * Registers JSR-356 WebSocket endpoints with the Quarkus-managed ServerWebSocketContainer.
+     * This runs at STATIC_INIT after the container is created by quarkus-websockets-client,
+     * but before deploymentComplete is set, so addEndpoint() succeeds.
+     */
+    @BuildStep
+    @Record(ExecutionTime.STATIC_INIT)
+    void registerWebSocketEndpoints(AtmosphereRecorder recorder,
+                                    AtmosphereConfig config,
+                                    ServerWebSocketContainerBuildItem container) {
+        // Vert.x mode upgrades WebSockets on its own route; JSR-356 endpoints
+        // would shadow it on the same paths. With websocket-support=false there
+        // is nothing to upgrade to, so no endpoint is registered at all.
+        if (config.container() != AtmosphereConfig.Container.SERVLET
+                || !config.websocketSupport().orElse(true)) {
+            return;
+        }
+        recorder.registerWebSocketEndpoints(container.getContainer());
+    }
+
+    /**
+     * Registers a shutdown hook that resets the {@link LazyAtmosphereConfigurator}
+     * before Quarkus dev mode live reload re-initializes the servlet. This ensures
+     * a fresh CountDownLatch and framework reference for each reload cycle.
+     */
+    @BuildStep
+    @Record(ExecutionTime.RUNTIME_INIT)
+    void registerConfiguratorShutdownHook(AtmosphereRecorder recorder,
+                                          ShutdownContextBuildItem shutdownContext) {
+        recorder.registerShutdownHook(shutdownContext);
+    }
+
+    /**
+     * Registers the Atmosphere servlet on Undertow ({@code quarkus.atmosphere.container=servlet},
+     * the default). The Vert.x container mode registers a route instead
+     * ({@link #registerVertxRoute}).
+     */
+    @BuildStep
+    @Record(ExecutionTime.STATIC_INIT)
+    void registerServlet(AtmosphereRecorder recorder,
+                         AtmosphereConfig config,
+                         AtmosphereAnnotationsBuildItem annotations,
+                         BuildProducer<ServletBuildItem> servlets) {
+        if (config.container() != AtmosphereConfig.Container.SERVLET) {
+            return;
+        }
+        ServletBuildItem.Builder builder = ServletBuildItem.builder(
+                        "AtmosphereServlet", QuarkusAtmosphereServlet.class.getName())
+                .addMapping(config.servletPath())
+                .setLoadOnStartup(config.loadOnStartup())
+                .setAsyncSupported(true)
+                .setInstanceFactory(
+                        recorder.createInstanceFactory(annotations.getAnnotationClassNames()));
+        atmosphereInitParams(config, "org.atmosphere.quarkus.runtime.QuarkusJSR356AsyncSupport")
+                .forEach(builder::addInitParam);
+        servlets.produce(builder.build());
+    }
+
+    /**
+     * Serves the Atmosphere mapping from a Vert.x route when
+     * {@code quarkus.atmosphere.container=vertx}: no servlet in the request path,
+     * a virtual thread per request, WebSockets upgraded on the router. The
+     * framework gets the same init-params as in servlet mode.
+     */
+    @BuildStep
+    @Record(ExecutionTime.RUNTIME_INIT)
+    void registerVertxRoute(AtmosphereRecorder recorder,
+                            AtmosphereConfig config,
+                            AtmosphereAnnotationsBuildItem annotations,
+                            ShutdownContextBuildItem shutdownContext,
+                            BuildProducer<RouteBuildItem> routes) {
+        if (config.container() != AtmosphereConfig.Container.VERTX) {
+            return;
+        }
+        if (config.sessionSupport()) {
+            logger.warn("quarkus.atmosphere.session-support is ignored with container=vertx: "
+                    + "there is no servlet HttpSession on the Vert.x route");
+        }
+        var params = atmosphereInitParams(config, "org.atmosphere.quarkus.runtime.vertx.VertxBlockingAsyncSupport");
+        params.remove("org.atmosphere.cpr.sessionSupport");
+        var handler = recorder.createVertxHandler(params,
+                annotations.getAnnotationClassNames(), config.servletPath(),
+                config.vertx().maxBodySize().asLongValue(), config.vertx().drainTimeout().toMillis(),
+                shutdownContext);
+        routes.produce(RouteBuildItem.builder().route(config.servletPath()).handler(handler).build());
+    }
+
+    /**
+     * The framework init-params both container modes share, so a servlet-mode and
+     * a Vert.x-mode application are configured identically (Mode Parity).
+     */
+    static Map<String, String> atmosphereInitParams(AtmosphereConfig config, String asyncSupportClass) {
+        var params = new LinkedHashMap<String, String>();
+        params.put("org.atmosphere.cpr.AtmosphereFramework.DISABLE_ATMOSPHERE_INITIALIZER", "true");
+
+        // Tell Atmosphere to use our Quarkus-aware object factory. Setting this via init param
+        // ensures the factory is created during framework.init() -> configureObjectFactory(),
+        // which is the correct lifecycle point. Setting it programmatically before init() does
+        // not survive because lookupDefaultObjectFactoryType() can overwrite it.
+        params.put("org.atmosphere.cpr.objectFactory",
+                "org.atmosphere.quarkus.runtime.QuarkusAtmosphereObjectFactory");
+
+        // Servlet mode: our Quarkus-specific async support instead of JSR356AsyncSupport.
+        // JSR356AsyncSupport's constructor calls container.addEndpoint() which fails in
+        // Quarkus with "Cannot add endpoint after deployment" (UT003017). Our replacement
+        // extends Servlet30CometSupport + supportWebSocket()=true, while the actual
+        // endpoints are registered via registerWebSocketEndpoints() at STATIC_INIT.
+        // Vert.x mode: VertxBlockingAsyncSupport (virtual-thread blocking suspend).
+        params.put("org.atmosphere.cpr.asyncSupport", asyncSupportClass);
+
+        // Use "all" to trigger scan of the pre-populated Jandex annotation map.
+        // Atmosphere's scan(String) checks getClass().getClassLoader().getResource() which
+        // fails with Quarkus's classloader for real package names. "all" bypasses that check.
+        params.put("org.atmosphere.cpr.packages", "all");
+
+        if (config.sessionSupport()) {
+            params.put("org.atmosphere.cpr.sessionSupport", "true");
+        }
+
+        // quarkus.atmosphere.websocket-support: explicit on/off for the WebSocket
+        // transport (ApplicationConfig.WEBSOCKET_SUPPORT). Unset keeps the default.
+        config.websocketSupport().ifPresent(ws ->
+                params.put("org.atmosphere.useWebSocket", String.valueOf(ws)));
+
+        config.broadcasterClass().ifPresent(b ->
+                params.put("org.atmosphere.cpr.broadcasterClass", b));
+
+        // Explicit broadcaster-cache-class config wins. Otherwise, when
+        // quarkus.atmosphere.cache-enabled=true (Spring Boot parity for
+        // AtmosphereCacheAutoConfiguration), default to BoundedMemoryCache
+        // and install MessageAckInterceptor so missed-message recovery
+        // works out of the box.
+        if (config.broadcasterCacheClass().isPresent()) {
+            params.put("org.atmosphere.cpr.broadcasterCacheClass",
+                    config.broadcasterCacheClass().get());
+        } else if (config.cacheEnabled()) {
+            params.put("org.atmosphere.cpr.broadcasterCacheClass",
+                    "org.atmosphere.cache.BoundedMemoryCache");
+            // AtmosphereInterceptor init params accept a comma-separated list of
+            // FQNs that AtmosphereFramework.configureAtmosphereInterceptor() expands
+            // into the running interceptor chain — same hook Spring Boot's
+            // @Bean MessageAckInterceptor uses, just plumbed through the servlet
+            // init param instead of an autoconfigured bean.
+            params.put("org.atmosphere.cpr.AtmosphereInterceptor",
+                    "org.atmosphere.interceptor.MessageAckInterceptor");
+            logger.info("Atmosphere cache enabled — installing BoundedMemoryCache + MessageAckInterceptor");
+        }
+
+        config.heartbeatInterval().ifPresent(h ->
+                params.put("org.atmosphere.cpr.AtmosphereResource.heartbeatFrequencyInSeconds",
+                        String.valueOf(h.toSeconds())));
+
+        // RAG injection-safety screen (OWASP Agentic A04): AiEndpointProcessor
+        // wraps every @AiEndpoint ContextProvider so retrieved documents are
+        // checked before reaching the LLM. On by default and fail-closed;
+        // disable with quarkus.atmosphere.ai.rag.safety.enabled=false. Keys are
+        // literals mirroring RagSafetyConfig in atmosphere-ai so this build-time
+        // deployment module needs no compile dep on the AI runtime module.
+        var ragSafety = config.ai().rag().safety();
+        params.put("org.atmosphere.ai.rag.safety.enabled", String.valueOf(ragSafety.enabled()));
+        params.put("org.atmosphere.ai.rag.safety.tier", ragSafety.tier());
+        params.put("org.atmosphere.ai.rag.safety.on-breach", ragSafety.onBreach());
+        params.put("org.atmosphere.ai.rag.safety.fail-open", String.valueOf(ragSafety.failOpen()));
+
+        // Long-term-memory injection-safety screen (OWASP Agentic A03):
+        // AiEndpointProcessor screens every fact extracted into a LongTermMemory
+        // store before it is persisted. On by default and fail-closed; disable
+        // with quarkus.atmosphere.ai.memory.safety.enabled=false. Keys are
+        // literals mirroring MemorySafetyConfig in atmosphere-ai.
+        var memorySafety = config.ai().memory().safety();
+        params.put("org.atmosphere.ai.memory.safety.enabled", String.valueOf(memorySafety.enabled()));
+        params.put("org.atmosphere.ai.memory.safety.tier", memorySafety.tier());
+        params.put("org.atmosphere.ai.memory.safety.on-breach", memorySafety.onBreach());
+        params.put("org.atmosphere.ai.memory.safety.fail-open", String.valueOf(memorySafety.failOpen()));
+
+        // Durable governance feedback (opt-in, off by default): when enabled,
+        // AiEndpointProcessor persists deny/prefer decisions to the resolved
+        // LongTermMemory (provenance-tagged) so the feedback interceptor recalls them
+        // across sessions and restarts. Enable with
+        // quarkus.atmosphere.ai.governance.memory.enabled=true. Keys are literals
+        // mirroring GovernanceMemoryConfig in atmosphere-ai so this build-time module
+        // needs no compile dep on the AI runtime module.
+        var governanceMemory = config.ai().governance().memory();
+        params.put("org.atmosphere.ai.governance.memory.enabled",
+                String.valueOf(governanceMemory.enabled()));
+        params.put("org.atmosphere.ai.governance.memory.ttl-seconds",
+                String.valueOf(governanceMemory.ttlSeconds()));
+        params.put("org.atmosphere.ai.governance.memory.confidence",
+                String.valueOf(governanceMemory.confidence()));
+        params.put("org.atmosphere.ai.governance.memory.min-confidence",
+                String.valueOf(governanceMemory.minConfidence()));
+
+        // Agent-harness preset: the app-wide switch governing Atmosphere's
+        // deep-agent primitives, read once per framework by AiEndpointProcessor.
+        // The switch is tri-state, so the init-param bridges only when the
+        // operator set it: absent leaves the annotation-governed default in
+        // charge, while an explicit false must reach the runtime as "false" —
+        // the kill switch that beats every annotation. Keys are literals
+        // mirroring the org.atmosphere.ai.harness.* namespace in atmosphere-ai
+        // so this build-time deployment module needs no compile dep on the AI
+        // runtime module. The compaction and prompt-cache seams work
+        // independent of the harness, so they bridge whenever set.
+        var harness = config.ai().harness();
+        harness.enabled().ifPresent(enabled ->
+                params.put("org.atmosphere.ai.harness.enabled", String.valueOf(enabled)));
+        harness.excludePaths().ifPresent(paths ->
+                params.put("org.atmosphere.ai.harness.exclude-paths", String.join(",", paths)));
+        harness.compaction().ifPresent(strategy ->
+                params.put("org.atmosphere.ai.compaction", strategy));
+        harness.promptCacheDefault().ifPresent(policy ->
+                params.put("org.atmosphere.ai.prompt-cache.default", policy));
+
+        for (Map.Entry<String, String> entry : config.initParams().entrySet()) {
+            params.put(entry.getKey(), entry.getValue());
+        }
+
+        return params;
+    }
+
+    /**
+     * Registers the bundled-Console info servlet at {@code /api/console/info}
+     * so the Vue Console UI gets the same {@code subtitle / endpoint /
+     * runtime / mode} payload it gets from the Spring Boot starter's
+     * {@code AtmosphereConsoleInfoEndpoint}. Closes the parity gap that
+     * previously made {@code GET /api/console/info} return 404 on Quarkus
+     * — the Vue app then fell back to AI-mode defaults regardless of
+     * whether the registered handler was AI-shaped or {@code @ManagedService}.
+     */
+    @BuildStep
+    ServletBuildItem registerConsoleInfoServlet(AtmosphereConfig config,
+                                                NonApplicationRootPathBuildItem nonApplicationRootPath) {
+        ServletBuildItem.Builder builder = ServletBuildItem.builder(
+                        "AtmosphereConsoleInfoServlet",
+                        AtmosphereConsoleInfoServlet.class.getName())
+                .addMapping("/api/console/info")
+                .setLoadOnStartup(2)
+                .setAsyncSupported(false);
+        config.consoleSubtitle().ifPresent(s ->
+                builder.addInitParam(
+                        AtmosphereConsoleInfoServlet.CONSOLE_SUBTITLE_PARAM, s));
+        config.consoleEndpoint().ifPresent(s ->
+                builder.addInitParam(
+                        AtmosphereConsoleInfoServlet.CONSOLE_ENDPOINT_PARAM, s));
+        config.consoleTransport().ifPresent(s ->
+                builder.addInitParam(
+                        AtmosphereConsoleInfoServlet.CONSOLE_TRANSPORT_PARAM, s));
+        // Advertise the durable-run checkpoint read plane to the console only when
+        // atmosphere-checkpoint is on the classpath — the same gate under which
+        // registerCheckpointStore() below produces the CheckpointStore and maps
+        // /api/admin/checkpoints. So hasCheckpoints is true iff the plane the
+        // console's Checkpoints tab probes genuinely exists (Runtime Truth,
+        // Invariant #5), in parity with the Spring starter's
+        // hasBean(CheckpointStore) gate.
+        if (isClassPresent("org.atmosphere.checkpoint.CheckpointStore")) {
+            builder.addInitParam(AtmosphereConsoleInfoServlet.HAS_CHECKPOINTS_PARAM, "true");
+        }
+        // Micrometer metrics parity for the console's Observability tab: resolve
+        // the Prometheus export route exactly the way quarkus-micrometer does —
+        // a relative path lives under the non-application root (default /q), an
+        // absolute override passes through — and hand the resolved string to the
+        // servlet. Passing it unconditionally is deliberate: it is a route
+        // *spelling*, not a capability claim. Whether the console is told the
+        // plane exists is decided at runtime by AtmosphereMetricsProducer
+        // confirming a Prometheus registry genuinely booted, because this
+        // build step runs in the augmentation classloader and cannot see the
+        // application's registry classes at all (Runtime Truth — Invariant #5).
+        String prometheusPath = ConfigProvider.getConfig()
+                .getOptionalValue("quarkus.micrometer.export.prometheus.path", String.class)
+                .orElse("metrics");
+        builder.addInitParam(AtmosphereConsoleInfoServlet.METRICS_PATH_PARAM,
+                nonApplicationRootPath.resolvePath(prometheusPath));
+        return builder.build();
+    }
+
+    /**
+     * Quarkus parity for the Spring Boot starter's
+     * {@code AtmosphereCheckpointAutoConfiguration} + {@code AtmosphereCheckpointEndpoint}.
+     * Requires {@code atmosphere-checkpoint} on the classpath
+     * ({@code CheckpointStore} lives there). When present it registers
+     * {@code AtmosphereCheckpointProducer} — which produces a {@code CheckpointStore}
+     * CDI bean (bounded in-memory by default, crash-durable SQLite when
+     * {@code quarkus.atmosphere.ai.checkpoint.store=sqlite}, or a user-supplied
+     * bean that wins via {@code @DefaultBean}) — and maps the read-only
+     * {@code AtmosphereCheckpointServlet} at {@code /api/admin/checkpoints}, so the
+     * durable-run read plane and the console's Checkpoints tab work on Quarkus
+     * exactly as on Spring Boot (Invariant #7). Both are registered by class name so
+     * this build-time module needs no compile dependency on {@code atmosphere-checkpoint}.
+     */
+    @BuildStep
+    void registerCheckpointStore(BuildProducer<AdditionalBeanBuildItem> beans,
+                                 BuildProducer<ServletBuildItem> servlets) {
+        if (!isClassPresent("org.atmosphere.checkpoint.CheckpointStore")) {
+            return;
+        }
+        beans.produce(AdditionalBeanBuildItem.unremovableOf(
+                "org.atmosphere.quarkus.runtime.AtmosphereCheckpointProducer"));
+        servlets.produce(ServletBuildItem.builder(
+                        "AtmosphereCheckpointServlet",
+                        "org.atmosphere.quarkus.runtime.AtmosphereCheckpointServlet")
+                .addMapping("/api/admin/checkpoints")
+                .setLoadOnStartup(2)
+                .setAsyncSupported(false)
+                .build());
+        logger.info("Atmosphere checkpoint store producer + read endpoint registered "
+                + "(default in-memory CheckpointStore, GET /api/admin/checkpoints; "
+                + "quarkus.atmosphere.ai.checkpoint.store=sqlite for crash-durable)");
+    }
+
+    /**
+     * Registers {@code BoundedMemoryCache} and {@code MessageAckInterceptor}
+     * for GraalVM reflection when {@code quarkus.atmosphere.cache-enabled=true}.
+     * The servlet wiring (see {@link #registerServlet}) sets the {@code broadcasterCacheClass}
+     * and {@code AtmosphereInterceptor} init params so Atmosphere instantiates them
+     * via reflection at servlet init; the build step above keeps that reflection path
+     * working in native image builds. Quarkus parity for the Spring Boot starter's
+     * {@code AtmosphereCacheAutoConfiguration}.
+     */
+    @BuildStep
+    void registerCacheReflection(AtmosphereConfig config,
+                                 BuildProducer<ReflectiveClassBuildItem> reflectiveClasses) {
+        if (!config.cacheEnabled() && config.broadcasterCacheClass().isEmpty()) {
+            return;
+        }
+        reflectiveClasses.produce(
+                ReflectiveClassBuildItem.builder(
+                                "org.atmosphere.cache.BoundedMemoryCache",
+                                "org.atmosphere.interceptor.MessageAckInterceptor")
+                        .constructors()
+                        .methods()
+                        .reason("Atmosphere cache enabled (quarkus.atmosphere.cache-enabled=true)")
+                        .build());
+        logger.info("Atmosphere cache reflection registered for native image");
+    }
+
+    /**
+     * Quarkus parity for {@code AtmosphereActuatorAutoConfiguration}. When
+     * {@code quarkus-smallrye-health} is on the classpath the health check bean
+     * is registered with the Quarkus Arc container and surfaced under
+     * {@code /q/health}, {@code /q/health/live}, and {@code /q/health/ready}
+     * by the SmallRye Health processor. Gated on {@link Capability#SMALLRYE_HEALTH}
+     * so users without smallrye-health pay no startup cost.
+     */
+    @BuildStep
+    void registerHealthCheck(Capabilities capabilities,
+                             BuildProducer<AdditionalBeanBuildItem> beans,
+                             BuildProducer<HealthBuildItem> health) {
+        if (!capabilities.isPresent(Capability.SMALLRYE_HEALTH)) {
+            logger.debug("quarkus-smallrye-health absent — skipping AtmosphereHealthCheck registration");
+            return;
+        }
+        beans.produce(AdditionalBeanBuildItem.unremovableOf(
+                "org.atmosphere.quarkus.runtime.AtmosphereHealthCheck"));
+        health.produce(new HealthBuildItem(
+                "org.atmosphere.quarkus.runtime.AtmosphereHealthCheck",
+                true));
+        logger.info("Atmosphere SmallRye Health check registered at /q/health/atmosphere");
+    }
+
+    /**
+     * Quarkus parity for {@code AtmosphereMetricsAutoConfiguration}. When the
+     * Quarkus Micrometer extension is on the classpath, registers the
+     * {@code AtmosphereMetricsProducer} bean. The producer injects the
+     * Micrometer {@link io.micrometer.core.instrument.MeterRegistry} bean
+     * Quarkus has already wired and binds Atmosphere's per-resource gauges,
+     * broadcast counters, and timers on {@code @Observes StartupEvent}.
+     * Gating on a class lookup keeps the build step inert in classpaths that
+     * do not pull {@code quarkus-micrometer}.
+     */
+    @BuildStep
+    void registerMetricsProducer(BuildProducer<AdditionalBeanBuildItem> beans) {
+        if (!isClassPresent("io.micrometer.core.instrument.MeterRegistry")) {
+            logger.debug("micrometer-core absent — skipping AtmosphereMetricsProducer registration");
+            return;
+        }
+        beans.produce(AdditionalBeanBuildItem.unremovableOf(
+                "org.atmosphere.quarkus.runtime.AtmosphereMetricsProducer"));
+        logger.info("Atmosphere Micrometer metrics producer registered (atmosphere.* metrics)");
+    }
+
+    /**
+     * Quarkus parity for {@code AtmosphereTracingAutoConfiguration}. When
+     * {@code quarkus-opentelemetry} is on the classpath, registers the
+     * {@code AtmosphereTracingProducer} bean. On {@code @Observes StartupEvent}
+     * the producer instantiates {@code AtmosphereTracing} with the running
+     * {@link io.opentelemetry.api.OpenTelemetry} bean and binds it as an
+     * interceptor on the framework. Gated on
+     * {@link Capability#OPENTELEMETRY_TRACER} so users without the OTel
+     * extension are unaffected.
+     */
+    @BuildStep
+    void registerTracingProducer(Capabilities capabilities,
+                                 BuildProducer<AdditionalBeanBuildItem> beans) {
+        if (!capabilities.isPresent(Capability.OPENTELEMETRY_TRACER)) {
+            logger.debug("quarkus-opentelemetry absent — skipping AtmosphereTracingProducer registration");
+            return;
+        }
+        beans.produce(AdditionalBeanBuildItem.unremovableOf(
+                "org.atmosphere.quarkus.runtime.AtmosphereTracingProducer"));
+        logger.info("Atmosphere OpenTelemetry tracing producer registered");
+    }
+
+    /**
+     * Quarkus parity for {@code AtmosphereGovernanceMetricsAutoConfiguration}.
+     * Stacks on the Micrometer step (the producer injects {@link io.micrometer.core.instrument.MeterRegistry})
+     * and additionally requires {@code atmosphere-ai} on the classpath
+     * ({@code GovernanceMetricsHolder} lives there). When both are present the
+     * producer wraps the running {@link io.micrometer.core.instrument.MeterRegistry}
+     * in a {@code QuarkusMicrometerGovernanceMetrics} and installs it via
+     * {@code GovernanceMetricsHolder.install(...)}, so per-policy similarity
+     * histograms and evaluation timers show up under
+     * {@code atmosphere.governance.*} alongside the rest of Atmosphere's
+     * meters.
+     */
+    @BuildStep
+    void registerGovernanceMetricsProducer(BuildProducer<AdditionalBeanBuildItem> beans) {
+        if (!isClassPresent("io.micrometer.core.instrument.MeterRegistry")) {
+            return;
+        }
+        if (!isClassPresent("org.atmosphere.ai.governance.GovernanceMetricsHolder")) {
+            return;
+        }
+        beans.produce(AdditionalBeanBuildItem.unremovableOf(
+                "org.atmosphere.quarkus.runtime.AtmosphereGovernanceMetricsProducer"));
+        logger.info("Atmosphere governance metrics producer registered "
+                + "(atmosphere.governance.* meters via GovernanceMetricsHolder)");
+    }
+
+    /**
+     * Quarkus parity for the Spring Boot starter's {@code DurableRunSpineInstaller}
+     * (in {@code AtmosphereAiAutoConfiguration}). Requires {@code atmosphere-ai} on
+     * the classpath ({@code DurableRunSpineHolder} lives there). When present the
+     * producer bean is registered; on startup it reads
+     * {@code quarkus.atmosphere.durable-runs.*} and, when {@code enabled=true}
+     * (or the agent-harness preset implies it — see {@code AtmosphereConfig.Ai.Harness}),
+     * installs the effect-journal-backed {@code DurableRunSpine} so committed LLM
+     * rounds and tool calls replay deterministically after a crash. The bean is a
+     * no-op when durable runs are disabled, so registering it unconditionally (when
+     * {@code atmosphere-ai} is present) carries no runtime cost beyond one startup
+     * observer.
+     */
+    @BuildStep
+    void registerDurableRunsProducer(BuildProducer<AdditionalBeanBuildItem> beans) {
+        if (!isClassPresent("org.atmosphere.ai.resume.DurableRunSpineHolder")) {
+            return;
+        }
+        beans.produce(AdditionalBeanBuildItem.unremovableOf(
+                "org.atmosphere.quarkus.runtime.AtmosphereDurableRunsProducer"));
+        logger.info("Atmosphere durable agent runs producer registered "
+                + "(quarkus.atmosphere.durable-runs.enabled gates installation)");
+    }
+
+    /**
+     * Quarkus parity for the Spring Boot starter's voice-endpoint lifecycle:
+     * registers the producer that mounts {@code VoiceEndpointHandler} when
+     * {@code quarkus.atmosphere.ai.voice.enabled=true} (registre#25). The
+     * observer is a no-op while the flag stays off.
+     */
+    @BuildStep
+    void registerVoiceProducer(BuildProducer<AdditionalBeanBuildItem> beans) {
+        if (!isClassPresent("org.atmosphere.ai.voice.VoiceEndpointHandler")) {
+            return;
+        }
+        beans.produce(AdditionalBeanBuildItem.unremovableOf(
+                "org.atmosphere.quarkus.runtime.AtmosphereVoiceProducer"));
+        logger.info("Atmosphere voice endpoint producer registered "
+                + "(quarkus.atmosphere.ai.voice.enabled gates the mount)");
+    }
+
+    /**
+     * Quarkus parity for the Spring Boot starters' {@code TapeInstaller} (in
+     * {@code AtmosphereAiAutoConfiguration}). Requires {@code atmosphere-ai} on
+     * the classpath ({@code TapeSupport} lives there). When present the producer
+     * bean is registered; on startup it reads {@code quarkus.atmosphere.ai.tape.*}
+     * and, when {@code enabled=true}, installs a {@code TapeRecorder} via
+     * {@code TapeSupport} so every AI streaming session is recorded as an
+     * append-only per-run step log. The bean is a no-op when the tape is
+     * disabled, so registering it unconditionally (when {@code atmosphere-ai} is
+     * present) carries no runtime cost beyond one startup observer.
+     */
+    @BuildStep
+    void registerTapeProducer(BuildProducer<AdditionalBeanBuildItem> beans) {
+        if (!isClassPresent("org.atmosphere.ai.tape.TapeSupport")) {
+            return;
+        }
+        beans.produce(AdditionalBeanBuildItem.unremovableOf(
+                "org.atmosphere.quarkus.runtime.AtmosphereTapeProducer"));
+        logger.info("Atmosphere session tape producer registered "
+                + "(quarkus.atmosphere.ai.tape.enabled gates installation)");
+    }
+
+    /**
+     * Quarkus parity for the Spring Boot starter's {@code CostAccountantInstaller}
+     * (in {@code AtmosphereAiAutoConfiguration}). Requires {@code atmosphere-ai} on
+     * the classpath ({@code CostAccountantHolder} lives there). When present the
+     * producer bean is registered; {@code QuarkusAtmosphereServlet} bridges the
+     * effective {@code CostCeilingGuardrail} (a user CDI bean, or the built-in one
+     * from {@code quarkus.atmosphere.ai.guardrails.cost.enabled=true} +
+     * {@code budget-usd}) into the framework guardrail chain before annotation
+     * processing, and on startup the producer installs a user {@code CostAccountant}
+     * bean or the built-in {@code CostCeilingAccountant} (guardrail +
+     * {@code TokenPricing} CDI bean) into the process-wide holders. The bean is a
+     * no-op when nothing is configured, so registering it unconditionally (when
+     * {@code atmosphere-ai} is present) carries no runtime cost beyond one startup
+     * observer.
+     */
+    @BuildStep
+    void registerCostAccountantProducer(BuildProducer<AdditionalBeanBuildItem> beans) {
+        if (!isClassPresent("org.atmosphere.ai.cost.CostAccountantHolder")) {
+            return;
+        }
+        beans.produce(AdditionalBeanBuildItem.unremovableOf(
+                "org.atmosphere.quarkus.runtime.AtmosphereCostAccountantProducer"));
+        logger.info("Atmosphere cost accountant producer registered "
+                + "(quarkus.atmosphere.ai.guardrails.cost.enabled or CDI beans gate installation)");
+    }
+
+    /**
+     * Registers the gateway-profile producer when {@code atmosphere-ai} is on
+     * the classpath ({@code AiGatewayHolder} lives there). The bean is a no-op
+     * unless {@code quarkus.atmosphere.ai.gateway.profile=production}, which
+     * installs the enforcing {@code GatewayProfiles.production()} limits into
+     * the process-wide holder — the Quarkus mirror of the Spring Boot
+     * starter's {@code atmosphere.ai.gateway.profile} key. Registering it
+     * unconditionally costs one startup observer.
+     */
+    @BuildStep
+    void registerGatewayProducer(BuildProducer<AdditionalBeanBuildItem> beans) {
+        if (!isClassPresent("org.atmosphere.ai.gateway.AiGatewayHolder")) {
+            return;
+        }
+        beans.produce(AdditionalBeanBuildItem.unremovableOf(
+                "org.atmosphere.quarkus.runtime.AtmosphereGatewayProducer"));
+        logger.info("Atmosphere gateway producer registered "
+                + "(quarkus.atmosphere.ai.gateway.profile gates installation)");
+    }
+
+    /**
+     * Build-time classpath detection for optional integrations. Quarkus
+     * extensions resolve dependencies through their own classloader, which
+     * matches the build classpath for the extension processor; this is the
+     * canonical pattern used across the Quarkus codebase for soft deps.
+     */
+    private static boolean isClassPresent(String name) {
+        try {
+            Class.forName(name, false, AtmosphereProcessor.class.getClassLoader());
+            return true;
+        } catch (ClassNotFoundException ex) {
+            return false;
+        }
+    }
+}

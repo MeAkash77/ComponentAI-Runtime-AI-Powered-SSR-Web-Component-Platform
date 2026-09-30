@@ -1,0 +1,1004 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.a2a.runtime;
+
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
+import org.atmosphere.a2a.annotation.AgentSkillParam;
+import org.atmosphere.a2a.protocol.A2aMethod;
+import org.atmosphere.a2a.registry.A2aRegistry;
+import org.atmosphere.a2a.types.AgentCard;
+import org.atmosphere.a2a.types.Artifact;
+import org.atmosphere.a2a.types.ListTasksResponse;
+import org.atmosphere.a2a.types.Message;
+import org.atmosphere.a2a.types.TaskArtifactUpdateEvent;
+import org.atmosphere.a2a.types.TaskPushNotificationConfig;
+import org.atmosphere.a2a.types.Part;
+import org.atmosphere.a2a.types.Role;
+import org.atmosphere.a2a.types.SendMessageResponse;
+import org.atmosphere.a2a.types.TaskState;
+import org.atmosphere.a2a.types.TaskStatusUpdateEvent;
+import org.atmosphere.protocol.JsonRpc;
+import org.atmosphere.protocol.ProtocolTracing;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.lang.reflect.InvocationTargetException;
+import java.util.List;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+
+/**
+ * Routes A2A v1.0.0 JSON-RPC requests to the registered task and skill
+ * machinery. Method names use the PascalCase form defined in the v1.0.0
+ * specification ({@code SendMessage}, {@code GetTask}, etc.); pre-1.0
+ * slash-style names are normalized via {@link A2aMethod#canonicalize(String)}
+ * with a one-time deprecation warning per alias.
+ *
+ * <p>A2A-specific JSON-RPC error codes follow {@code docs/specification.md}
+ * §5.4: {@code -32001} task not found, {@code -32002} task not cancelable,
+ * {@code -32003} push-notification not supported, {@code -32004} unsupported
+ * operation, {@code -32007} extended-card not configured.</p>
+ */
+public final class A2aProtocolHandler {
+
+    private static final Logger logger = LoggerFactory.getLogger(A2aProtocolHandler.class);
+    private static final ObjectMapper mapper = new ObjectMapper();
+
+    /** -32001 — TaskNotFoundError per A2A v1.0.0 §5.4. */
+    public static final int ERROR_TASK_NOT_FOUND = -32001;
+    /** -32002 — TaskNotCancelableError. */
+    public static final int ERROR_TASK_NOT_CANCELABLE = -32002;
+    /** -32003 — PushNotificationNotSupportedError. */
+    public static final int ERROR_PUSH_NOT_SUPPORTED = -32003;
+    /** -32004 — UnsupportedOperationError. */
+    public static final int ERROR_UNSUPPORTED_OPERATION = -32004;
+    /** -32007 — ExtendedAgentCardNotConfiguredError. */
+    public static final int ERROR_EXTENDED_CARD_NOT_CONFIGURED = -32007;
+
+    /**
+     * Upper bound (ms) a resubscribe stream waits for an in-flight task to
+     * reach a terminal state before releasing the request thread. Matches the
+     * synchronous prompt cap so a resubscribe cannot outlive the work it
+     * follows; a task already terminal at resubscribe time never waits.
+     */
+    private static final long RESUBSCRIBE_TIMEOUT_MS = 120_000L;
+
+    private final A2aRegistry registry;
+    private final TaskManager taskManager;
+    private final AgentCard agentCard;
+    private final AgentCard extendedAgentCard;
+
+    private final Set<String> warnedLegacyAliases = ConcurrentHashMap.newKeySet();
+
+    private volatile ProtocolTracing tracing;
+
+    /**
+     * Optional framework reference used to resolve the installed governance
+     * policy chain for raw-skill admission ({@link A2aPolicyGateway}). When
+     * {@code null} (not wired) no chain is resolvable and raw dispatch is
+     * admitted — matching a deployment with no policies installed. Installed
+     * via {@link #setFramework} by the registration sites (agent /
+     * coordinator processors, {@code ProtocolBridge}).
+     */
+    private volatile org.atmosphere.cpr.AtmosphereFramework framework;
+
+    /**
+     * Optional push-notification service. When {@code null} (the default),
+     * the {@code tasks/pushNotificationConfig/*} methods report
+     * {@link #ERROR_PUSH_NOT_SUPPORTED} — the honest runtime state for an
+     * agent that has not enabled push (Correctness Invariant #5). Installed
+     * via {@link #setPushNotificationService} when push is wired.
+     */
+    private volatile PushNotificationService pushService;
+
+    public A2aProtocolHandler(A2aRegistry registry, TaskManager taskManager, AgentCard agentCard) {
+        this(registry, taskManager, agentCard, null);
+    }
+
+    public A2aProtocolHandler(A2aRegistry registry, TaskManager taskManager,
+                              AgentCard agentCard, AgentCard extendedAgentCard) {
+        this.registry = registry;
+        this.taskManager = taskManager;
+        this.agentCard = agentCard;
+        this.extendedAgentCard = extendedAgentCard;
+    }
+
+    public AgentCard agentCard() {
+        return agentCard;
+    }
+
+    public AgentCard extendedAgentCard() {
+        return extendedAgentCard;
+    }
+
+    /** Returns the agent card serialized as JSON. Used by the well-known filter. */
+    public String agentCardJson() {
+        try {
+            return mapper.writeValueAsString(agentCard);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Install the optional A2A tracing instance for OpenTelemetry
+     * instrumentation. Passing {@code null} disables tracing. Unwraps the
+     * {@link ProtocolTracing} backing the supplied {@link A2aTracing} so the
+     * dispatch hot path holds the shared protocol-tracing helper directly.
+     */
+    public void setTracing(A2aTracing t) {
+        this.tracing = (t == null) ? null : t.tracing();
+    }
+
+    /** Return the installed protocol tracing instance, or {@code null} if none. */
+    public ProtocolTracing tracing() {
+        return tracing;
+    }
+
+    /**
+     * Install the push-notification service that backs the
+     * {@code tasks/pushNotificationConfig/*} methods. Passing {@code null}
+     * disables push (methods report {@link #ERROR_PUSH_NOT_SUPPORTED}).
+     */
+    public void setPushNotificationService(PushNotificationService service) {
+        this.pushService = service;
+    }
+
+    /** The installed push-notification service, or {@code null} if push is off. */
+    public PushNotificationService pushNotificationService() {
+        return pushService;
+    }
+
+    /**
+     * Install the framework whose governance policy chain governs raw
+     * {@code @AgentSkill} dispatch. Registration sites call this right after
+     * construction; without it no chain is resolvable and raw skills dispatch
+     * ungoverned — the same posture as a deployment with no policies
+     * installed. Passing {@code null} clears the reference.
+     */
+    public void setFramework(org.atmosphere.cpr.AtmosphereFramework f) {
+        this.framework = f;
+    }
+
+    /** The framework backing raw-skill policy admission, or {@code null}. */
+    public org.atmosphere.cpr.AtmosphereFramework framework() {
+        return framework;
+    }
+
+    public String handleMessage(String message) {
+        try {
+            var node = mapper.readTree(message);
+            var rawMethod = node.has("method") ? node.get("method").stringValue() : null;
+            var id = node.has("id") ? node.get("id") : null;
+
+            if (rawMethod == null) {
+                return serialize(JsonRpc.Response.error(idValue(id),
+                        JsonRpc.INVALID_REQUEST, "Missing method"));
+            }
+
+            var method = A2aMethod.canonicalize(rawMethod);
+            if (!method.equals(rawMethod) && warnedLegacyAliases.add(rawMethod)) {
+                logger.warn("Received pre-1.0 A2A method '{}'; aliasing to '{}'. "
+                        + "Update clients to the v1.0.0 method name.", rawMethod, method);
+            }
+
+            var isNotification = id == null || id.isNull();
+            var idVal = isNotification ? null : idValue(id);
+            var params = node.get("params");
+
+            JsonRpc.Response response;
+            if (tracing != null) {
+                final var fMethod = method;
+                final var fRawMethod = rawMethod;
+                final var fIdVal = idVal;
+                final var fParams = params;
+                response = tracing.traced("rpc", fMethod, fParams != null ? 1 : 0,
+                        () -> dispatch(fMethod, fRawMethod, fIdVal, fParams));
+            } else {
+                response = dispatch(method, rawMethod, idVal, params);
+            }
+
+            if (isNotification) {
+                return null;
+            }
+            return serialize(response);
+        } catch (JacksonException e) {
+            // Do not reflect the parser's exception text to the remote caller —
+            // it can echo internal detail. The full cause is logged.
+            logger.warn("Failed to parse A2A message", e);
+            return serialize(JsonRpc.Response.error(null, JsonRpc.PARSE_ERROR,
+                    "Invalid JSON"));
+        } catch (Exception e) {
+            // Return a generic error; the exception message may carry internal
+            // paths, SQL, or other detail an attacker can use (info disclosure).
+            // The detail is logged server-side for operators.
+            logger.error("Error handling A2A message", e);
+            return serialize(JsonRpc.Response.error(null, JsonRpc.INTERNAL_ERROR,
+                    "Internal error"));
+        }
+    }
+
+    private JsonRpc.Response dispatch(String method, String rawMethod, Object idVal, JsonNode params) {
+        return switch (method) {
+            case A2aMethod.SEND_MESSAGE, A2aMethod.SEND_STREAMING_MESSAGE ->
+                    handleSendMessage(idVal, params);
+            case A2aMethod.GET_TASK -> handleGetTask(idVal, params);
+            case A2aMethod.LIST_TASKS -> handleListTasks(idVal, params);
+            case A2aMethod.CANCEL_TASK -> handleCancelTask(idVal, params);
+            case A2aMethod.SUBSCRIBE_TO_TASK -> handleSubscribeToTask(idVal, params);
+            case A2aMethod.CREATE_TASK_PUSH_NOTIFICATION_CONFIG ->
+                    handleCreatePushConfig(idVal, params);
+            case A2aMethod.GET_TASK_PUSH_NOTIFICATION_CONFIG ->
+                    handleGetPushConfig(idVal, params);
+            case A2aMethod.LIST_TASK_PUSH_NOTIFICATION_CONFIGS ->
+                    handleListPushConfigs(idVal, params);
+            case A2aMethod.DELETE_TASK_PUSH_NOTIFICATION_CONFIG ->
+                    handleDeletePushConfig(idVal, params);
+            case A2aMethod.GET_EXTENDED_AGENT_CARD -> handleGetExtendedAgentCard(idVal);
+            default -> JsonRpc.Response.error(idVal, JsonRpc.METHOD_NOT_FOUND,
+                    "Unknown method: " + rawMethod);
+        };
+    }
+
+    /**
+     * Handle a streaming message from a local transport with a no-op error
+     * callback. Retained for callers (the local coordinator dispatch and the
+     * {@link LocalDispatchable} SPI) that surface failures via task state
+     * rather than an inline error frame.
+     */
+    public void handleStreamingMessage(String message, Consumer<String> onToken,
+                                        Runnable onComplete) {
+        handleStreamingMessage(message, onToken, err -> { }, onComplete);
+    }
+
+    /**
+     * Handle a streaming request. Two request shapes flow here:
+     *
+     * <ul>
+     *   <li>{@code SendStreamingMessage} — resolves and runs the skill with a
+     *       live token sink installed on the task, so pipeline tokens
+     *       ({@link A2aStreamCollector#send}) and each {@code addArtifact} text
+     *       part are forwarded to {@code onToken} <em>as the skill produces
+     *       them</em> (not buffered-then-replayed). On skill failure
+     *       {@code onError} receives the failure message so the caller emits a
+     *       proper error frame instead of a silent completion (Correctness
+     *       Invariant #2 — every terminal path completes). A skill that returns
+     *       a result without streaming still yields one final frame, preserving
+     *       Mode Parity (#7) with the unary response's text.</li>
+     *   <li>{@code SubscribeToTask} (target of {@code tasks/resubscribe}) —
+     *       replays the target task's recorded artifact events and, while it is
+     *       still in-flight, forwards subsequent events until it terminates.
+     *       Does <em>not</em> create a new task or run a skill — fixing the
+     *       prior behavior that routed a resubscribe through the send path with
+     *       an empty message, spawning a bogus task.</li>
+     * </ul>
+     *
+     * {@code onComplete} runs exactly once on every terminal path.
+     */
+    public void handleStreamingMessage(String message, Consumer<String> onToken,
+                                        Consumer<String> onError, Runnable onComplete) {
+        // Serialize sink writes: a pipeline may stream tokens from a background
+        // thread while the request thread waits in awaitAndFinalize, and SSE
+        // frames must not interleave (Correctness Invariant #4 — framing).
+        var writeLock = new Object();
+        Consumer<String> safeToken = token -> {
+            synchronized (writeLock) {
+                onToken.accept(token);
+            }
+        };
+        try {
+            var node = mapper.readTree(message);
+            var rawMethod = node.has("method") ? node.get("method").stringValue() : null;
+            var method = A2aMethod.canonicalize(rawMethod);
+            var params = node.get("params");
+
+            if (A2aMethod.SUBSCRIBE_TO_TASK.equals(method)) {
+                replayAndResume(params, safeToken, onError);
+                return;
+            }
+
+            if (params == null) {
+                return;
+            }
+
+            var msg = extractMessage(params);
+            var contextId = params.has("contextId")
+                    ? params.get("contextId").stringValue() : UUID.randomUUID().toString();
+            var skillId = resolveSkillId(msg);
+
+            var taskCtx = taskManager.createTask(contextId);
+            taskCtx.addMessage(msg);
+            taskCtx.putMetadata(msg.metadata());
+
+            A2aRegistry.SkillEntry skill = null;
+            if (skillId != null) {
+                skill = registry.skill(skillId).orElse(null);
+            }
+            if (skill == null) {
+                skill = defaultSkill();
+            }
+
+            if (skill == null) {
+                logger.warn("No skill found for streaming request (skillId: {})", skillId);
+                taskCtx.fail("No skills registered");
+                onError.accept("No skills registered");
+                return;
+            }
+
+            // Install the live sink so send()/addArtifact forward tokens as the
+            // skill runs; detach on every exit so nothing is forwarded after the
+            // stream closes (Correctness Invariant #1).
+            var tokenCount = new AtomicInteger();
+            taskCtx.setTokenSink(t -> {
+                tokenCount.incrementAndGet();
+                safeToken.accept(t);
+            });
+            try {
+                executeSkill(skill, taskCtx, params);
+            } finally {
+                taskCtx.setTokenSink(null);
+            }
+
+            // Skill failed: emit an error frame rather than a silent [DONE]
+            // (Correctness Invariant #2).
+            if (taskCtx.state() == TaskState.FAILED) {
+                var reason = taskCtx.statusMessage() != null
+                        ? taskCtx.statusMessage() : "Skill execution failed";
+                onError.accept(reason);
+                return;
+            }
+
+            // Skill produced its result without streaming live (e.g. a command
+            // handler that only calls complete()): still emit one final frame so
+            // the SSE client receives the result (Mode Parity #7). Guarded by
+            // tokenCount so it never duplicates already-streamed tokens.
+            if (tokenCount.get() == 0) {
+                emitFinalResult(taskCtx, safeToken);
+            }
+        } catch (Exception e) {
+            logger.warn("Streaming message handling failed", e);
+            onError.accept("Internal error");
+        } finally {
+            onComplete.run();
+        }
+    }
+
+    /**
+     * Replay a task's recorded artifact events for a resubscribe, then — while
+     * the task is still in-flight — forward subsequent artifact events until it
+     * reaches a terminal state or {@link #RESUBSCRIBE_TIMEOUT_MS} elapses.
+     * Future-event listeners are registered <em>before</em> the snapshot replay
+     * (so an artifact added mid-replay is not lost) and deduped by
+     * {@code artifactId} (so it is not emitted twice); both listeners are
+     * removed on every exit path (Correctness Invariant #1).
+     */
+    private void replayAndResume(JsonNode params, Consumer<String> onToken,
+                                 Consumer<String> onError) {
+        var taskId = params != null && params.has("id") && !params.get("id").isNull()
+                ? params.get("id").stringValue() : null;
+        if (taskId == null || taskId.isBlank()) {
+            onError.accept("Missing task id for resubscribe");
+            return;
+        }
+        var taskOpt = taskManager.getTask(taskId);
+        if (taskOpt.isEmpty()) {
+            onError.accept("Unknown task: " + taskId);
+            return;
+        }
+        var ctx = taskOpt.get();
+
+        Set<String> seen = ConcurrentHashMap.newKeySet();
+        var terminal = new CountDownLatch(1);
+        Consumer<TaskArtifactUpdateEvent> artifactListener = ev -> {
+            if (taskId.equals(ev.taskId())) {
+                emitArtifact(ev.artifact(), onToken, seen);
+            }
+        };
+        Consumer<TaskStatusUpdateEvent> statusListener = ev -> {
+            if (taskId.equals(ev.taskId()) && ev.status() != null
+                    && ev.status().state() != null && ev.status().state().isTerminal()) {
+                terminal.countDown();
+            }
+        };
+        taskManager.onArtifactUpdate(artifactListener);
+        taskManager.onStatusUpdate(statusListener);
+        try {
+            // Replay events the reconnecting client missed.
+            for (var artifact : ctx.artifacts()) {
+                emitArtifact(artifact, onToken, seen);
+            }
+            // Stream subsequent events until the task terminates (bounded wait).
+            if (!ctx.state().isTerminal()) {
+                terminal.await(RESUBSCRIBE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            taskManager.removeArtifactListener(artifactListener);
+            taskManager.removeStatusListener(statusListener);
+        }
+    }
+
+    /** Emit an artifact's text parts once, skipping any already-seen artifactId. */
+    private static void emitArtifact(Artifact artifact, Consumer<String> onToken,
+                                     Set<String> seen) {
+        if (artifact == null || artifact.parts() == null) {
+            return;
+        }
+        if (artifact.artifactId() != null && !seen.add(artifact.artifactId())) {
+            return;
+        }
+        for (var part : artifact.parts()) {
+            if (part.text() != null && !part.text().isEmpty()) {
+                onToken.accept(part.text());
+            }
+        }
+    }
+
+    /**
+     * Emit a completed task's result as a single final frame when nothing
+     * streamed live — the recorded artifacts if any, else the completed status
+     * text. Only reached with {@code tokenCount == 0}, so it cannot duplicate a
+     * token already forwarded through the live sink.
+     */
+    private static void emitFinalResult(TaskContext taskCtx, Consumer<String> onToken) {
+        boolean emitted = false;
+        for (var artifact : taskCtx.artifacts()) {
+            if (artifact.parts() != null) {
+                for (var part : artifact.parts()) {
+                    if (part.text() != null && !part.text().isEmpty()) {
+                        onToken.accept(part.text());
+                        emitted = true;
+                    }
+                }
+            }
+        }
+        if (!emitted) {
+            var text = taskCtx.statusMessage();
+            if (text != null && !text.isEmpty()) {
+                onToken.accept(text);
+            }
+        }
+    }
+
+    private JsonRpc.Response handleSendMessage(Object id, JsonNode params) {
+        if (params == null) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS, "Missing params");
+        }
+
+        var message = extractMessage(params);
+        var contextId = resolveContextId(params, message);
+        var skillId = resolveSkillId(message);
+
+        var taskCtx = taskManager.createTask(contextId);
+        taskCtx.addMessage(message);
+        taskCtx.putMetadata(message.metadata());
+
+        if (skillId != null) {
+            var skillOpt = registry.skill(skillId);
+            if (skillOpt.isPresent()) {
+                executeSkill(skillOpt.get(), taskCtx, params);
+            } else {
+                taskCtx.fail("Unknown skill: " + skillId);
+            }
+        } else {
+            var fallback = defaultSkill();
+            if (fallback != null) {
+                executeSkill(fallback, taskCtx, params);
+            } else {
+                taskCtx.fail("No skills registered");
+            }
+        }
+
+        return JsonRpc.Response.success(id, SendMessageResponse.of(
+                taskCtx.toTask(historyLength(params))));
+    }
+
+    private JsonRpc.Response handleGetTask(Object id, JsonNode params) {
+        if (params == null || !params.has("id")) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS, "Missing task id");
+        }
+        var taskId = params.get("id").stringValue();
+        var taskOpt = taskManager.getTask(taskId);
+        if (taskOpt.isEmpty()) {
+            return JsonRpc.Response.error(id, ERROR_TASK_NOT_FOUND,
+                    "Unknown task: " + taskId);
+        }
+        return JsonRpc.Response.success(id, taskOpt.get().toTask(historyLength(params)));
+    }
+
+    private JsonRpc.Response handleListTasks(Object id, JsonNode params) {
+        var contextId = textParam(params, "contextId");
+        // Require a contextId: listing every task across all contexts leaks
+        // other callers' request messages and artifact text (IDOR). The
+        // contextId scopes the listing to the caller's own conversation —
+        // server-generated as a random UUID on SendMessage, so a caller can
+        // only enumerate contexts it created (Correctness Invariant #6).
+        if (contextId == null || contextId.isBlank()) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS,
+                    "ListTasks requires a contextId; listing across all contexts is not permitted");
+        }
+        TaskState statusFilter = null;
+        if (params != null && params.has("status") && !params.get("status").isNull()) {
+            try {
+                statusFilter = TaskState.fromWire(params.get("status").asString());
+            } catch (IllegalArgumentException e) {
+                return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS,
+                        "Invalid status filter: " + params.get("status").asString());
+            }
+        }
+        var pageSize = intParam(params, "pageSize", 50);
+        if (pageSize < 1) {
+            pageSize = 50;
+        }
+        if (pageSize > 100) {
+            pageSize = 100;
+        }
+        var pageToken = textParam(params, "pageToken");
+        var historyLength = params != null && params.has("historyLength")
+                ? Integer.valueOf(params.get("historyLength").asInt()) : null;
+
+        // Stream#toList() is unmodifiable; sort the snapshot in a mutable copy.
+        var all = new java.util.ArrayList<>(taskManager.listTasks(contextId, statusFilter));
+        all.sort((a, b) -> Long.compare(b.createdAtMillis(), a.createdAtMillis()));
+        var startIdx = decodePageToken(pageToken);
+        var endIdx = Math.min(all.size(), startIdx + pageSize);
+        var page = all.subList(Math.min(startIdx, all.size()), endIdx);
+        var nextToken = endIdx < all.size() ? encodePageToken(endIdx) : "";
+        final var clampHistory = historyLength;
+        var tasks = page.stream().map(t -> t.toTask(clampHistory)).toList();
+        return JsonRpc.Response.success(id, new ListTasksResponse(
+                tasks, nextToken, pageSize, all.size()));
+    }
+
+    private JsonRpc.Response handleCancelTask(Object id, JsonNode params) {
+        if (params == null || !params.has("id")) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS, "Missing task id");
+        }
+        var taskId = params.get("id").stringValue();
+        var existing = taskManager.getTask(taskId);
+        if (existing.isEmpty()) {
+            return JsonRpc.Response.error(id, ERROR_TASK_NOT_FOUND,
+                    "Unknown task: " + taskId);
+        }
+        var canceled = taskManager.cancelTask(taskId);
+        if (!canceled) {
+            return JsonRpc.Response.error(id, ERROR_TASK_NOT_CANCELABLE,
+                    "Task not cancelable: " + taskId);
+        }
+        return JsonRpc.Response.success(id, existing.get().toTask());
+    }
+
+    private JsonRpc.Response handleSubscribeToTask(Object id, JsonNode params) {
+        if (params == null || !params.has("id")) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS, "Missing task id");
+        }
+        var taskId = params.get("id").stringValue();
+        var taskOpt = taskManager.getTask(taskId);
+        if (taskOpt.isEmpty()) {
+            return JsonRpc.Response.error(id, ERROR_TASK_NOT_FOUND,
+                    "Unknown task: " + taskId);
+        }
+        var ctx = taskOpt.get();
+        if (ctx.state().isTerminal()) {
+            return JsonRpc.Response.error(id, ERROR_UNSUPPORTED_OPERATION,
+                    "Task is in a terminal state: " + ctx.state());
+        }
+        return JsonRpc.Response.success(id, ctx.toTask());
+    }
+
+    private JsonRpc.Response handleGetExtendedAgentCard(Object id) {
+        // Per A2A v1.0.0 §6.4: if no separate extended card is configured, fall
+        // back to the public agent card. The capability flag advertises that
+        // the method is callable, not that a distinct card exists.
+        return JsonRpc.Response.success(id,
+                extendedAgentCard != null ? extendedAgentCard : agentCard);
+    }
+
+    private void executeSkill(A2aRegistry.SkillEntry skill, TaskContext taskCtx, JsonNode params) {
+        var inputText = firstMessageText(params);
+        if (!admitRawSkill(skill, taskCtx, inputText)) {
+            return;
+        }
+        boolean ok = true;
+        try {
+            var method = skill.method();
+            method.setAccessible(true);
+            var methodParams = method.getParameters();
+            var args = new Object[methodParams.length];
+
+            var arguments = params.has("arguments") ? params.get("arguments") : null;
+            int paramIdx = 0;
+
+            for (int i = 0; i < methodParams.length; i++) {
+                if (methodParams[i].getType() == TaskContext.class) {
+                    args[i] = taskCtx;
+                } else {
+                    var a2aParam = methodParams[i].getAnnotation(AgentSkillParam.class);
+                    if (a2aParam != null && arguments != null && arguments.has(a2aParam.name())) {
+                        args[i] = coerceArgument(arguments.get(a2aParam.name()), methodParams[i].getType());
+                    } else if (paramIdx < skill.params().size()) {
+                        var message = extractMessage(params);
+                        if (!message.parts().isEmpty()
+                                && message.parts().getFirst().text() != null) {
+                            args[i] = message.parts().getFirst().text();
+                        }
+                        paramIdx++;
+                    }
+                }
+            }
+
+            method.invoke(skill.instance(), args);
+        } catch (InvocationTargetException e) {
+            ok = false;
+            var cause = e.getCause() != null ? e.getCause() : e;
+            logger.warn("Skill {} execution failed", skill.id(), cause);
+            taskCtx.fail(cause.getMessage());
+        } catch (Exception e) {
+            ok = false;
+            logger.warn("Skill {} execution failed", skill.id(), e);
+            taskCtx.fail(e.getMessage());
+        } finally {
+            tapeToolDispatch(skill, taskCtx, inputText, ok);
+        }
+    }
+
+    /**
+     * Boundary admission for a <b>raw</b> {@code @AgentSkill} handler — a
+     * user-written method the registry invokes reflectively, which never
+     * enters {@code AiPipeline} and therefore never met the governance
+     * plane's pre-admission loop. Runs the installed policy chain via
+     * {@link A2aPolicyGateway} (fail-closed) and fails the task on a denial
+     * so both the unary response ({@code SendMessage} returns the FAILED
+     * task) and the streaming path (which turns a FAILED task into an error
+     * frame) report it — Mode Parity, Correctness Invariant #7.
+     *
+     * <p>{@link PipelineBackedSkill} handlers are skipped: their dispatch
+     * runs the same chain inside {@code AiPipeline.execute()}, so admitting
+     * here too would evaluate every policy twice per turn — double-charging
+     * stateful policies (concurrency slots, rate counters) and double-writing
+     * the {@code GovernanceDecisionLog}.</p>
+     *
+     * @return {@code true} when the dispatch may proceed
+     */
+    private boolean admitRawSkill(A2aRegistry.SkillEntry skill, TaskContext taskCtx,
+                                  String inputText) {
+        if (skill.instance() instanceof PipelineBackedSkill) {
+            return true;
+        }
+        var outcome = A2aPolicyGateway.admit(framework, skill.id(), inputText);
+        if (outcome instanceof A2aPolicyGateway.Outcome.Denied denied) {
+            logger.warn("A2A skill '{}' denied by policy '{}': {}",
+                    skill.id(), denied.policyName(), denied.reason());
+            taskCtx.fail("Skill '" + skill.id() + "' denied by policy '"
+                    + denied.policyName() + "': " + denied.reason());
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Record a tool-agent dispatch (a {@code @AgentSkillHandler} that returns
+     * directly, never entering the streaming pipeline) as a single tape run, so
+     * a multi-agent coordination whose children are tool-backed still
+     * reconstructs as a tree. Skipped when: the tape is off; the handler is
+     * {@link PipelineBackedSkill} (an LLM agent that tapes its own pipeline run —
+     * avoids a double run); or there is no coordination parent run (a standalone
+     * A2A tool call is not part of a tree). Taping never breaks the dispatch.
+     */
+    private void tapeToolDispatch(A2aRegistry.SkillEntry skill, TaskContext taskCtx,
+                                  String inputText, boolean ok) {
+        if (!org.atmosphere.ai.tape.TapeSupport.installed()
+                || skill.instance() instanceof PipelineBackedSkill) {
+            return;
+        }
+        var parent = taskCtx.metadata()
+                .get(org.atmosphere.ai.tape.TapeSupport.PARENT_RUN_METADATA_KEY);
+        if (!(parent instanceof String parentRunId) || parentRunId.isBlank()) {
+            return;
+        }
+        org.atmosphere.ai.tape.TapeSupport.recordCompletedDispatch(taskCtx.taskId(), skill.id(),
+                parentRunId, null, inputText, taskResultText(taskCtx), ok);
+    }
+
+    private String firstMessageText(JsonNode params) {
+        var message = extractMessage(params);
+        return message.parts().isEmpty() ? null : message.parts().getFirst().text();
+    }
+
+    private static String taskResultText(TaskContext taskCtx) {
+        for (var artifact : taskCtx.artifacts()) {
+            if (artifact.parts() != null) {
+                for (var part : artifact.parts()) {
+                    if (part.text() != null && !part.text().isBlank()) {
+                        return part.text();
+                    }
+                }
+            }
+        }
+        return taskCtx.statusMessage();
+    }
+
+    private Object coerceArgument(JsonNode node, Class<?> targetType) {
+        if (targetType == String.class) {
+            return node.isString() ? node.stringValue() : node.toString();
+        }
+        if (targetType == int.class || targetType == Integer.class) {
+            return node.asInt();
+        }
+        if (targetType == long.class || targetType == Long.class) {
+            return node.asLong();
+        }
+        if (targetType == double.class || targetType == Double.class) {
+            return node.asDouble();
+        }
+        if (targetType == boolean.class || targetType == Boolean.class) {
+            return node.asBoolean();
+        }
+        if (targetType == JsonNode.class) {
+            return node;
+        }
+        try {
+            return mapper.treeToValue(node, targetType);
+        } catch (Exception e) {
+            return node.isString() ? node.stringValue() : node.toString();
+        }
+    }
+
+    private Message extractMessage(JsonNode params) {
+        if (params != null && params.has("message")) {
+            try {
+                return mapper.treeToValue(params.get("message"), Message.class);
+            } catch (JacksonException e) {
+                logger.warn("Failed to parse message from params", e);
+            }
+        }
+        return new Message(UUID.randomUUID().toString(), null, null,
+                Role.USER, List.of(Part.text("")), null, null, null);
+    }
+
+    private String resolveContextId(JsonNode params, Message message) {
+        if (message.contextId() != null) {
+            return message.contextId();
+        }
+        if (params != null && params.has("contextId")) {
+            return params.get("contextId").stringValue();
+        }
+        return UUID.randomUUID().toString();
+    }
+
+    private String resolveSkillId(Message message) {
+        if (message.metadata() != null && message.metadata().containsKey("skillId")) {
+            return message.metadata().get("skillId").toString();
+        }
+        return null;
+    }
+
+    /**
+     * Deterministic default for requests carrying no {@code skillId} — free-text
+     * chat from the Atmosphere Console or any generic A2A client. Prefers the
+     * conversational skill: exactly one {@code String} parameter named
+     * {@code message}, the shape the free text binds to. Falls back to the first
+     * registered skill, and {@code null} when none exist. Registration order
+     * alone is not a stable contract ({@code getDeclaredMethods} is
+     * JVM-arbitrary), which made no-skillId requests nondeterministically land
+     * on parameter-shaped skills (e.g. {@code get-time}) and fail on any
+     * multi-skill agent. Shared by the streaming and unary paths (Mode Parity).
+     */
+    private A2aRegistry.SkillEntry defaultSkill() {
+        var all = registry.skills().values();
+        for (var entry : all) {
+            var skillParams = entry.params();
+            if (skillParams != null && skillParams.size() == 1) {
+                var p = skillParams.get(0);
+                if ("message".equals(p.name()) && p.type() == String.class) {
+                    return entry;
+                }
+            }
+        }
+        return all.isEmpty() ? null : all.iterator().next();
+    }
+
+    // ── Push notification config (tasks/pushNotificationConfig/*) ──
+
+    private JsonRpc.Response handleCreatePushConfig(Object id, JsonNode params) {
+        var svc = pushService;
+        if (svc == null) {
+            return JsonRpc.Response.error(id, ERROR_PUSH_NOT_SUPPORTED,
+                    "Push notifications are not supported by this agent");
+        }
+        if (params == null) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS, "Missing params");
+        }
+        var configNode = params.has("pushNotificationConfig")
+                ? params.get("pushNotificationConfig") : params;
+        var taskId = pushTaskId(params, configNode);
+        var notFound = requirePushTask(id, taskId);
+        if (notFound != null) {
+            return notFound;
+        }
+        TaskPushNotificationConfig requested;
+        try {
+            requested = mapper.treeToValue(configNode, TaskPushNotificationConfig.class);
+        } catch (RuntimeException e) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS,
+                    "Invalid pushNotificationConfig: " + e.getMessage());
+        }
+        // Force the resolved taskId so a client cannot register a webhook
+        // under a different task's id than the one it addressed.
+        var toStore = new TaskPushNotificationConfig(requested.tenant(), requested.id(),
+                taskId, requested.url(), requested.token(), requested.authentication());
+        try {
+            return JsonRpc.Response.success(id, svc.create(toStore));
+        } catch (IllegalArgumentException e) {
+            // Boundary rejection (bad URL) — malformed input, not a server fault.
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS, e.getMessage());
+        } catch (IllegalStateException e) {
+            return JsonRpc.Response.error(id, JsonRpc.INTERNAL_ERROR, e.getMessage());
+        }
+    }
+
+    private JsonRpc.Response handleGetPushConfig(Object id, JsonNode params) {
+        var svc = pushService;
+        if (svc == null) {
+            return JsonRpc.Response.error(id, ERROR_PUSH_NOT_SUPPORTED,
+                    "Push notifications are not supported by this agent");
+        }
+        var taskId = textParam(params, "taskId");
+        var notFound = requirePushTask(id, taskId);
+        if (notFound != null) {
+            return notFound;
+        }
+        var configId = pushConfigId(params);
+        var config = svc.get(taskId, configId);
+        if (config == null) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS,
+                    "Unknown push notification config: " + configId);
+        }
+        return JsonRpc.Response.success(id, config);
+    }
+
+    private JsonRpc.Response handleListPushConfigs(Object id, JsonNode params) {
+        var svc = pushService;
+        if (svc == null) {
+            return JsonRpc.Response.error(id, ERROR_PUSH_NOT_SUPPORTED,
+                    "Push notifications are not supported by this agent");
+        }
+        var taskId = textParam(params, "taskId");
+        var notFound = requirePushTask(id, taskId);
+        if (notFound != null) {
+            return notFound;
+        }
+        return JsonRpc.Response.success(id, svc.list(taskId));
+    }
+
+    private JsonRpc.Response handleDeletePushConfig(Object id, JsonNode params) {
+        var svc = pushService;
+        if (svc == null) {
+            return JsonRpc.Response.error(id, ERROR_PUSH_NOT_SUPPORTED,
+                    "Push notifications are not supported by this agent");
+        }
+        var taskId = textParam(params, "taskId");
+        var notFound = requirePushTask(id, taskId);
+        if (notFound != null) {
+            return notFound;
+        }
+        var removed = svc.delete(taskId, pushConfigId(params));
+        return JsonRpc.Response.success(id, java.util.Map.of("deleted", removed));
+    }
+
+    /** Resolve the task id from the request or the nested config node. */
+    private static String pushTaskId(JsonNode params, JsonNode configNode) {
+        var taskId = textParam(params, "taskId");
+        return taskId != null ? taskId : textParam(configNode, "taskId");
+    }
+
+    /** Resolve the config id under any of the accepted A2A param names. */
+    private static String pushConfigId(JsonNode params) {
+        var configId = textParam(params, "pushNotificationConfigId");
+        if (configId == null) {
+            configId = textParam(params, "configId");
+        }
+        return configId != null ? configId : textParam(params, "id");
+    }
+
+    /**
+     * Reject when the task id is missing or unknown. The task id is a
+     * server-generated UUID acting as the capability to address a task's push
+     * configs (same ownership model as {@code tasks/get}); requiring the task
+     * to exist prevents registering webhooks against arbitrary ids.
+     */
+    private JsonRpc.Response requirePushTask(Object id, String taskId) {
+        if (taskId == null || taskId.isBlank()) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS, "Missing taskId");
+        }
+        if (taskManager.getTask(taskId).isEmpty()) {
+            return JsonRpc.Response.error(id, ERROR_TASK_NOT_FOUND, "Unknown task: " + taskId);
+        }
+        return null;
+    }
+
+    private Integer historyLength(JsonNode params) {
+        if (params == null) {
+            return null;
+        }
+        if (params.has("historyLength")) {
+            return params.get("historyLength").asInt();
+        }
+        if (params.has("configuration") && params.get("configuration").has("historyLength")) {
+            return params.get("configuration").get("historyLength").asInt();
+        }
+        return null;
+    }
+
+    private static String textParam(JsonNode params, String name) {
+        if (params == null || !params.has(name) || params.get(name).isNull()) {
+            return null;
+        }
+        return params.get(name).asString();
+    }
+
+    private static int intParam(JsonNode params, String name, int defaultValue) {
+        if (params == null || !params.has(name) || params.get(name).isNull()) {
+            return defaultValue;
+        }
+        return params.get(name).asInt(defaultValue);
+    }
+
+    private static int decodePageToken(String token) {
+        if (token == null || token.isEmpty()) {
+            return 0;
+        }
+        try {
+            return Math.max(0, Integer.parseInt(token));
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    private static String encodePageToken(int offset) {
+        return Integer.toString(offset);
+    }
+
+    private Object idValue(JsonNode id) {
+        if (id == null || id.isNull()) {
+            return null;
+        }
+        if (id.isNumber()) {
+            return id.numberValue();
+        }
+        if (id.isString()) {
+            return id.stringValue();
+        }
+        return id.toString();
+    }
+
+    private String serialize(Object obj) {
+        try {
+            return mapper.writeValueAsString(obj);
+        } catch (JacksonException e) {
+            logger.error("Failed to serialize A2A response", e);
+            return "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"Serialization failed\"}}";
+        }
+    }
+}

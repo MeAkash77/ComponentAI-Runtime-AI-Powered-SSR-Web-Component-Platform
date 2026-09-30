@@ -1,0 +1,72 @@
+/*
+ * Copyright 2011-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// RN-specific platform setup
+export { setupReactNative, isReactNativeSetup } from '../../react-native/platform';
+export type { RNCapabilities, SetupReactNativeOptions } from '../../react-native/platform';
+
+// Shared core hook for building custom hooks
+export { useAtmosphereCore } from '../shared/useAtmosphereCore';
+export type { UseAtmosphereCoreResult, CoreSubscriptionHandlers } from '../shared/useAtmosphereCore';
+
+// RN-aware hooks
+export { useAtmosphereRN } from './useAtmosphereRN';
+export type { UseAtmosphereRNOptions, UseAtmosphereRNResult, BackgroundBehavior } from './useAtmosphereRN';
+
+export { useStreamingRN } from './useStreamingRN';
+export type {
+  UseStreamingRNOptions,
+  UseStreamingRNResult,
+  StreamingSendOutcome,
+  StreamingSendResult,
+} from './useStreamingRN';
+export { useChatRN } from './useChatRN';
+export type { UseChatRNOptions, UseChatRNResult } from './useChatRN';
+
+// ConnectionStatus surface — useConnectionStatus is identical to the
+// web version (pure React, no RN-specific behavior); re-export under
+// the RN entry so consumers don't have to mix imports.
+export { useConnectionStatus } from '../react/useConnectionStatus';
+export type { UseConnectionStatusResult } from '../react/useConnectionStatus';
+export {
+  ConnectionStatusBadgeRN,
+  DEFAULT_LABELS_RN as CONNECTION_STATUS_LABELS_RN,
+  DEFAULT_COLORS_RN as CONNECTION_STATUS_COLORS_RN,
+} from './ConnectionStatusBadgeRN';
+export type { ConnectionStatusBadgeRNProps } from './ConnectionStatusBadgeRN';
+export type {
+  ConnectionEvent,
+  ConnectionPhase,
+  ConnectionStatusOptions,
+  ConnectionStatusSnapshot,
+  ConnectionTransportName,
+} from '../../resilience';
+
+// Re-export core hooks that work as-is in RN
+export { AtmosphereProvider, useAtmosphereContext } from '../react/provider';
+export { useRoom } from '../react/useRoom';
+export { usePresence } from '../react/usePresence';
+// useOfflineQueue is pure React — same hook works in RN (no DOM access, no
+// browser-only globals). Re-exported so RN consumers can import from
+// atmosphere.js/react-native without crossing entry points.
+export { useOfflineQueue } from '../react/useOfflineQueue';
+export type { UseOfflineQueueOptions, UseOfflineQueueResult } from '../react/useOfflineQueue';
+// useMessageHistory is also pure React — same reason.
+export { useMessageHistory } from '../react/useMessageHistory';
+export type { UseMessageHistoryOptions, UseMessageHistoryResult } from '../react/useMessageHistory';
+// useOptimistic is pure React (no DOM access, no browser-only globals).
+export { useOptimistic } from '../react/useOptimistic';
+export type { UseOptimisticOptions, UseOptimisticResult } from '../react/useOptimistic';

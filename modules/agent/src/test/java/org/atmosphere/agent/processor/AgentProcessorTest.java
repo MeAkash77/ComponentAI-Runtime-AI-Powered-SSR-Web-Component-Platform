@@ -1,0 +1,331 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.agent.processor;
+
+import org.atmosphere.a2a.annotation.AgentSkillParam;
+import org.atmosphere.a2a.annotation.AgentSkill;
+import org.atmosphere.a2a.annotation.AgentSkillHandler;
+import org.atmosphere.a2a.runtime.TaskContext;
+import org.atmosphere.a2a.types.Artifact;
+import org.atmosphere.agent.ClasspathDetector;
+import org.atmosphere.agent.annotation.Agent;
+import org.atmosphere.agent.annotation.Command;
+import org.atmosphere.ai.StreamingSession;
+import org.atmosphere.ai.annotation.AiTool;
+import org.atmosphere.ai.annotation.Prompt;
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Tests for {@link AgentProcessor} — specifically the annotation scanning,
+ * skill file parsing, and zero-code agent support.
+ */
+public class AgentProcessorTest {
+
+    @Agent(name = "test-agent", description = "A test agent")
+    static class MinimalAgent {
+    }
+
+    @Agent(name = "full-agent", description = "Full agent")
+    static class FullAgent {
+        @Command(value = "/status", description = "Show status")
+        public String status() {
+            return "OK";
+        }
+
+        @Command(value = "/deploy", confirm = "Really?")
+        public String deploy(String args) {
+            return "Deployed " + args;
+        }
+
+        @Prompt
+        public void onPrompt(String message, StreamingSession session) {
+            session.stream(message);
+        }
+
+        @AiTool(name = "weather", description = "Get weather")
+        public String getWeather(String city) {
+            return "Sunny in " + city;
+        }
+    }
+
+    @Test
+    public void testAnnotationPresent() {
+        var annotation = MinimalAgent.class.getAnnotation(Agent.class);
+        assertNotNull(annotation);
+        assertEquals("test-agent", annotation.name());
+        assertEquals("A test agent", annotation.description());
+        assertEquals("", annotation.skillFile());
+    }
+
+    @Test
+    public void testFullAgentAnnotation() {
+        var annotation = FullAgent.class.getAnnotation(Agent.class);
+        assertNotNull(annotation);
+        assertEquals("full-agent", annotation.name());
+    }
+
+    @Test
+    public void testFullAgentHasPrompt() {
+        var hasPrompt = false;
+        for (var method : FullAgent.class.getDeclaredMethods()) {
+            if (method.isAnnotationPresent(Prompt.class)) {
+                hasPrompt = true;
+                break;
+            }
+        }
+        assertTrue(hasPrompt);
+    }
+
+    @Test
+    public void testFullAgentHasCommands() {
+        var commandCount = 0;
+        for (var method : FullAgent.class.getDeclaredMethods()) {
+            if (method.isAnnotationPresent(Command.class)) {
+                commandCount++;
+            }
+        }
+        assertEquals(2, commandCount);
+    }
+
+    @Test
+    public void testFullAgentHasTools() {
+        var toolCount = 0;
+        for (var method : FullAgent.class.getDeclaredMethods()) {
+            if (method.isAnnotationPresent(AiTool.class)) {
+                toolCount++;
+            }
+        }
+        assertEquals(1, toolCount);
+    }
+
+    @Test
+    public void testClasspathDetectorA2a() {
+        // A2A is on the classpath in this test (optional dep)
+        assertTrue(ClasspathDetector.hasA2a());
+    }
+
+    @Test
+    public void testClasspathDetectorMcp() {
+        // MCP is on the classpath in this test (optional dep)
+        assertTrue(ClasspathDetector.hasMcp());
+    }
+
+    @Test
+    public void testClasspathDetectorUnknown() {
+        assertFalse(ClasspathDetector.isPresent("com.nonexistent.FakeClass"));
+    }
+
+    // ── Headless agent test classes ──
+
+    @Agent(name = "headless-a2a", endpoint = "/atmosphere/a2a/headless",
+            description = "Headless agent with A2A skills")
+    static class HeadlessA2aAgent {
+        @AgentSkill(id = "greet", name = "Greet", description = "Say hello",
+                tags = {"greeting"})
+        @AgentSkillHandler
+        public void greet(TaskContext task,
+                          @AgentSkillParam(name = "name", description = "Name") String name) {
+            task.addArtifact(Artifact.text("Hello " + name));
+            task.complete("Greeted " + name);
+        }
+    }
+
+    @Agent(name = "explicit-headless", headless = true,
+            description = "Explicitly headless agent")
+    static class ExplicitHeadlessAgent {
+        @Prompt
+        public void onPrompt(String msg, StreamingSession session) {
+            session.stream(msg);
+        }
+    }
+
+    @Agent(name = "mixed-agent", description = "Full agent with A2A skills")
+    static class MixedAgent {
+        @Prompt
+        public void onPrompt(String msg, StreamingSession session) {
+            session.stream(msg);
+        }
+
+        @AgentSkill(id = "compute", name = "Compute", description = "Compute something",
+                tags = {"math"})
+        @AgentSkillHandler
+        public void compute(TaskContext task,
+                            @AgentSkillParam(name = "expr", description = "Expression") String expr) {
+            task.addArtifact(Artifact.text("Result: " + expr));
+            task.complete("Computed");
+        }
+    }
+
+    @Agent(name = "custom-endpoint", endpoint = "/api/custom",
+            version = "2.0.0", description = "Custom endpoint agent")
+    static class CustomEndpointAgent {
+        @AgentSkill(id = "ping", name = "Ping", description = "Ping",
+                tags = {"health"})
+        @AgentSkillHandler
+        public void ping(TaskContext task) {
+            task.complete("pong");
+        }
+    }
+
+    // ── Headless detection tests ──
+
+    @Test
+    public void testHeadlessAutoDetected() {
+        var processor = new AgentProcessor();
+        var annotation = HeadlessA2aAgent.class.getAnnotation(Agent.class);
+        assertTrue(processor.isHeadless(annotation, HeadlessA2aAgent.class),
+                "Agent with @Skill methods and no @Prompt should be headless");
+    }
+
+    @Test
+    public void testExplicitHeadlessFlag() {
+        var processor = new AgentProcessor();
+        var annotation = ExplicitHeadlessAgent.class.getAnnotation(Agent.class);
+        assertTrue(processor.isHeadless(annotation, ExplicitHeadlessAgent.class),
+                "Agent with headless=true should be headless even with @Prompt");
+    }
+
+    @Test
+    public void testMixedAgentNotHeadless() {
+        var processor = new AgentProcessor();
+        var annotation = MixedAgent.class.getAnnotation(Agent.class);
+        assertFalse(processor.isHeadless(annotation, MixedAgent.class),
+                "Agent with both @Prompt and @Skill should NOT be headless");
+    }
+
+    @Test
+    public void testFullAgentNotHeadless() {
+        var processor = new AgentProcessor();
+        var annotation = FullAgent.class.getAnnotation(Agent.class);
+        assertFalse(processor.isHeadless(annotation, FullAgent.class),
+                "Agent with @Prompt should NOT be headless");
+    }
+
+    @Test
+    public void testMinimalAgentNotHeadless() {
+        var processor = new AgentProcessor();
+        var annotation = MinimalAgent.class.getAnnotation(Agent.class);
+        assertFalse(processor.isHeadless(annotation, MinimalAgent.class),
+                "Agent with no @Prompt and no @Skill should NOT be headless");
+    }
+
+    // ── Annotation attribute tests ──
+
+    @Test
+    public void testCustomEndpointAttribute() {
+        var annotation = CustomEndpointAgent.class.getAnnotation(Agent.class);
+        assertEquals("/api/custom", annotation.endpoint());
+    }
+
+    @Test
+    public void testVersionAttribute() {
+        var annotation = CustomEndpointAgent.class.getAnnotation(Agent.class);
+        assertEquals("2.0.0", annotation.version());
+    }
+
+    @Test
+    public void testDefaultEndpointIsEmpty() {
+        var annotation = MinimalAgent.class.getAnnotation(Agent.class);
+        assertEquals("", annotation.endpoint());
+    }
+
+    @Test
+    public void testDefaultVersionIs1() {
+        var annotation = MinimalAgent.class.getAnnotation(Agent.class);
+        assertEquals("1.0.0", annotation.version());
+    }
+
+    @Test
+    public void testDefaultHeadlessIsFalse() {
+        var annotation = MinimalAgent.class.getAnnotation(Agent.class);
+        assertFalse(annotation.headless());
+    }
+
+    @Test
+    public void testSyntheticPromptExists() {
+        // Verify the SyntheticPrompt inner class has a @Prompt method
+        var found = false;
+        for (var method : AgentProcessor.SyntheticPrompt.class.getDeclaredMethods()) {
+            if (method.isAnnotationPresent(Prompt.class)) {
+                found = true;
+                assertEquals(2, method.getParameterCount());
+                assertEquals(String.class, method.getParameterTypes()[0]);
+                assertEquals(StreamingSession.class, method.getParameterTypes()[1]);
+                break;
+            }
+        }
+        assertTrue(found, "SyntheticPrompt must have a @Prompt method");
+    }
+
+    /**
+     * Regression for the 4.0.36 durable-HITL sample crash: AgentProcessor's
+     * bytecode must not contain any direct symbolic reference to
+     * {@code org/atmosphere/mcp/...}, otherwise samples that depend on
+     * {@code atmosphere-agent} without the optional {@code atmosphere-mcp}
+     * jar crash at servlet init with a NoClassDefFoundError on
+     * {@code McpRegistry$ParamEntry} before any handler is mapped.
+     *
+     * <p>All MCP type references must live in {@link McpAgentRegistration},
+     * which is loaded reflectively from AgentProcessor only after
+     * {@link ClasspathDetector#hasMcp()} succeeds.</p>
+     */
+    @Test
+    public void testAgentProcessorBytecodeIsFreeOfMcpClassRefs() throws Exception {
+        byte[] bytecode;
+        try (var in = AgentProcessor.class.getResourceAsStream(
+                "/org/atmosphere/agent/processor/AgentProcessor.class")) {
+            assertNotNull(in, "AgentProcessor.class must be on the classpath");
+            bytecode = in.readAllBytes();
+        }
+
+        var ascii = new String(bytecode, java.nio.charset.StandardCharsets.US_ASCII);
+        // Any slash-separated type reference to org/atmosphere/mcp/... in the
+        // constant pool would force the JVM to resolve that class at link
+        // time when AgentProcessor is loaded — which is exactly the failure
+        // mode this test pins down. String literals (e.g. the fully-qualified
+        // name passed to Class.forName) use dot notation and are safe.
+        assertFalse(ascii.contains("org/atmosphere/mcp/"),
+                "AgentProcessor.class must not contain any symbolic reference "
+                        + "to org/atmosphere/mcp/* — move MCP integration to "
+                        + "McpAgentRegistration (loaded reflectively). Found "
+                        + "one in the bytecode constant pool.");
+    }
+
+    /**
+     * Regression for the 4.0.36 durable-HITL sample crash: confirm the MCP
+     * bridge class is resolvable by the classloader agent users actually hit
+     * (so {@code Class.forName} in the registerMcpAt fallback path loads it)
+     * and exposes the expected static entry point.
+     */
+    @Test
+    public void testMcpAgentRegistrationIsLoadableViaClassForName() throws Exception {
+        var bridge = Class.forName(
+                "org.atmosphere.agent.processor.McpAgentRegistration",
+                true, Thread.currentThread().getContextClassLoader());
+        var register = bridge.getDeclaredMethod("register",
+                org.atmosphere.cpr.AtmosphereFramework.class,
+                String.class, String.class,
+                org.atmosphere.ai.tool.ToolRegistry.class,
+                Object.class, String.class,
+                java.util.List.class, java.util.List.class);
+        assertNotNull(register, "McpAgentRegistration.register must exist with the "
+                + "signature AgentProcessor invokes reflectively");
+        assertTrue(java.lang.reflect.Modifier.isStatic(register.getModifiers()),
+                "McpAgentRegistration.register must be static");
+    }
+}

@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.atmosphere</groupId>
+        <artifactId>atmosphere-project</artifactId>
+        <version>4.0.72-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <groupId>org.atmosphere.samples</groupId>
+    <artifactId>atmosphere-spring-boot-channels-chat</artifactId>
+    <name>atmosphere-spring-boot-channels-chat</name>
+    <description>Omnichannel AI chat — one @Agent on Web + Telegram + Slack + Discord + WhatsApp + Messenger</description>
+
+    <properties>
+        <!-- Self-contained netty pin: covers samples scaffolded standalone against
+             a released parent POM that may not yet declare netty.version. -->
+        <netty.version>4.2.17.Final</netty.version>
+        <maven.deploy.skip>true</maven.deploy.skip>
+        <atmosphere.starter>atmosphere-spring-boot-starter</atmosphere.starter>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+<!-- netty-bom imported BEFORE spring-boot-dependencies so its
+                 first-wins rule pulls patched netty 4.x for this sample,
+                 overriding Spring Boot's transitively-pinned vulnerable line. -->
+            <dependency>
+                <groupId>io.netty</groupId>
+                <artifactId>netty-bom</artifactId>
+                <version>${netty.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <!-- tools.jackson pinned one patch above Spring Boot 4.1.0's
+                 managed 3.1.4: 3.1.5 closes GHSA-5gvw-p9qm-jgwh
+                 (jackson-databind DoS). Imported BEFORE spring-boot-dependencies
+                 so Maven's first-declared-wins rule takes the patched line. -->
+            <dependency>
+                <groupId>tools.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>3.1.5</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-dependencies</artifactId>
+                <version>${spring-boot.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>${atmosphere.starter}</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-agent</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-ai</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-channels</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Parent POM restricts logback to test scope; override for runtime logging -->
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-core</artifactId>
+            <version>${logback-version}</version>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>${logback-version}</version>
+            <scope>runtime</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <version>${spring-boot.version}</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+    <profiles>
+        <profile>
+            <id>spring-boot3</id>
+            <properties>
+                <spring-boot.version>3.5.15</spring-boot.version>
+                <netty.version>4.1.137.Final</netty.version>
+                <atmosphere.starter>atmosphere-spring-boot3-starter</atmosphere.starter>
+            </properties>
+        </profile>
+    </profiles>
+</project>

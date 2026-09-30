@@ -1,0 +1,172 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.samples.springboot.checkpoint;
+
+import java.nio.file.Path;
+import java.nio.file.Paths;
+
+import org.atmosphere.checkpoint.CheckpointStore;
+import org.atmosphere.checkpoint.DurableTimerService;
+import org.atmosphere.checkpoint.DurableTimerStore;
+import org.atmosphere.checkpoint.InMemoryCheckpointStore;
+import org.atmosphere.checkpoint.InMemoryDurableTimerStore;
+import org.atmosphere.checkpoint.SqliteCheckpointStore;
+import org.atmosphere.checkpoint.SqliteDurableTimerStore;
+import org.atmosphere.checkpoint.coordinator.CheckpointingCoordinationJournal;
+import org.atmosphere.checkpoint.coordinator.CoordinationStateExtractor;
+import org.atmosphere.checkpoint.coordinator.CoordinationStateExtractors;
+import org.atmosphere.coordinator.journal.CoordinationEvent;
+import org.atmosphere.coordinator.journal.CoordinationJournal;
+import org.atmosphere.coordinator.journal.InMemoryCoordinationJournal;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+
+/**
+ * Wires a {@link CheckpointStore} and decorates the coordinator's
+ * {@link CoordinationJournal} with {@link CheckpointingCoordinationJournal}
+ * so every agent boundary emits a durable snapshot.
+ *
+ * <p>By default the sample uses a {@link SqliteCheckpointStore} backed by a
+ * local {@code target/checkpoint.db} file — that way {@code mvn clean} is
+ * enough to reset the store, but a JVM restart (without {@code mvn clean})
+ * preserves all snapshots and demonstrates durable HITL survival across
+ * restarts. Set {@code atmosphere.checkpoint.store=in-memory} to opt out
+ * for tests that want a clean slate on each boot.</p>
+ *
+ * <p>Configuration (see {@code application.yml}):</p>
+ * <pre>
+ *   atmosphere.checkpoint.store        sqlite|in-memory (default: sqlite)
+ *   atmosphere.checkpoint.sqlite.path  filesystem path to the SQLite db
+ *                                      (default: target/checkpoint.db)
+ * </pre>
+ */
+@Configuration
+public class CheckpointConfig {
+
+    private static final Logger logger = LoggerFactory.getLogger(CheckpointConfig.class);
+
+    static final String STORE_SQLITE = "sqlite";
+    static final String STORE_IN_MEMORY = "in-memory";
+
+    private final String storeKind;
+    private final String sqlitePath;
+
+    public CheckpointConfig(
+            @Value("${atmosphere.checkpoint.store:sqlite}") String storeKind,
+            @Value("${atmosphere.checkpoint.sqlite.path:target/checkpoint.db}") String sqlitePath) {
+        this.storeKind = storeKind == null ? STORE_SQLITE : storeKind.trim().toLowerCase();
+        this.sqlitePath = sqlitePath == null ? "target/checkpoint.db" : sqlitePath;
+    }
+
+    /**
+     * CheckpointStore bean. {@code stop()} is bound as the destroy method so
+     * the Spring context closes the SQLite connection on shutdown; without
+     * this, the JDBC connection leaks on every restart.
+     */
+    @Bean(destroyMethod = "stop")
+    public CheckpointStore checkpointStore() {
+        CheckpointStore store = switch (storeKind) {
+            case STORE_IN_MEMORY -> {
+                logger.info("Using InMemoryCheckpointStore — snapshots will be lost on restart.");
+                yield new InMemoryCheckpointStore();
+            }
+            case STORE_SQLITE -> {
+                Path dbPath = Paths.get(sqlitePath).toAbsolutePath();
+                logger.info("Using SqliteCheckpointStore at {} — snapshots survive JVM restart.", dbPath);
+                yield new SqliteCheckpointStore(dbPath);
+            }
+            default -> throw new IllegalArgumentException(
+                    "Unknown atmosphere.checkpoint.store value '" + storeKind
+                            + "'. Valid values: " + STORE_SQLITE + ", " + STORE_IN_MEMORY);
+        };
+        store.start();
+        return store;
+    }
+
+    /**
+     * Backing store for the durable timer service. Defaults to a
+     * {@link SqliteDurableTimerStore} at {@code target/durable-timers.db} so a
+     * timer armed before a JVM restart actually survives it — matching the
+     * checkpoint store's durability. Set {@code atmosphere.checkpoint.store=in-memory}
+     * to opt out (armed timers then die with the JVM).
+     *
+     * <p>No explicit {@code destroyMethod} is declared: Spring's inferred-destroy
+     * closes {@link SqliteDurableTimerStore#close()} (releasing the JDBC
+     * connection) on shutdown and no-ops for the in-memory store. The timer
+     * service below does NOT own this connection and must not close it
+     * (Correctness Invariant #1).</p>
+     */
+    @Bean
+    public DurableTimerStore durableTimerStore() {
+        if (STORE_IN_MEMORY.equals(storeKind)) {
+            logger.info("Using InMemoryDurableTimerStore — armed timers will be lost on restart.");
+            return new InMemoryDurableTimerStore();
+        }
+        Path dbPath = Paths.get("target/durable-timers.db").toAbsolutePath();
+        logger.info("Using SqliteDurableTimerStore at {} — armed timers survive JVM restart.", dbPath);
+        return new SqliteDurableTimerStore(dbPath);
+    }
+
+    /**
+     * Wall-clock durable timer service for restart-surviving deadlines — e.g.
+     * auto-rejecting an approval that no human acted on within its window. The
+     * {@code approval-auto-reject} callback is registered here; a controller arms
+     * a timer via {@link DurableTimerService#schedule} and the service fires it on
+     * the poll after its deadline (even across a restart, because the store above
+     * is crash-durable by default). {@code close()} stops the poller on shutdown;
+     * the store connection is released by its own bean (Correctness Invariant #1).
+     */
+    @Bean(destroyMethod = "close")
+    public DurableTimerService durableTimerService(DurableTimerStore durableTimerStore) {
+        var service = new DurableTimerService(durableTimerStore);
+        service.onFire("approval-auto-reject", timer ->
+                logger.warn("Durable timer fired: auto-rejecting approval {} (deadline reached)",
+                        timer.payload().get("approvalId")));
+        service.start();
+        logger.info("DurableTimerService started — restart-surviving timers armed.");
+        return service;
+    }
+
+    @Bean
+    @Primary
+    public CoordinationJournal coordinationJournal(CheckpointStore store) {
+        var underlying = new InMemoryCoordinationJournal();
+        CoordinationStateExtractor<CoordinationEvent> extractor =
+                CoordinationStateExtractors.event();
+        // Do NOT call journal.start() here. CheckpointingCoordinationJournal.start()
+        // delegates to store.start(), which would re-initialize the SQLite schema
+        // and emit a duplicate "SqliteCheckpointStore initialized" log line —
+        // checkpointStore() above has already started the store. The processor's
+        // bridged-journal path in CoordinatorProcessor also skips start() because
+        // this bean is Spring-owned (see AtmosphereCoordinatorAutoConfiguration).
+        return journal(underlying, store, extractor);
+    }
+
+    private static CoordinationJournal journal(
+            InMemoryCoordinationJournal underlying,
+            CheckpointStore store,
+            CoordinationStateExtractor<CoordinationEvent> extractor) {
+        return new CheckpointingCoordinationJournal<>(
+                underlying,
+                store,
+                CheckpointingCoordinationJournal.onAgentBoundaries(),
+                extractor);
+    }
+}

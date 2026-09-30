@@ -1,0 +1,482 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.admin;
+
+import org.atmosphere.cpr.AtmosphereFramework;
+import org.atmosphere.cpr.BroadcasterFactory;
+import org.atmosphere.mcp.registry.McpRegistry;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+/**
+ * Tests for {@link AdminMcpBridge} — MCP tool registration and authorizer gating.
+ */
+class AdminMcpBridgeTest {
+
+    private AtmosphereAdmin admin;
+    private McpRegistry registry;
+    private ControlAuthorizer authorizer;
+    private AdminMcpBridge bridge;
+
+    @BeforeEach
+    void setUp() {
+        var framework = mock(AtmosphereFramework.class);
+        var factory = mock(BroadcasterFactory.class);
+        when(framework.getBroadcasterFactory()).thenReturn(factory);
+        when(factory.lookupAll()).thenReturn(Collections.emptyList());
+        when(framework.getAtmosphereHandlers()).thenReturn(new LinkedHashMap<>());
+
+        admin = new AtmosphereAdmin(framework, 100);
+        registry = new McpRegistry();
+        authorizer = ControlAuthorizer.ALLOW_ALL;
+        bridge = new AdminMcpBridge(admin, registry, authorizer);
+    }
+
+    // ── Read tool registration ──
+
+    @Test
+    void testRegisterReadToolsRegisters8Tools() {
+        bridge.registerReadTools();
+        var tools = registry.tools();
+        assertTrue(tools.containsKey("atmosphere_overview"));
+        assertTrue(tools.containsKey("atmosphere_list_broadcasters"));
+        assertTrue(tools.containsKey("atmosphere_list_resources"));
+        assertTrue(tools.containsKey("atmosphere_list_agents"));
+        assertTrue(tools.containsKey("atmosphere_agent_sessions"));
+        assertTrue(tools.containsKey("atmosphere_list_handlers"));
+        assertTrue(tools.containsKey("atmosphere_list_interceptors"));
+        assertTrue(tools.containsKey("atmosphere_audit_log"));
+    }
+
+    @Test
+    void testOverviewToolReturnsMap() throws Exception {
+        bridge.registerReadTools();
+        var tool = registry.tools().get("atmosphere_overview");
+        assertNotNull(tool);
+        var result = tool.handler().execute(Map.of());
+        assertNotNull(result);
+        assertTrue(result instanceof Map);
+    }
+
+    @Test
+    void testAuditLogToolReturnsEntries() throws Exception {
+        admin.auditLog().record("test", "action", "target", true, null);
+        bridge.registerReadTools();
+        var tool = registry.tools().get("atmosphere_audit_log");
+        var result = tool.handler().execute(Map.of());
+        assertTrue(result instanceof List);
+        assertEquals(1, ((List<?>) result).size());
+    }
+
+    // ── Write tool registration ──
+
+    @Test
+    void testRegisterWriteToolsRegistersAllTools() {
+        bridge.registerWriteTools();
+        var tools = registry.tools();
+        assertTrue(tools.containsKey("atmosphere_broadcast"));
+        assertTrue(tools.containsKey("atmosphere_disconnect_resource"));
+        assertTrue(tools.containsKey("atmosphere_destroy_broadcaster"));
+        assertTrue(tools.containsKey("atmosphere_cancel_task"));
+        assertTrue(tools.containsKey("atmosphere_resume_run"));
+        // The tape read tool rides the authorizer-gated surface because tape
+        // content is pre-redaction; the ai module is on the test classpath.
+        assertTrue(tools.containsKey("atmosphere_read_tape"));
+    }
+
+    @Test
+    void testResumeRunToolDeniedByAuthorizer() throws Exception {
+        var denyAll = (ControlAuthorizer) (action, target, principal) -> false;
+        var deniedBridge = new AdminMcpBridge(admin, registry, denyAll);
+        deniedBridge.registerWriteTools();
+
+        var tool = registry.tools().get("atmosphere_resume_run");
+        @SuppressWarnings("unchecked")
+        var result = (Map<String, Object>) tool.handler().execute(Map.of("runId", "r1"));
+        assertEquals("unauthorized", result.get("error"));
+    }
+
+    @Test
+    void testResumeRunToolReportsNotFoundForUnknownRun() throws Exception {
+        // An enabled spine with an empty journal: an unknown run id is not
+        // resumable, so the authorized admin call reports NOT_FOUND (not an error).
+        org.atmosphere.ai.resume.DurableRunSpineHolder.install(
+                new org.atmosphere.ai.resume.DurableRunSpine(
+                        new org.atmosphere.ai.resume.InMemoryEffectJournal(),
+                        new org.atmosphere.ai.resume.DurableRunConfig(
+                                true, java.time.Duration.ofMinutes(5), false),
+                        "test-proc"));
+        try {
+            bridge.registerWriteTools();
+            var tool = registry.tools().get("atmosphere_resume_run");
+            @SuppressWarnings("unchecked")
+            var result = (Map<String, Object>) tool.handler().execute(Map.of("runId", "missing"));
+            assertEquals("NOT_FOUND", result.get("status"));
+        } finally {
+            org.atmosphere.ai.resume.DurableRunSpineHolder.reset();
+        }
+    }
+
+    // ── Session tape read tool ──
+
+    @Test
+    void testReadTapeToolDeniedByAuthorizerAndAuditLogged() throws Exception {
+        var denyAll = (ControlAuthorizer) (action, target, principal) -> false;
+        var deniedBridge = new AdminMcpBridge(admin, registry, denyAll);
+        deniedBridge.registerWriteTools();
+
+        var tool = registry.tools().get("atmosphere_read_tape");
+        @SuppressWarnings("unchecked")
+        var result = (Map<String, Object>) tool.handler().execute(Map.of("runId", "run-1"));
+        assertEquals("unauthorized", result.get("error"));
+
+        var entries = admin.auditLog().entries();
+        assertEquals(1, entries.size());
+        assertEquals("read_tape.denied", entries.getFirst().action());
+        assertEquals("run-1", entries.getFirst().target());
+        assertFalse(entries.getFirst().success());
+    }
+
+    @Test
+    void testReadTapeToolReportsDisabledWhenNoTapeInstalled() throws Exception {
+        bridge.registerWriteTools();
+        var tool = registry.tools().get("atmosphere_read_tape");
+        @SuppressWarnings("unchecked")
+        var result = (Map<String, Object>) tool.handler().execute(Map.of());
+        assertEquals("session tape is not enabled", result.get("error"));
+    }
+
+    @Test
+    void testReadTapeToolListsRunsAndCursorReadsSteps() throws Exception {
+        var store = new org.atmosphere.ai.tape.InMemoryTapeStore();
+        var recorder = org.atmosphere.ai.tape.TapeSupport.install(store);
+        try {
+            store.begin(new org.atmosphere.ai.tape.TapeRun(
+                    "run-1", "tape-a", null, null, "alice", "/ai/chat", "model-1",
+                    "runtime-1", 1000L, org.atmosphere.ai.tape.TapeStatus.OPEN,
+                    null, 0, 0, false, null));
+            store.append("run-1", List.of(
+                    new org.atmosphere.ai.tape.TapeStep(
+                            "run-1", 0, "text", "{\"v\":1,\"text\":\"hel\"}", 1L),
+                    new org.atmosphere.ai.tape.TapeStep(
+                            "run-1", 1, "text", "{\"v\":1,\"text\":\"lo\"}", 2L),
+                    new org.atmosphere.ai.tape.TapeStep(
+                            "run-1", 2, "complete", "{\"v\":1}", 3L)));
+            store.markTerminal("run-1", org.atmosphere.ai.tape.TapeStatus.COMPLETED,
+                    org.atmosphere.ai.tape.TapeStore.Counters.NONE);
+
+            bridge.registerWriteTools();
+            var tool = registry.tools().get("atmosphere_read_tape");
+
+            // List mode, filtered by tapeId.
+            @SuppressWarnings("unchecked")
+            var listed = (Map<String, Object>) tool.handler().execute(Map.of("tapeId", "tape-a"));
+            @SuppressWarnings("unchecked")
+            var runs = (List<Map<String, Object>>) listed.get("runs");
+            assertEquals(1, runs.size());
+            assertEquals("run-1", runs.getFirst().get("runId"));
+            assertEquals("COMPLETED", runs.getFirst().get("status"));
+            assertEquals(3L, runs.getFirst().get("stepCount"));
+
+            // Cursor read: from seq 1, one step — and the cursor to resume at.
+            @SuppressWarnings("unchecked")
+            var page1 = (Map<String, Object>) tool.handler().execute(
+                    Map.of("runId", "run-1", "fromSeq", "1", "max", "1"));
+            @SuppressWarnings("unchecked")
+            var page1Steps = (List<Map<String, Object>>) page1.get("steps");
+            assertEquals(1, page1Steps.size());
+            assertEquals(1L, page1Steps.getFirst().get("seq"));
+            assertEquals("{\"v\":1,\"text\":\"lo\"}", page1Steps.getFirst().get("payload"));
+            assertEquals(2L, page1.get("nextSeq"));
+
+            // Resume from the returned cursor; max <= 0 means no cap.
+            @SuppressWarnings("unchecked")
+            var page2 = (Map<String, Object>) tool.handler().execute(
+                    Map.of("runId", "run-1", "fromSeq", "2", "max", "0"));
+            @SuppressWarnings("unchecked")
+            var page2Steps = (List<Map<String, Object>>) page2.get("steps");
+            assertEquals(1, page2Steps.size());
+            assertEquals("complete", page2Steps.getFirst().get("kind"));
+            assertEquals(3L, page2.get("nextSeq"));
+
+            // Every authorized read is audit-logged.
+            var entries = admin.auditLog().entries();
+            assertEquals(3, entries.size());
+            assertTrue(entries.stream().allMatch(
+                    e -> "read_tape".equals(e.action()) && e.success()));
+            assertEquals("runs=1", entries.getFirst().message());
+            assertEquals("steps=1", entries.getLast().message());
+        } finally {
+            org.atmosphere.ai.tape.TapeSupport.uninstall(recorder);
+        }
+    }
+
+    @Test
+    void testReadTapeToolRejectsMalformedStatusAsCallerError() throws Exception {
+        var store = new org.atmosphere.ai.tape.InMemoryTapeStore();
+        var recorder = org.atmosphere.ai.tape.TapeSupport.install(store);
+        try {
+            bridge.registerWriteTools();
+            var tool = registry.tools().get("atmosphere_read_tape");
+            @SuppressWarnings("unchecked")
+            var result = (Map<String, Object>) tool.handler().execute(
+                    Map.of("status", "NOT_A_STATUS"));
+            var error = (String) result.get("error");
+            assertNotNull(error);
+            assertTrue(error.startsWith("invalid argument"),
+                    "malformed status must be reported as caller input, got: " + error);
+        } finally {
+            org.atmosphere.ai.tape.TapeSupport.uninstall(recorder);
+        }
+    }
+
+    // ── Authorizer gating ──
+
+    @Test
+    void testBroadcastToolDeniedByAuthorizer() throws Exception {
+        var denyAll = (ControlAuthorizer) (action, target, principal) -> false;
+        var deniedBridge = new AdminMcpBridge(admin, registry, denyAll);
+        deniedBridge.registerWriteTools();
+
+        var tool = registry.tools().get("atmosphere_broadcast");
+        @SuppressWarnings("unchecked")
+        var result = (Map<String, Object>) tool.handler().execute(
+                Map.of("broadcasterId", "test", "message", "hello"));
+        assertEquals("unauthorized", result.get("error"));
+    }
+
+    /**
+     * Regression for the P1 "MCP writes require principal" bug — previously
+     * every tool passed {@code null} to the authorizer, so REQUIRE_PRINCIPAL
+     * permanently denied every call regardless of who was connected. This
+     * test asserts the identity-aware form now threads the principal through.
+     */
+    @Test
+    void testWriteToolsForwardPrincipalToAuthorizer() throws Exception {
+        var seen = new java.util.concurrent.atomic.AtomicReference<String>();
+        ControlAuthorizer sniffing = (action, target, principal) -> {
+            seen.set(principal);
+            return principal != null && !principal.isBlank();
+        };
+        var sniffingBridge = new AdminMcpBridge(admin, registry, sniffing);
+        sniffingBridge.registerWriteTools();
+
+        var tool = registry.tools().get("atmosphere_broadcast");
+        var handler = tool.handler();
+        assertTrue(handler instanceof McpRegistry.IdentityAwareToolHandler,
+                "write tool must be identity-aware so the authorizer sees a real principal");
+
+        var aware = (McpRegistry.IdentityAwareToolHandler) handler;
+        // Anonymous caller → denied under REQUIRE_PRINCIPAL semantics.
+        @SuppressWarnings("unchecked")
+        var denied = (Map<String, Object>) aware.execute(
+                Map.of("broadcasterId", "/chat", "message", "hi"), null);
+        assertEquals("unauthorized", denied.get("error"));
+        assertEquals(null, seen.get(), "authorizer must receive the null principal verbatim");
+
+        // Authenticated caller → authorizer receives the real name.
+        @SuppressWarnings("unchecked")
+        var allowed = (Map<String, Object>) aware.execute(
+                Map.of("broadcasterId", "/chat", "message", "hi"), "alice@example.com");
+        assertEquals("alice@example.com", seen.get(),
+                "authorizer must receive the authenticated principal, not null");
+        // admin.framework().broadcast returns false for unknown broadcasters,
+        // but the authorizer already accepted — response carries "success"
+        // (true or false) rather than "error=unauthorized".
+        assertTrue(allowed.containsKey("success"),
+                "authorizer accepted: payload should carry the broadcast outcome, "
+                + "not the unauthorized error: " + allowed);
+    }
+
+    @Test
+    void testDisconnectToolDeniedByAuthorizer() throws Exception {
+        var denyAll = (ControlAuthorizer) (action, target, principal) -> false;
+        var deniedBridge = new AdminMcpBridge(admin, registry, denyAll);
+        deniedBridge.registerWriteTools();
+
+        var tool = registry.tools().get("atmosphere_disconnect_resource");
+        @SuppressWarnings("unchecked")
+        var result = (Map<String, Object>) tool.handler().execute(
+                Map.of("uuid", "some-uuid"));
+        assertEquals("unauthorized", result.get("error"));
+    }
+
+    @Test
+    void testDestroyBroadcasterDeniedByAuthorizer() throws Exception {
+        var denyAll = (ControlAuthorizer) (action, target, principal) -> false;
+        var deniedBridge = new AdminMcpBridge(admin, registry, denyAll);
+        deniedBridge.registerWriteTools();
+
+        var tool = registry.tools().get("atmosphere_destroy_broadcaster");
+        @SuppressWarnings("unchecked")
+        var result = (Map<String, Object>) tool.handler().execute(
+                Map.of("broadcasterId", "test"));
+        assertEquals("unauthorized", result.get("error"));
+    }
+
+    @Test
+    void testCancelTaskWithNoA2AModule() throws Exception {
+        bridge.registerWriteTools();
+        var tool = registry.tools().get("atmosphere_cancel_task");
+        @SuppressWarnings("unchecked")
+        var result = (Map<String, Object>) tool.handler().execute(
+                Map.of("taskId", "task-1"));
+        assertEquals("A2A module not available", result.get("error"));
+    }
+
+    @Test
+    void testCancelTaskDeniedByAuthorizer() throws Exception {
+        var denyAll = (ControlAuthorizer) (action, target, principal) -> false;
+        var deniedBridge = new AdminMcpBridge(admin, registry, denyAll);
+        deniedBridge.registerWriteTools();
+
+        var tool = registry.tools().get("atmosphere_cancel_task");
+        @SuppressWarnings("unchecked")
+        var result = (Map<String, Object>) tool.handler().execute(
+                Map.of("taskId", "task-1"));
+        assertEquals("unauthorized", result.get("error"));
+    }
+
+    // ── Optional subsystem MCP tools ──
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void testOptionalCoordinatorToolsRegistered() {
+        var coordinator = new Object() {
+            @SuppressWarnings("unused")
+            public List<Map<String, Object>> listCoordinators() {
+                return List.of(Map.of("name", "c1"));
+            }
+        };
+        admin.setCoordinatorController(coordinator);
+        bridge.registerReadTools();
+        assertTrue(registry.tools().containsKey("atmosphere_list_coordinators"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void testOptionalTaskToolsRegistered() {
+        var taskCtrl = new Object() {
+            @SuppressWarnings("unused")
+            public List<Map<String, Object>> listTasks(String filter) {
+                return List.of();
+            }
+        };
+        admin.setTaskController(taskCtrl);
+        bridge.registerReadTools();
+        assertTrue(registry.tools().containsKey("atmosphere_list_tasks"));
+    }
+
+    @Test
+    void testNoOptionalToolsWithoutControllers() {
+        bridge.registerReadTools();
+        // Should not contain optional tools
+        assertEquals(8, registry.tools().size());
+    }
+
+    @Test
+    void testOptionalVerifierToolsRegistered() {
+        admin.setVerifierController(new FakeVerifierController());
+        bridge.registerReadTools();
+        var tools = registry.tools();
+        assertTrue(tools.containsKey("atmosphere_verifier_summary"));
+        assertTrue(tools.containsKey("atmosphere_verifier_examples"));
+        assertTrue(tools.containsKey("atmosphere_verifier_check"));
+    }
+
+    /**
+     * The MCP {@code atmosphere_verifier_check} read tool must route to the
+     * verify-only {@code dryCheck} — surfacing violations without executing —
+     * and never to the mutating {@code check}. The fake's {@code check} throws
+     * an {@link AssertionError}, so any wiring that reaches it fails the test.
+     */
+    @Test
+    void testVerifierCheckToolRoutesToDryCheckNotExecute() throws Exception {
+        admin.setVerifierController(new FakeVerifierController());
+        bridge.registerReadTools();
+
+        var tool = registry.tools().get("atmosphere_verifier_check");
+        assertNotNull(tool);
+        @SuppressWarnings("unchecked")
+        var result = (Map<String, Object>) tool.handler().execute(Map.of("goal", "drop the db"));
+
+        assertEquals("refused", result.get("status"));
+        assertFalse(((List<?>) result.get("violations")).isEmpty(),
+                "verifier check tool must surface the violations from dryCheck");
+        assertFalse(result.containsKey("env"),
+                "the read tool must not carry an executed environment");
+    }
+
+    // ── Write tool produces audit entry ──
+
+    @Test
+    void testBroadcastToolCreatesAuditEntry() throws Exception {
+        bridge.registerWriteTools();
+        var tool = registry.tools().get("atmosphere_broadcast");
+        tool.handler().execute(
+                Map.of("broadcasterId", "test-b", "message", "hi"));
+        var entries = admin.auditLog().entries();
+        assertEquals(1, entries.size());
+        assertEquals("broadcast", entries.getFirst().action());
+    }
+
+    /**
+     * Stand-in for the real {@code VerifierController}, wired via the
+     * reflection-based optional-controller bridge. Public so the bridge's
+     * {@code getMethod(...).invoke(...)} reaches its methods. {@code check}
+     * throws to guard against a regression that wires the read tool to the
+     * mutating path.
+     */
+    public static final class FakeVerifierController {
+        @SuppressWarnings("unused")
+        public Map<String, Object> summary() {
+            return Map.of("verifiers", List.of(), "smtSolver", "none");
+        }
+
+        @SuppressWarnings("unused")
+        public List<Map<String, Object>> examples() {
+            return List.of();
+        }
+
+        @SuppressWarnings("unused")
+        public Map<String, Object> dryCheck(String goal) {
+            return Map.of(
+                    "goal", goal,
+                    "status", "refused",
+                    "violations", List.of(Map.of(
+                            "category", "allowlist",
+                            "message", "tool 'delete_database' not in allowlist")));
+        }
+
+        @SuppressWarnings("unused")
+        public Map<String, Object> check(String goal) {
+            throw new AssertionError(
+                    "MCP read tool must call dryCheck (verify-only), never check (executes)");
+        }
+    }
+}

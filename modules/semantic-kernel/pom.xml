@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <parent>
+        <groupId>org.atmosphere</groupId>
+        <artifactId>atmosphere-project</artifactId>
+        <version>4.0.72-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <modelVersion>4.0.0</modelVersion>
+    <artifactId>atmosphere-semantic-kernel</artifactId>
+    <packaging>jar</packaging>
+    <name>atmosphere-semantic-kernel</name>
+    <description>Microsoft Semantic Kernel for Java streaming adapter for Atmosphere Framework</description>
+    <url>https://github.com/Atmosphere/atmosphere</url>
+
+    <properties>
+        <atmosphere.module.name>org.atmosphere.semantic.kernel</atmosphere.module.name>
+        <semantickernel.version>1.5.0</semantickernel.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- Pin netty 4.1.x line to 4.1.137.Final (codec-family GHSA batch). Azure SDK
+                 (azure-core-http-netty 1.15.x) pulled in by semantickernel
+                 ships netty 4.1.118.Final, which lacks CVE-2026-42577
+                 (handler-proxy header injection), CVE-2026-42578 (chunked-
+                 extension request smuggling), and CVE-2026-41417 (TE
+                 smuggling) fixes. -->
+            <dependency>
+                <groupId>io.netty</groupId>
+                <artifactId>netty-bom</artifactId>
+                <version>4.1.137.Final</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <!-- Pin reactor-netty to 1.2.17 (last 1.2.x). Azure SDK's
+                 azure-core-http-netty 1.15.11 ships reactor-netty-http 1.0.48,
+                 which is in the deprecated 1.0.x line and lacks the credential-
+                 leak-on-chained-redirects patch shipped in 1.2.8+. Newer
+                 azure-core-http-netty 1.16.4 already uses reactor-netty-http
+                 1.2.16; pinning 1.2.17 stays on the API-stable 1.2.x branch
+                 that azure-core supports without forcing an azure-ai-openai
+                 upgrade. -->
+            <dependency>
+                <groupId>io.projectreactor.netty</groupId>
+                <artifactId>reactor-netty-http</artifactId>
+                <version>1.2.17</version>
+            </dependency>
+            <dependency>
+                <groupId>io.projectreactor.netty</groupId>
+                <artifactId>reactor-netty-core</artifactId>
+                <version>1.2.17</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-ai</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>com.microsoft.semantic-kernel</groupId>
+            <artifactId>semantickernel-api</artifactId>
+            <version>${semantickernel.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>com.microsoft.semantic-kernel</groupId>
+            <artifactId>semantickernel-aiservices-openai</artifactId>
+            <version>${semantickernel.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-autoconfigure</artifactId>
+            <version>${spring-boot.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-ai-test</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!--
+            ApplicationContextRunner. The auto-configuration's gating lives in a
+            @ConditionalOnExpression SpEL string, which only a real context can
+            evaluate — asserting on the resolution helpers instead would pass
+            against the broken key-only condition.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-test</artifactId>
+            <version>${spring-boot.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <version>${assertj.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>${mockito.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>${logback-version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>

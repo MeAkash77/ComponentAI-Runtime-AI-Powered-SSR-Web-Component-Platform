@@ -1,0 +1,498 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.mcp;
+
+import tools.jackson.databind.ObjectMapper;
+import org.atmosphere.cpr.AtmosphereConfig;
+import org.atmosphere.cpr.AtmosphereRequest;
+import org.atmosphere.cpr.AtmosphereResource;
+import org.atmosphere.cpr.AtmosphereResponse;
+import org.atmosphere.mcp.annotation.McpParam;
+import org.atmosphere.mcp.annotation.McpTool;
+import org.atmosphere.mcp.registry.McpRegistry;
+import org.atmosphere.mcp.runtime.McpAuthorization;
+import org.atmosphere.mcp.runtime.McpHandler;
+import org.atmosphere.mcp.runtime.McpProtocolHandler;
+import org.atmosphere.mcp.runtime.McpSession;
+
+import java.io.BufferedReader;
+import java.io.PrintWriter;
+import java.io.StringReader;
+import java.io.StringWriter;
+import java.security.Principal;
+
+import static org.mockito.Mockito.*;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Tests for Streamable HTTP transport support in McpHandler.
+ */
+public class McpStreamableHttpTest {
+
+    private static final ObjectMapper mapper = new ObjectMapper();
+    private McpHandler handler;
+
+    public static class SimpleMcpServer {
+        @McpTool(name = "echo", description = "Echo input")
+        public String echo(@McpParam(name = "text") String text) {
+            return text;
+        }
+    }
+
+    @BeforeEach
+    public void setUp() {
+        var registry = new McpRegistry();
+        registry.scan(new SimpleMcpServer());
+        var protocolHandler = new McpProtocolHandler("test-server", "1.0.0", registry,
+                mock(AtmosphereConfig.class));
+        handler = new McpHandler(protocolHandler);
+    }
+
+    // ── POST with JSON response ──────────────────────────────────────────
+
+    @Test
+    public void testPostJsonResponse() throws Exception {
+        var body = """
+                {"jsonrpc":"2.0","id":1,"method":"ping"}""";
+
+        var output = new StringWriter();
+        var resource = mockResource("POST", body, "application/json", null);
+        when(resource.getResponse().getWriter()).thenReturn(new PrintWriter(output));
+
+        handler.onRequest(resource);
+
+        var node = mapper.readTree(output.toString());
+        assertEquals(1, node.get("id").asInt());
+        assertNotNull(node.get("result"));
+        verify(resource.getResponse()).setContentType("application/json");
+        verify(resource.getResponse()).setStatus(200);
+    }
+
+    // ── POST with SSE response ───────────────────────────────────────────
+
+    @Test
+    public void testPostSseResponse() throws Exception {
+        var body = """
+                {"jsonrpc":"2.0","id":1,"method":"ping"}""";
+
+        var output = new StringWriter();
+        var resource = mockResource("POST", body, "application/json, text/event-stream", null);
+        when(resource.getResponse().getWriter()).thenReturn(new PrintWriter(output));
+
+        handler.onRequest(resource);
+
+        var raw = output.toString();
+        assertTrue(raw.startsWith("event: message\ndata: "), "Should be SSE format");
+        assertTrue(raw.endsWith("\n\n"), "SSE must end with double newline");
+        verify(resource.getResponse()).setContentType("text/event-stream");
+
+        // Extract JSON from SSE
+        var json = raw.replace("event: message\ndata: ", "").replace("\n\n", "");
+        var node = mapper.readTree(json);
+        assertEquals(1, node.get("id").asInt());
+    }
+
+    // ── POST notification returns 202 ────────────────────────────────────
+
+    @Test
+    public void testPostNotificationReturns202() throws Exception {
+        var body = """
+                {"jsonrpc":"2.0","method":"notifications/initialized"}""";
+
+        var resource = mockResource("POST", body, "application/json", null);
+
+        handler.onRequest(resource);
+
+        verify(resource.getResponse()).setStatus(202);
+    }
+
+    // ── POST empty body returns 400 ──────────────────────────────────────
+
+    @Test
+    public void testPostEmptyBodyReturns400() throws Exception {
+        var output = new StringWriter();
+        var resource = mockResource("POST", "", "application/json", null);
+        when(resource.getResponse().getWriter()).thenReturn(new PrintWriter(output));
+
+        handler.onRequest(resource);
+
+        verify(resource.getResponse()).setStatus(400);
+        assertTrue(output.toString().contains("Empty body"));
+    }
+
+    // ── Session ID management ────────────────────────────────────────────
+
+    @Test
+    public void testInitializeReturnsSessionId() throws Exception {
+        var body = """
+                {"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                    "protocolVersion":"2025-03-26",
+                    "clientInfo":{"name":"test","version":"1.0"}
+                }}""";
+
+        var output = new StringWriter();
+        var resource = mockResource("POST", body, "application/json", null);
+        when(resource.getResponse().getWriter()).thenReturn(new PrintWriter(output));
+
+        handler.onRequest(resource);
+
+        // Session ID header should be set
+        verify(resource.getResponse()).setHeader(eq("Mcp-Session-Id"), argThat(s -> s != null && !s.isEmpty()));
+
+        // Session should be stored
+        assertEquals(1, handler.sessions().size());
+    }
+
+    @Test
+    public void testSessionIdRestoredOnSubsequentRequest() throws Exception {
+        // First: initialize
+        var initBody = """
+                {"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                    "protocolVersion":"2025-03-26",
+                    "clientInfo":{"name":"test","version":"1.0"}
+                }}""";
+
+        var output1 = new StringWriter();
+        var resource1 = mockResource("POST", initBody, "application/json", null);
+        when(resource1.getResponse().getWriter()).thenReturn(new PrintWriter(output1));
+
+        handler.onRequest(resource1);
+
+        // Get the session ID
+        var sessionId = handler.sessions().keySet().iterator().next();
+        assertNotNull(sessionId);
+
+        // Second: ping with session ID
+        var pingBody = """
+                {"jsonrpc":"2.0","id":2,"method":"ping"}""";
+        var output2 = new StringWriter();
+        var resource2 = mockResource("POST", pingBody, "application/json", sessionId);
+        when(resource2.getResponse().getWriter()).thenReturn(new PrintWriter(output2));
+
+        handler.onRequest(resource2);
+
+        // Session should be restored (same session attribute set)
+        verify(resource2.getRequest()).setAttribute(eq(McpSession.ATTRIBUTE_KEY), any(McpSession.class));
+    }
+
+    // ── GET suspends for SSE ─────────────────────────────────────────────
+
+    @Test
+    public void testGetSuspendsForSse() throws Exception {
+        var resource = mockResource("GET", "", "text/event-stream", null);
+
+        handler.onRequest(resource);
+
+        verify(resource).suspend();
+        verify(resource.getResponse()).setContentType("text/event-stream");
+    }
+
+    // ── DELETE terminates session ────────────────────────────────────────
+
+    @Test
+    public void testDeleteTerminatesSession() throws Exception {
+        // First create a session
+        var initBody = """
+                {"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                    "protocolVersion":"2025-03-26",
+                    "clientInfo":{"name":"test","version":"1.0"}
+                }}""";
+        var output = new StringWriter();
+        var resource1 = mockResource("POST", initBody, "application/json", null);
+        when(resource1.getResponse().getWriter()).thenReturn(new PrintWriter(output));
+        handler.onRequest(resource1);
+
+        assertEquals(1, handler.sessions().size());
+        var sessionId = handler.sessions().keySet().iterator().next();
+
+        // DELETE
+        var resource2 = mockResource("DELETE", "", null, sessionId);
+        handler.onRequest(resource2);
+
+        verify(resource2.getResponse()).setStatus(204);
+        assertTrue(handler.sessions().isEmpty(), "Session should be removed");
+    }
+
+    // ── Unsupported method returns 405 ───────────────────────────────────
+
+    @Test
+    public void testUnsupportedMethodReturns405() throws Exception {
+        var output = new StringWriter();
+        var resource = mockResource("PUT", "", null, null);
+        when(resource.getResponse().getWriter()).thenReturn(new PrintWriter(output));
+
+        handler.onRequest(resource);
+
+        verify(resource.getResponse()).setStatus(405);
+    }
+
+    // ── 2025-11-25 Origin enforcement: HTTP 403 ──────────────────────────
+
+    @Test
+    public void testForbiddenOriginReturns403() throws Exception {
+        var output = new StringWriter();
+        var resource = mockResource("POST", "{}", "application/json", null);
+        var request = resource.getRequest();
+        when(request.getHeader("Origin")).thenReturn("https://evil.example");
+        request.setAttribute("org.atmosphere.mcp.allowedOrigins",
+                java.util.List.of("https://app.example"));
+        when(resource.getResponse().getWriter()).thenReturn(new PrintWriter(output));
+
+        handler.onRequest(resource);
+
+        verify(resource.getResponse()).setStatus(403);
+        assertTrue(output.toString().contains("Forbidden Origin"),
+                () -> "expected 403 body; got: " + output);
+    }
+
+    @Test
+    public void testAllowedOriginPasses() throws Exception {
+        var output = new StringWriter();
+        var resource = mockResource("POST", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+                "application/json", null);
+        var request = resource.getRequest();
+        when(request.getHeader("Origin")).thenReturn("https://app.example");
+        request.setAttribute("org.atmosphere.mcp.allowedOrigins",
+                java.util.List.of("https://app.example"));
+        when(resource.getResponse().getWriter()).thenReturn(new PrintWriter(output));
+
+        handler.onRequest(resource);
+
+        verify(resource.getResponse(), org.mockito.Mockito.never()).setStatus(403);
+        verify(resource.getResponse()).setStatus(200);
+    }
+
+    @Test
+    public void testNoOriginHeaderIsAllowed() throws Exception {
+        // Non-browser clients (CLI, server-to-server) don't send Origin.
+        // The 403 enforcement is only for browser-cross-origin abuse.
+        var output = new StringWriter();
+        var resource = mockResource("POST", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+                "application/json", null);
+        var request = resource.getRequest();
+        when(request.getHeader("Origin")).thenReturn(null);
+        request.setAttribute("org.atmosphere.mcp.allowedOrigins",
+                java.util.List.of("https://only.example"));
+        when(resource.getResponse().getWriter()).thenReturn(new PrintWriter(output));
+
+        handler.onRequest(resource);
+
+        verify(resource.getResponse(), org.mockito.Mockito.never()).setStatus(403);
+        verify(resource.getResponse()).setStatus(200);
+    }
+
+    // ── Protocol-Version mismatch: response JSON must be safely encoded ──
+
+    /**
+     * Regression test for the JSON-injection variant of code-scanning alert
+     * #48 (java/xss in McpHandler:checkProtocolVersion). A malicious header
+     * value containing a {@code "} character must not break out of the
+     * {@code message} string in the JSON-RPC error response.
+     */
+    @Test
+    public void testProtocolVersionMismatchErrorIsJsonSafe() throws Exception {
+        // First initialize to create a session with a negotiated protocol.
+        var initBody = """
+                {"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                    "protocolVersion":"2025-03-26",
+                    "clientInfo":{"name":"test","version":"1.0"}
+                }}""";
+        var initOut = new StringWriter();
+        var initResource = mockResource("POST", initBody, "application/json", null);
+        when(initResource.getResponse().getWriter()).thenReturn(new PrintWriter(initOut));
+        handler.onRequest(initResource);
+        var sessionId = handler.sessions().keySet().iterator().next();
+
+        // Send notifications/initialized to flip the session to initialized
+        // state — the protocol-version enforcement only fires post-handshake.
+        var notifBody = """
+                {"jsonrpc":"2.0","method":"notifications/initialized"}""";
+        var notifResource = mockResource("POST", notifBody, "application/json", sessionId);
+        handler.onRequest(notifResource);
+
+        // Now send a request with a hostile MCP-Protocol-Version header that
+        // would have broken raw string concatenation: contains `"` and a
+        // would-be injected JSON property.
+        String hostile = "999-fake\",\"injected\":\"yes";
+        var followBody = """
+                {"jsonrpc":"2.0","id":2,"method":"ping"}""";
+        var followOut = new StringWriter();
+        var followResource = mockResource("POST", followBody, "application/json", sessionId);
+        when(followResource.getRequest().getHeader(McpHandler.PROTOCOL_VERSION_HEADER))
+                .thenReturn(hostile);
+        when(followResource.getResponse().getWriter()).thenReturn(new PrintWriter(followOut));
+
+        handler.onRequest(followResource);
+
+        verify(followResource.getResponse()).setStatus(400);
+        var node = mapper.readTree(followOut.toString());
+        assertNotNull(node.get("error"), "Response must be valid JSON with error field");
+        assertNull(node.get("injected"),
+                "Hostile header value must not escape the message string and inject JSON fields");
+        // Sanity-check the message echoes the hostile string (now safely escaped).
+        var msg = node.get("error").get("message").asString();
+        assertTrue(msg.contains("999-fake"), "Message should still echo the hostile header value (escaped)");
+    }
+
+    // ── SEP-2243 operability headers (MCP 2026-07-28) ────────────────────
+
+    @Test
+    public void testOperabilityHeadersMatchPasses() throws Exception {
+        var body = """
+                {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                    "name":"echo","arguments":{"text":"hi"}
+                }}""";
+        var output = new StringWriter();
+        var resource = mockResource("POST", body, "application/json", null);
+        when(resource.getRequest().getHeader("Mcp-Method")).thenReturn("tools/call");
+        when(resource.getRequest().getHeader("Mcp-Name")).thenReturn("echo");
+        when(resource.getResponse().getWriter()).thenReturn(new PrintWriter(output));
+
+        handler.onRequest(resource);
+
+        verify(resource.getResponse(), never()).setStatus(400);
+        verify(resource.getResponse()).setStatus(200);
+    }
+
+    @Test
+    public void testMcpMethodHeaderMismatchReturns400() throws Exception {
+        var body = """
+                {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                    "name":"echo","arguments":{"text":"hi"}
+                }}""";
+        var output = new StringWriter();
+        var resource = mockResource("POST", body, "application/json", null);
+        // Router header says tools/list but the body is tools/call — SEP-2243
+        // requires the server to reject the disagreement.
+        when(resource.getRequest().getHeader("Mcp-Method")).thenReturn("tools/list");
+        when(resource.getResponse().getWriter()).thenReturn(new PrintWriter(output));
+
+        handler.onRequest(resource);
+
+        verify(resource.getResponse()).setStatus(400);
+        var node = mapper.readTree(output.toString());
+        assertEquals(-32600, node.get("error").get("code").asInt());
+        assertTrue(node.get("error").get("message").asString().contains("Mcp-Method"));
+    }
+
+    @Test
+    public void testMcpNameHeaderMismatchReturns400() throws Exception {
+        var body = """
+                {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                    "name":"echo","arguments":{"text":"hi"}
+                }}""";
+        var output = new StringWriter();
+        var resource = mockResource("POST", body, "application/json", null);
+        when(resource.getRequest().getHeader("Mcp-Method")).thenReturn("tools/call");
+        when(resource.getRequest().getHeader("Mcp-Name")).thenReturn("not-echo");
+        when(resource.getResponse().getWriter()).thenReturn(new PrintWriter(output));
+
+        handler.onRequest(resource);
+
+        verify(resource.getResponse()).setStatus(400);
+        assertTrue(mapper.readTree(output.toString()).get("error").get("message")
+                .asString().contains("Mcp-Name"));
+    }
+
+    // ── OAuth resource-server enforcement (RFC 9728) ─────────────────────
+
+    private McpHandler authEnabledHandler() {
+        var registry = new McpRegistry();
+        registry.scan(new SimpleMcpServer());
+        var config = mock(AtmosphereConfig.class);
+        when(config.getInitParameter(McpAuthorization.RESOURCE)).thenReturn("https://mcp.example.com/mcp");
+        when(config.getInitParameter(McpAuthorization.AUTHORIZATION_SERVERS))
+                .thenReturn("https://auth.example.com");
+        return new McpHandler(new McpProtocolHandler("test-server", "1.0.0", registry, config));
+    }
+
+    @Test
+    public void testUnauthenticatedRequestReturns401WithChallenge() throws Exception {
+        var output = new StringWriter();
+        var resource = mockResource("POST", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+                "application/json", null);
+        when(resource.getResponse().getWriter()).thenReturn(new PrintWriter(output));
+        // No principal set on the request → unauthenticated.
+
+        authEnabledHandler().onRequest(resource);
+
+        verify(resource.getResponse()).setStatus(401);
+        verify(resource.getResponse()).setHeader(eq("WWW-Authenticate"),
+                argThat(v -> v != null && v.contains("resource_metadata=")));
+    }
+
+    @Test
+    public void testAuthenticatedRequestProceeds() throws Exception {
+        var output = new StringWriter();
+        var resource = mockResource("POST", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+                "application/json", null);
+        when(resource.getResponse().getWriter()).thenReturn(new PrintWriter(output));
+        // The framework's resource-server filter validated the token → principal present.
+        var principal = mock(Principal.class);
+        when(principal.getName()).thenReturn("alice");
+        when(resource.getRequest().getUserPrincipal()).thenReturn(principal);
+
+        authEnabledHandler().onRequest(resource);
+
+        verify(resource.getResponse(), never()).setStatus(401);
+        verify(resource.getResponse()).setStatus(200);
+    }
+
+    @Test
+    public void testAuthDisabledLeavesEndpointOpen() throws Exception {
+        // The default handler (no auth config) must not challenge — back-compat.
+        var output = new StringWriter();
+        var resource = mockResource("POST", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+                "application/json", null);
+        when(resource.getResponse().getWriter()).thenReturn(new PrintWriter(output));
+
+        handler.onRequest(resource);
+
+        verify(resource.getResponse(), never()).setStatus(401);
+        verify(resource.getResponse()).setStatus(200);
+    }
+
+    // ── Helper ───────────────────────────────────────────────────────────
+
+    private AtmosphereResource mockResource(String method, String body,
+                                            String acceptHeader, String sessionId) throws Exception {
+        var resource = mock(AtmosphereResource.class);
+        var request = mock(AtmosphereRequest.class);
+        var response = mock(AtmosphereResponse.class);
+
+        when(resource.getRequest()).thenReturn(request);
+        when(resource.getResponse()).thenReturn(response);
+        when(resource.uuid()).thenReturn("test-uuid");
+
+        when(request.getMethod()).thenReturn(method);
+        when(request.getReader()).thenReturn(new BufferedReader(new StringReader(body)));
+        when(request.getHeader("Accept")).thenReturn(acceptHeader);
+        when(request.getHeader("Mcp-Session-Id")).thenReturn(sessionId);
+
+        // Support setAttribute/getAttribute so McpSession can be stored and retrieved
+        var attributes = new java.util.HashMap<String, Object>();
+        doAnswer(inv -> {
+            attributes.put(inv.getArgument(0), inv.getArgument(1));
+            return null;
+        }).when(request).setAttribute(anyString(), any());
+        when(request.getAttribute(anyString())).thenAnswer(inv -> attributes.get(inv.getArgument(0, String.class)));
+
+        return resource;
+    }
+}

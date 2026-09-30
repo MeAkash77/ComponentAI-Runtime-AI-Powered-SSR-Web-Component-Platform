@@ -1,0 +1,229 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+
+package org.atmosphere.cpr;
+
+import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * {@link AtmosphereResourceEvent} implementation.
+ *
+ * @author Jeanfrancois Arcand
+ */
+public class AtmosphereResourceEventImpl implements AtmosphereResourceEvent {
+
+    // Was the remote connection closed.
+    private final AtomicBoolean isCancelled = new AtomicBoolean(false);
+    // Is Resumed on Timeout?
+    private final AtomicBoolean isResumedOnTimeout = new AtomicBoolean(false);
+    private volatile Throwable throwable;
+    // The current message
+    protected volatile Object message;
+    protected volatile AtmosphereResourceImpl resource;
+    private final AtomicBoolean isClosedByClient = new AtomicBoolean(false);
+    private final String uuid;
+    private final AtomicBoolean isClosedByApplication = new AtomicBoolean(false);
+
+    public AtmosphereResourceEventImpl(AtmosphereResourceImpl resource) {
+        this.resource = resource;
+        this.throwable = null;
+        uuid = resource.uuid();
+    }
+
+    public AtmosphereResourceEventImpl(AtmosphereResourceImpl resource, boolean isCancelled,
+                                       boolean isResumedOnTimeout) {
+        this.isCancelled.set(isCancelled);
+        this.isResumedOnTimeout.set(isResumedOnTimeout);
+        this.resource = resource;
+        this.throwable = null;
+        uuid = resource.uuid();
+    }
+
+    public AtmosphereResourceEventImpl(AtmosphereResourceImpl resource, boolean isCancelled,
+                                       boolean isResumedOnTimeout,
+                                       Throwable throwable) {
+        this.isCancelled.set(isCancelled);
+        this.isResumedOnTimeout.set(isResumedOnTimeout);
+        this.resource = resource;
+        this.throwable = throwable;
+        uuid = resource.uuid();
+    }
+
+    public AtmosphereResourceEventImpl(AtmosphereResourceImpl resource,
+                                       boolean isCancelled,
+                                       boolean isResumedOnTimeout,
+                                       boolean isClosedByClient,
+                                       Throwable throwable) {
+        this.isCancelled.set(isCancelled);
+        this.isResumedOnTimeout.set(isResumedOnTimeout);
+        this.resource = resource;
+        this.throwable = throwable;
+        this.isClosedByClient.set(isClosedByClient);
+        uuid = resource.uuid();
+    }
+
+    /**
+     * The UUID of the {@link AtmosphereResource} this event was created for.
+     * Captured at construction time, so it remains available after
+     * {@link #destroy()} has stripped the resource reference — containers
+     * (Tomcat) can fire async error/cancel listeners with a recycled request,
+     * and disconnect-cleanup paths need the resource identity even then.
+     *
+     * @return the originating resource UUID; never null
+     */
+    public String uuid() {
+        return uuid;
+    }
+
+    @Override
+    public boolean isResuming() {
+        var r = resource;
+        return r == null || r.isResumed();
+    }
+
+    @Override
+    public boolean isSuspended() {
+        var r = resource;
+        return r != null && r.isSuspended();
+    }
+
+    @Override
+    public boolean isClosedByClient() {
+        return isClosedByClient.get();
+    }
+
+    @Override
+    public boolean isClosedByApplication() {
+        return isClosedByApplication.get();
+    }
+
+    public AtmosphereResourceEventImpl setCloseByApplication(boolean b) {
+        isClosedByApplication.set(b);
+        return this;
+    }
+
+    @Override
+    public Object getMessage() {
+        return message;
+    }
+
+    @Override
+    public AtmosphereResourceEventImpl setMessage(Object message) {
+        this.message = message;
+        return this;
+    }
+
+    public AtmosphereResourceEventImpl isClosedByClient(boolean isClosedByClient) {
+        this.isClosedByClient.set(isClosedByClient);
+        return this;
+    }
+
+    @Override
+    public boolean isResumedOnTimeout() {
+        return isResumedOnTimeout.get();
+    }
+
+    @Override
+    public boolean isCancelled() {
+        return isCancelled.get();
+    }
+
+    public AtmosphereResourceEventImpl setCancelled(boolean isCancelled) {
+        var r = resource;
+        if (r != null) {
+            r.setAction(new Action(Action.TYPE.CANCELLED, r.action().timeout()));
+            this.isCancelled.set(isCancelled);
+        }
+        return this;
+    }
+
+    protected AtmosphereResourceEventImpl setIsResumedOnTimeout(boolean isResumedOnTimeout) {
+        var r = resource;
+        if (r != null) {
+            r.setAction(new Action(Action.TYPE.TIMEOUT, r.action().timeout()));
+            this.isResumedOnTimeout.set(isResumedOnTimeout);
+        }
+        return this;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+
+        AtmosphereResourceEventImpl that = (AtmosphereResourceEventImpl) o;
+
+        if (!isCancelled.equals(that.isCancelled)) return false;
+        if (!isResumedOnTimeout.equals(that.isResumedOnTimeout))
+            return false;
+        if (!Objects.equals(message, that.message)) return false;
+        if (!Objects.equals(resource, that.resource)) return false;
+        if (!Objects.equals(throwable, that.throwable)) return false;
+
+        return true;
+    }
+
+    @Override
+    public int hashCode() {
+        int result = isCancelled.hashCode();
+        result = 31 * result + isResumedOnTimeout.hashCode();
+        result = 31 * result + (throwable != null ? throwable.hashCode() : 0);
+        result = 31 * result + (message != null ? message.hashCode() : 0);
+        result = 31 * result + (resource != null ? resource.hashCode() : 0);
+        return result;
+    }
+
+    @Override
+    public Throwable throwable() {
+        return throwable;
+    }
+
+    @Override
+    public Broadcaster broadcaster() {
+        var r = resource;
+        return r != null ? r.getBroadcaster() : null;
+    }
+
+    @Override
+    public AtmosphereResource getResource() {
+        return resource;
+    }
+
+    public AtmosphereResourceEvent setThrowable(Throwable t) {
+        this.throwable = t;
+        return this;
+    }
+
+    public AtmosphereResourceEvent destroy() {
+        isCancelled.set(true);
+        resource = null;
+        message = null;
+        return this;
+    }
+
+    @Override
+    public String toString() {
+        return "AtmosphereResourceEventImpl{" +
+                " isCancelled=" + isCancelled +
+                " isClosedByClient=" + isClosedByClient +
+                " isClosedByApplication=" + isClosedByApplication +
+                " isResumedOnTimeout=" + isResumedOnTimeout +
+                " throwable=" + throwable +
+                " resource=" + uuid +
+                '}';
+    }
+}

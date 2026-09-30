@@ -1,0 +1,1100 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.cpr;
+
+import org.atmosphere.interceptor.AllowInterceptor;
+import org.atmosphere.util.Utils;
+import org.atmosphere.websocket.WebSocket;
+import org.atmosphere.websocket.WebSocketEventListener;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import jakarta.servlet.http.HttpSession;
+import java.io.IOException;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
+
+import static org.atmosphere.cpr.ApplicationConfig.PROPERTY_SESSION_CREATE;
+import static org.atmosphere.cpr.ApplicationConfig.SUSPENDED_ATMOSPHERE_RESOURCE_UUID;
+import static org.atmosphere.cpr.AtmosphereResource.TRANSPORT.UNDEFINED;
+import static org.atmosphere.cpr.Broadcaster.ROOT_MASTER;
+import static org.atmosphere.cpr.HeaderConfig.LONG_POLLING_TRANSPORT;
+import static org.atmosphere.cpr.HeaderConfig.WEBSOCKET_UPGRADE;
+import static org.atmosphere.cpr.HeaderConfig.X_ATMOSPHERE_ERROR;
+import static org.atmosphere.cpr.HeaderConfig.X_ATMOSPHERE_TRANSPORT;
+import static org.atmosphere.websocket.WebSocketEventListener.WebSocketEvent.TYPE.CLOSE;
+
+/**
+ * {@link AtmosphereResource} implementation for supporting {@link AtmosphereRequest}
+ * and {@link AtmosphereResponse}.
+ *
+ * @author Jeanfrancois Arcand
+ */
+public class AtmosphereResourceImpl implements AtmosphereResource {
+
+    private static final Logger logger = LoggerFactory.getLogger(AtmosphereResourceImpl.class);
+
+    public static final String PRE_SUSPEND = AtmosphereResourceImpl.class.getName() + ".preSuspend";
+    public static final String SKIP_BROADCASTER_CREATION = AtmosphereResourceImpl.class.getName() + ".skipBroadcasterCreation";
+
+    /**
+     * Explicit lifecycle states for an {@link AtmosphereResource}, replacing the previous
+     * collection of independent {@link AtomicBoolean} fields that tracked lifecycle implicitly.
+     */
+    public enum LifecycleState {
+        /** Initial state after construction or {@link #reset()}. */
+        CREATED,
+        /** {@link #suspend()} called successfully. */
+        SUSPENDED,
+        /** {@link #resume()} called successfully. */
+        RESUMED,
+        /** Resource is in the closing phase (entered {@code completeLifecycle}). */
+        CLOSING,
+        /** {@link #cancel()} called successfully. */
+        CANCELLED,
+        /** Resource marked out of scope due to IO error or external invalidation. */
+        DISCONNECTED
+    }
+
+    private volatile AtmosphereRequest req;
+    private volatile AtmosphereResponse response;
+    private volatile Action action = new Action();
+    protected final List<Broadcaster> broadcasters = new CopyOnWriteArrayList<>();
+    private final Set<String> broadcasterIdIndex = ConcurrentHashMap.newKeySet();
+    protected volatile Broadcaster broadcaster;
+    private volatile AtmosphereConfig config;
+    protected volatile AsyncSupport<AtmosphereResourceImpl> asyncSupport;
+    private Serializer serializer;
+    private final AtomicReference<LifecycleState> state = new AtomicReference<>(LifecycleState.CREATED);
+    private volatile AtmosphereResourceEventImpl event;
+    private final AtomicBoolean resumeOnBroadcast = new AtomicBoolean();
+    private volatile Object writeOnTimeout;
+    private volatile boolean disableSuspend;
+    private final AtomicBoolean disconnected = new AtomicBoolean();
+
+    private final ConcurrentLinkedQueue<AtmosphereResourceEventListener> listeners =
+            new ConcurrentLinkedQueue<>();
+
+    private final AtomicBoolean isSuspendEvent = new AtomicBoolean();
+    private volatile AtmosphereHandler atmosphereHandler;
+    private String uuid;
+    protected volatile HttpSession session;
+    private volatile boolean disableSuspendEvent;
+    private volatile TRANSPORT transport;
+    private volatile boolean forceBinaryWrite;
+    private volatile WebSocket webSocket;
+    private volatile boolean closeOnCancel;
+    private final AtomicBoolean isPendingClose = new AtomicBoolean();
+    private final ReentrantLock broadcasterRecoveryLock = new ReentrantLock();
+
+    public AtmosphereResourceImpl() {
+    }
+
+    @SuppressWarnings("this-escape")
+    @Deprecated
+    public AtmosphereResourceImpl(AtmosphereConfig config, Broadcaster broadcaster,
+                                  AtmosphereRequest req, AtmosphereResponse response,
+                                  AsyncSupport<AtmosphereResourceImpl> asyncSupport, AtmosphereHandler atmosphereHandler) {
+        initialize(config, broadcaster, req, response, asyncSupport, atmosphereHandler);
+    }
+
+    /**
+     * Initialize an {@link AtmosphereResource}.
+     *
+     * @param config            The {@link org.atmosphere.cpr.AtmosphereConfig}
+     * @param broadcaster       The {@link org.atmosphere.cpr.Broadcaster}.
+     * @param req               The {@link AtmosphereRequest}
+     * @param response          The {@link AtmosphereResource}
+     * @param asyncSupport      The {@link AsyncSupport}
+     * @param atmosphereHandler The {@link AtmosphereHandler}
+     * @return this
+     */
+    @SuppressWarnings("unchecked")
+    @Override
+    public AtmosphereResource initialize(AtmosphereConfig config, Broadcaster broadcaster,
+                                         AtmosphereRequest req, AtmosphereResponse response,
+                                         AsyncSupport<?> asyncSupport, AtmosphereHandler atmosphereHandler) {
+        this.req = req;
+        this.response = response;
+        this.config = config;
+        this.asyncSupport = (AsyncSupport<AtmosphereResourceImpl>) asyncSupport;
+        this.atmosphereHandler = atmosphereHandler;
+        this.event = new AtmosphereResourceEventImpl(this);
+
+        this.broadcaster = broadcaster;
+        uniqueBroadcaster(broadcaster);
+
+        String s = (String) req.getAttribute(SUSPENDED_ATMOSPHERE_RESOURCE_UUID);
+        if (s == null) {
+            s = response.getHeader(HeaderConfig.X_ATMOSPHERE_TRACKING_ID);
+            if (s == null) {
+                String tmp = req.getHeader(HeaderConfig.X_ATMOSPHERE_TRACKING_ID);
+                s = tmp != null && !tmp.equalsIgnoreCase("0") ? tmp : null;
+            }
+        }
+        if (s != null && !isValidTrackingId(s)) {
+            logger.warn("Invalid X-Atmosphere-Tracking-ID header value, generating server-side UUID");
+            s = null;
+        }
+        setUUID(s == null ? config.uuidProvider().generateUuid() : s);
+
+        if (config.isSupportSession()) {
+            // Keep a reference to an HttpSession in case the associated request get recycled by the underlying container.
+            try {
+                session = req.getSession(config.getInitParameter(PROPERTY_SESSION_CREATE, true));
+            } catch (NullPointerException ex) {
+                // http://java.net/jira/browse/GLASSFISH-18856
+                logger.trace("http://java.net/jira/browse/GLASSFISH-18856", ex);
+            }
+        }
+        transport = configureTransport();
+        closeOnCancel = config.getInitParameter(ApplicationConfig.CLOSE_STREAM_ON_CANCEL, false);
+        return this;
+    }
+
+    protected void setUUID(String uuid) {
+        this.uuid = uuid;
+    }
+
+
+    protected void register() {
+        if (!Utils.pollableTransport(transport()) && !Utils.webSocketMessage(this)) {
+            config.resourcesFactory().registerUuidForFindCandidate(this);
+        }
+    }
+
+    private TRANSPORT configureTransport() {
+        if (req == null) return UNDEFINED;
+
+        String s = req.getHeader(HeaderConfig.X_ATMOSPHERE_TRANSPORT);
+        if (s == null) return UNDEFINED;
+
+        if (s.equals(UNDEFINED.name()) && Utils.rawWebSocket(req)) {
+            return TRANSPORT.WEBSOCKET;
+        }
+
+        return switch (s.replace("-", "_").toUpperCase()) {
+            case "POLLING" -> TRANSPORT.POLLING;
+            case "LONG_POLLING" -> TRANSPORT.LONG_POLLING;
+            case "STREAMING" -> TRANSPORT.STREAMING;
+            case "WEBSOCKET" -> TRANSPORT.WEBSOCKET;
+            case "SSE" -> TRANSPORT.SSE;
+            case "AJAX" -> TRANSPORT.AJAX;
+            case "CLOSE" -> TRANSPORT.CLOSE;
+            default -> UNDEFINED;
+        };
+    }
+
+    @Override
+    public AtmosphereResourceEventImpl getAtmosphereResourceEvent() {
+        return event;
+    }
+
+    @Override
+    public AtmosphereHandler getAtmosphereHandler() {
+        return atmosphereHandler;
+    }
+
+    @Override
+    public AtmosphereResource writeOnTimeout(Object o) {
+        writeOnTimeout = o;
+        return this;
+    }
+
+    @Override
+    public Object writeOnTimeout() {
+        return writeOnTimeout;
+    }
+
+    @Override
+    public String uuid() {
+        return uuid;
+    }
+
+    @Override
+    public TRANSPORT transport() {
+        return transport;
+    }
+
+    /**
+     * Manually set the {@link TRANSPORT}
+     *
+     * @param transport set the {@link TRANSPORT}
+     */
+    public AtmosphereResourceImpl transport(TRANSPORT transport) {
+        this.transport = transport;
+        return this;
+    }
+
+    @Override
+    public AtmosphereResource resumeOnBroadcast(boolean resumeOnBroadcast) {
+        this.resumeOnBroadcast.set(resumeOnBroadcast);
+        // For legacy reason
+        req.setAttribute(ApplicationConfig.RESUME_ON_BROADCAST, resumeOnBroadcast);
+        return this;
+    }
+
+    @Override
+    public boolean isSuspended() {
+        return state.get() == LifecycleState.SUSPENDED;
+    }
+
+    @Override
+    public boolean resumeOnBroadcast() {
+        boolean rob = resumeOnBroadcast.get();
+        if (!rob) {
+            try {
+                Boolean b = (Boolean) req.getAttribute(ApplicationConfig.RESUME_ON_BROADCAST);
+                return b != null && b;
+            } catch (ClassCastException ex) {
+                // WebSphere is doing something strange here
+                return false;
+            }
+        }
+        return rob;
+    }
+
+    @Override
+    public AtmosphereResource resume() {
+
+        if (!isSuspended()) {
+            logger.trace("AtmosphereResource {} not suspended {}, cannot resume it.", uuid(), action);
+            return this;
+        }
+
+        try {
+            if (state.compareAndSet(LifecycleState.SUSPENDED, LifecycleState.RESUMED)) {
+                logger.trace("AtmosphereResource {} is resuming", uuid());
+
+                action = new Action(Action.TYPE.RESUME, action.timeout());
+
+                boolean notify = true;
+                for (Broadcaster b : broadcasters) {
+                    // We need it as Jetty doesn't support timeout
+                    if (!b.isDestroyed() && b instanceof DefaultBroadcaster db) {
+                        db.broadcastOnResume(this);
+                    }
+
+                    if (notify) {
+                        notify = false;
+                        notifyListeners();
+                    }
+
+                    if (b.getScope() == Broadcaster.SCOPE.REQUEST) {
+                        logger.debug("Broadcaster's scope is set to request, destroying it {}", b.getID());
+                        b.destroy();
+                    }
+                }
+                removeFromAllBroadcasters();
+
+                try {
+                    req.setAttribute(ApplicationConfig.RESUMED_ON_TIMEOUT, Boolean.FALSE);
+                } catch (Exception ex) {
+                    logger.debug("Resume exception: Cannot resume an already resumed/cancelled request", ex);
+                }
+
+                if (req.getAttribute(PRE_SUSPEND) == null) {
+                    asyncSupport.action(this);
+                }
+            } else {
+                logger.trace("Already resumed {}", this);
+                return this;
+            }
+        } catch (Throwable t) {
+            logger.trace("Wasn't able to resume a connection {}", this, t);
+        } finally {
+            listeners.clear();
+            unregister();
+        }
+        return this;
+    }
+
+    @Override
+    public AtmosphereResource suspend() {
+        return suspend(-1);
+    }
+
+    @Override
+    public AtmosphereResource suspend(long timeout, TimeUnit timeunit) {
+        long timeoutms = -1;
+        if (timeunit != null) {
+            timeoutms = TimeUnit.MILLISECONDS.convert(timeout, timeunit);
+        }
+
+        return suspend(timeoutms);
+    }
+
+    @Override
+    public AtmosphereResource suspend(long timeout) {
+
+        if (event.isSuspended() || disableSuspend) return this;
+
+        if (config.isSupportSession()
+                && req.getSession(false) != null
+                && req.getSession().getMaxInactiveInterval() >= 0
+                && req.getSession().getMaxInactiveInterval() * 1000L < timeout) {
+            throw new IllegalStateException("Cannot suspend a " +
+                    "response longer than the session timeout. Increase the value of session-timeout in web.xml");
+        }
+
+        if (Utils.resumableTransport(transport())) {
+            resumeOnBroadcast.set(true);
+        }
+
+        onPreSuspend(event);
+
+        // Recheck based on preSuspend
+        if (event.isSuspended() || disableSuspend) return this;
+
+        if (!event.isResumedOnTimeout()) {
+            // CAS guard: only transition to SUSPENDED from CREATED or RESUMED
+            var current = state.get();
+            if (current != LifecycleState.CREATED && current != LifecycleState.RESUMED) {
+                return this;
+            }
+            if (!state.compareAndSet(current, LifecycleState.SUSPENDED)) {
+                return this;
+            }
+
+            Enumeration<String> connection = req.getHeaders("Connection");
+            if (connection == null) {
+                connection = req.getHeaders("connection");
+            }
+
+            if (connection != null && connection.hasMoreElements()) {
+                String[] e = connection.nextElement().toString().split(",");
+                for (String upgrade : e) {
+                    if (upgrade.trim().equalsIgnoreCase(WEBSOCKET_UPGRADE)) {
+                        if (!asyncSupport.supportWebSocket()) {
+                            response.addHeader(X_ATMOSPHERE_ERROR, "Websocket protocol not supported");
+                        } else {
+                            req.setAttribute(FrameworkConfig.TRANSPORT_IN_USE, HeaderConfig.WEBSOCKET_TRANSPORT);
+                        }
+                    }
+                }
+            }
+
+            if (req.getHeader(X_ATMOSPHERE_TRANSPORT) == null || transport().equals(UNDEFINED)) {
+                req.setAttribute(FrameworkConfig.TRANSPORT_IN_USE, LONG_POLLING_TRANSPORT);
+            }
+
+            req.setAttribute(PRE_SUSPEND, "true");
+            action = new Action(Action.TYPE.SUSPEND, timeout);
+
+            // Optimization opportunity: avoid creating a Broadcaster when the Broadcaster is unique
+            boolean isJersey = req.getAttribute(FrameworkConfig.CONTAINER_RESPONSE) != null;
+
+            boolean skipCreation = req.getAttribute(SKIP_BROADCASTER_CREATION) != null;
+
+            Broadcaster broadcaster = getBroadcaster();
+
+            // Null means SCOPE=REQUEST
+            if (!skipCreation && (broadcaster == null || broadcaster.getScope() == Broadcaster.SCOPE.REQUEST) && !isJersey) {
+                String id = broadcaster != null ? broadcaster.getID() : ROOT_MASTER;
+                Class<? extends Broadcaster> clazz = broadcaster != null ? broadcaster.getClass() : DefaultBroadcaster.class;
+
+                broadcaster = config.getBroadcasterFactory().lookup(clazz, id, false);
+                if (broadcaster == null || !broadcaster.getAtmosphereResources().isEmpty()) {
+                    broadcaster = config.getBroadcasterFactory().lookup(clazz, id + "/" + UUID.randomUUID(), true);
+                }
+            }
+
+            Objects.requireNonNull(broadcaster).addAtmosphereResource(this);
+            if (req.getAttribute(DefaultBroadcaster.CACHED) != null && transport() != null && Utils.resumableTransport(transport())) {
+                action = new Action(Action.TYPE.CONTINUE, action.timeout());
+                // Do nothing because we have found cached message which was written already, and the handler resumed.
+                logger.debug("Cached message found, not suspending {}", uuid());
+                return this;
+            }
+            req.removeAttribute(PRE_SUSPEND);
+            register();
+            notifyListeners();
+        }
+        return this;
+    }
+
+    public AtmosphereRequest getRequest(boolean enforceScope) {
+        if (enforceScope && !isInScope()) {
+            throw new IllegalStateException("Request object no longer" + " valid. This object has been cancelled");
+        }
+        return req;
+    }
+
+    public AtmosphereResponse getResponse(boolean enforceScope) {
+        if (enforceScope && !isInScope()) {
+            throw new IllegalStateException("Response object no longer valid. This object has been cancelled");
+        }
+        return response;
+    }
+
+    @Override
+    public AtmosphereRequest getRequest() {
+        return getRequest(true);
+    }
+
+    @Override
+    public AtmosphereResponse getResponse() {
+        return getResponse(true);
+    }
+
+    @Override
+    public Broadcaster getBroadcaster() {
+        return getBroadcaster(true);
+    }
+
+    @Override
+    public List<Broadcaster> broadcasters() {
+        return Collections.unmodifiableList(broadcasters);
+    }
+
+    protected Broadcaster getBroadcaster(boolean autoCreate) {
+        if (broadcaster == null) {
+            throw new IllegalStateException("No Broadcaster associated with this AtmosphereResource.");
+        }
+
+        String s = config.getInitParameter(ApplicationConfig.RECOVER_DEAD_BROADCASTER);
+        if (s != null) {
+            autoCreate = Boolean.parseBoolean(s);
+        }
+
+        if (autoCreate && broadcaster.isDestroyed() && config.getBroadcasterFactory() != null) {
+            logger.debug("Broadcaster {} has been destroyed and cannot be re-used. Recreating a new one with the same name. You can turn off this" +
+                    " mechanism by adding, in web.xml, {} set to false", broadcaster.getID(), ApplicationConfig.RECOVER_DEAD_BROADCASTER);
+
+            Broadcaster.SCOPE scope = broadcaster.getScope();
+            broadcasterRecoveryLock.lock();
+            try {
+                String id = scope != Broadcaster.SCOPE.REQUEST ? broadcaster.getID() : broadcaster.getID() + ".recovered"
+                        + config.uuidProvider().generateUuid();
+
+                // Another Thread may have added the Broadcaster.
+                broadcaster = config.getBroadcasterFactory().lookup(id, true);
+                broadcaster.setScope(scope);
+                broadcaster.addAtmosphereResource(this);
+            } finally {
+                broadcasterRecoveryLock.unlock();
+            }
+        }
+        return broadcaster;
+    }
+
+    @Override
+    public AtmosphereResource setBroadcaster(Broadcaster broadcaster) {
+        this.broadcaster = broadcaster;
+        return uniqueBroadcaster(broadcaster);
+    }
+
+    @Override
+    public AtmosphereResource addBroadcaster(Broadcaster broadcaster) {
+        return uniqueBroadcaster(broadcaster);
+    }
+
+    @Override
+    public AtmosphereResource removeBroadcaster(Broadcaster broadcaster) {
+        broadcasters.remove(broadcaster);
+        if (broadcaster.getID() != null) {
+            broadcasterIdIndex.remove(broadcaster.getID().toLowerCase(Locale.ROOT));
+        }
+        return this;
+    }
+
+    protected AtmosphereResource uniqueBroadcaster(Broadcaster newB) {
+        if (newB == null || newB.getID() == null) {
+            return this;
+        }
+        if (broadcasterIdIndex.add(newB.getID().toLowerCase(Locale.ROOT))) {
+            broadcasters.add(newB);
+        } else {
+            logger.trace("Duplicate Broadcaster {}", newB);
+        }
+        return this;
+    }
+
+
+    @Override
+    public AtmosphereConfig getAtmosphereConfig() {
+        return config;
+    }
+
+    /**
+     * Return the {@link Action} which represent the state of the response, e.g. suspended, resumed or timed out.
+     *
+     * @return the {@link Action}
+     */
+    public Action action() {
+        return action;
+    }
+
+    public void setAction(Action action) {
+        this.action = action;
+    }
+
+    /**
+     * Completely reset the instance to its initial state.
+     */
+    public void reset() {
+        state.set(LifecycleState.CREATED);
+        isPendingClose.set(false);
+        isSuspendEvent.set(false);
+        disconnected.set(false);
+        listeners.clear();
+        broadcasters.clear();
+        broadcasterIdIndex.clear();
+        action = new Action(Action.TYPE.CREATED, action.timeout());
+    }
+
+    /**
+     * Protect the object from being used after it got cancelled.
+     *
+     * @param inScope when false, transitions the resource to {@link LifecycleState#DISCONNECTED}
+     */
+    public void setIsInScope(boolean inScope) {
+        if (!inScope) {
+            // CAS guard: don't overwrite CANCELLED or DISCONNECTED
+            while (true) {
+                var current = state.get();
+                if (current == LifecycleState.DISCONNECTED || current == LifecycleState.CANCELLED) {
+                    return;
+                }
+                if (state.compareAndSet(current, LifecycleState.DISCONNECTED)) {
+                    return;
+                }
+            }
+        } else {
+            // Only valid during reset — transition back to CREATED
+            state.set(LifecycleState.CREATED);
+        }
+    }
+
+    /**
+     * Check if the {@link AtmosphereRequest} still is valid.
+     *
+     * @return true if the {@link AtmosphereRequest} still is valid
+     */
+    public boolean isInScope() {
+        var s = state.get();
+        return s == LifecycleState.CREATED || s == LifecycleState.SUSPENDED
+                || s == LifecycleState.RESUMED || s == LifecycleState.CLOSING;
+    }
+
+    /**
+     * Return the current {@link LifecycleState} of this resource.
+     *
+     * @return the current lifecycle state
+     */
+    public LifecycleState lifecycleState() {
+        return state.get();
+    }
+
+    /**
+     * Set the {@link Serializer} used to write broadcasted objects.
+     *
+     */
+    @Override
+    public AtmosphereResource setSerializer(Serializer s) {
+        serializer = s;
+        return this;
+    }
+
+    @Override
+    public boolean isResumed() {
+        return state.get() == LifecycleState.RESUMED;
+    }
+
+    @Override
+    public boolean isCancelled() {
+        return state.get() == LifecycleState.CANCELLED;
+    }
+
+    @Override
+    public AtmosphereResource write(String s) {
+        response.write(s);
+        if (resumeOnBroadcast()) {
+            resume();
+        }
+        return this;
+    }
+
+    @Override
+    public AtmosphereResource write(byte[] o) {
+        response.write(o);
+        if (resumeOnBroadcast()) {
+            resume();
+        }
+        return this;
+    }
+
+    @Override
+    public Serializer getSerializer() {
+        return serializer;
+    }
+
+    /**
+     * Add a {@link AtmosphereResourceEventListener}.
+     *
+     * @param e an instance of AtmosphereResourceEventListener
+     */
+    @Override
+    public AtmosphereResource addEventListener(AtmosphereResourceEventListener e) {
+        // ConcurrentLinkedQueue.add is thread-safe; contains+add is benign TOCTOU
+        // (worst case: a duplicate listener that fires twice, which callers tolerate).
+        if (!listeners.contains(e)) {
+            listeners.add(e);
+        }
+        return this;
+    }
+
+    @Override
+    public AtmosphereResource removeEventListener(AtmosphereResourceEventListener e) {
+        listeners.remove(e);
+        return this;
+    }
+
+    @Override
+    public AtmosphereResource removeEventListeners() {
+        listeners.clear();
+        return this;
+    }
+
+    @Override
+    public AtmosphereResource notifyListeners() {
+        notifyListeners(event);
+        return this;
+    }
+
+    @Override
+    public AtmosphereResource notifyListeners(AtmosphereResourceEvent event) {
+        if (listeners.isEmpty() && config.framework().atmosphereResourceListeners().isEmpty()) {
+            logger.trace("No listener with {}", uuid());
+            return this;
+        }
+        logger.trace("Invoking listener {} for {}", listeners, uuid());
+
+        Action.TYPE previousType = action.type();
+        try {
+            if (event instanceof HeartbeatAtmosphereResourceEvent heartbeat) {
+                onHeartbeat(heartbeat);
+            } else if (event.isClosedByApplication()) {
+                onClose(event);
+            } else if (event.isCancelled() || event.isClosedByClient()) {
+                if (!disconnected.getAndSet(true)) {
+                    onDisconnect(event);
+                } else {
+                    logger.trace("Skipping notification, already disconnected {}", event.getResource() != null ? event.getResource().uuid() : uuid());
+                }
+            } else if (event.isResuming() || event.isResumedOnTimeout()) {
+                onResume(event);
+            } else if (!isSuspendEvent.getAndSet(true) && event.isSuspended()) {
+                onSuspend(event);
+            } else if (event.throwable() != null) {
+                onThrowable(event);
+            } else {
+                onBroadcast(event);
+            }
+
+            if (previousType != action.type()) {
+                action = new Action(Action.TYPE.CREATED, action.timeout());
+            }
+        } catch (Throwable t) {
+            ((AtmosphereResourceEventImpl) event).setThrowable(t);
+            if (event.isSuspended()) {
+                logger.warn("Exception during suspend() operation {}", t.toString());
+                logger.debug("", t);
+                removeFromAllBroadcasters();
+            } else {
+                logger.debug("Listener error {}", event, t);
+            }
+
+            try {
+                onThrowable(event);
+            } catch (Throwable t2) {
+                logger.warn("Listener error {}", event, t2);
+            }
+        }
+        return this;
+    }
+
+    @Override
+    public AtmosphereResource removeFromAllBroadcasters() {
+        for (Broadcaster b : broadcasters) {
+            try {
+                b.removeAtmosphereResource(this);
+            } catch (Exception ex) {
+                logger.trace("", ex);
+            }
+        }
+        return this;
+    }
+
+    /**
+     * Notify {@link AtmosphereResourceEventListener} thah an unexpected exception occured.
+     *
+     */
+    public void onThrowable(Throwable t) {
+        onThrowable(new AtmosphereResourceEventImpl(this, false, false, t));
+    }
+
+    void onThrowable(AtmosphereResourceEvent e) {
+        for (AtmosphereResourceEventListener r : listeners) {
+            r.onThrowable(e);
+        }
+    }
+
+    /**
+     * <p>
+     * Notifies to all listeners that a heartbeat has been sent.
+     * </p>
+     *
+     * @param e the event
+     */
+    void onHeartbeat(AtmosphereResourceEvent e) {
+        for (AtmosphereResourceEventListener r : listeners) {
+            r.onHeartbeat(e);
+        }
+    }
+
+    void onSuspend(AtmosphereResourceEvent e) {
+        for (AtmosphereResourceEventListener r : listeners) {
+            if (disableSuspendEvent) {
+                if (!(r instanceof AllowInterceptor)) {
+                    continue;
+                }
+            }
+            r.onSuspend(e);
+        }
+        if (e.getResource() != null) {
+            config.framework().notifySuspended(e.getResource().uuid());
+        }
+    }
+
+    void onPreSuspend(AtmosphereResourceEvent e) {
+        for (AtmosphereResourceEventListener r : listeners) {
+            if (disableSuspendEvent) {
+                if (!(r instanceof AllowInterceptor)) {
+                    continue;
+                }
+            }
+            r.onPreSuspend(e);
+        }
+    }
+
+    void onResume(AtmosphereResourceEvent e) {
+        for (AtmosphereResourceEventListener r : listeners) {
+            r.onResume(e);
+        }
+    }
+
+    void onDisconnect(AtmosphereResourceEvent e) {
+        for (AtmosphereResourceEventListener r : listeners) {
+            r.onDisconnect(e);
+            if (transport.equals(TRANSPORT.WEBSOCKET) && r instanceof WebSocketEventListener wsel) {
+                wsel.onDisconnect(new WebSocketEventListener.WebSocketEvent<>(1005, CLOSE, webSocket));
+            }
+        }
+
+        if (e.getResource() != null) {
+            config.framework().notifyDestroyed(e.getResource().uuid());
+        }
+    }
+
+    void onBroadcast(AtmosphereResourceEvent e) {
+        for (AtmosphereResourceEventListener r : listeners) {
+            r.onBroadcast(e);
+        }
+    }
+
+    void onClose(AtmosphereResourceEvent e) {
+        for (AtmosphereResourceEventListener r : listeners) {
+            r.onClose(e);
+            if (transport.equals(TRANSPORT.WEBSOCKET) && r instanceof WebSocketEventListener wsel) {
+                wsel.onClose(new WebSocketEventListener.WebSocketEvent<>(1005, CLOSE, webSocket));
+            }
+        }
+    }
+
+    public ConcurrentLinkedQueue<AtmosphereResourceEventListener> atmosphereResourceEventListener() {
+        return listeners;
+    }
+
+    public AtmosphereResourceImpl atmosphereHandler(AtmosphereHandler atmosphereHandler) {
+        this.atmosphereHandler = atmosphereHandler;
+        return this;
+    }
+
+    public void cancel() throws IOException {
+        try {
+            var prev = state.getAndSet(LifecycleState.CANCELLED);
+            if (prev != LifecycleState.CANCELLED) {
+                logger.trace("Cancelling {}", uuid());
+
+                if (config.getBroadcasterFactory() != null) {
+                    removeFromAllBroadcasters();
+                    if (transport.equals(TRANSPORT.WEBSOCKET)) {
+                        String parentUUID = (String) req.getAttribute(SUSPENDED_ATMOSPHERE_RESOURCE_UUID);
+                        config.resourcesFactory().findResource(parentUUID)
+                                .ifPresent(AtmosphereResource::removeFromAllBroadcasters);
+                    }
+                }
+
+                asyncSupport.complete(this);
+
+                SessionTimeoutSupport.restoreTimeout(req);
+                action = new Action(Action.TYPE.CANCELLED, action.timeout());
+                if (asyncSupport != null) asyncSupport.action(this);
+                // We must close the underlying WebSocket as well.
+                if (response instanceof AtmosphereResponseImpl ari) {
+                    if (closeOnCancel) {
+                        ari.close();
+                    }
+                    ari.destroy();
+                }
+
+                if (req instanceof AtmosphereRequestImpl ari) {
+                    if (closeOnCancel) {
+                        ari.destroy();
+                    }
+                }
+                event.destroy();
+            }
+        } finally {
+            listeners.clear();
+            unregister();
+        }
+    }
+
+    private void unregister() {
+        config.resourcesFactory().remove(uuid());
+    }
+
+    public void _destroy() {
+        try {
+            if (state.get() != LifecycleState.CANCELLED) {
+                removeFromAllBroadcasters();
+            }
+            broadcasters.clear();
+            broadcasterIdIndex.clear();
+
+            unregister();
+            removeEventListeners();
+        } catch (Throwable t) {
+            logger.trace("destroyResource", t);
+        } finally {
+            unregister();
+            webSocket = null;
+        }
+    }
+
+    @Override
+    public String toString() {
+        try {
+            return "AtmosphereResource{" +
+                    "\n\t uuid=" + uuid() +
+                    ",\n\t transport=" + transport() +
+                    ",\n\t state=" + state.get() +
+                    ",\n\t isInScope=" + isInScope() +
+                    ",\n\t isResumed=" + isResumed() +
+                    ",\n\t isCancelled=" + isCancelled() +
+                    ",\n\t isSuspended=" + isSuspended() +
+                    ",\n\t broadcasters=" + getBroadcaster().getID() +
+                    ",\n\t isClosedByClient=" + (event != null && event.isClosedByClient()) +
+                    ",\n\t isClosedByApplication=" + (event != null && event.isClosedByApplication()) +
+                    ",\n\t action=" + action +
+                    '}';
+        } catch (NullPointerException ex) {
+            // Prevent logger
+            return "AtmosphereResourceImpl{" + uuid() + "}";
+        }
+    }
+
+    public AtmosphereResourceImpl disableSuspend(boolean disableSuspend) {
+        this.disableSuspend = disableSuspend;
+        return this;
+    }
+
+    @Override
+    public HttpSession session(boolean create) {
+        if (config.isSupportSession() && session == null) {
+            // http://java.net/jira/browse/GLASSFISH-18856
+            session = req.getSession(create);
+        }
+        return session;
+    }
+
+    @Override
+    public void close() throws IOException {
+        event.setCloseByApplication(true);
+        notifyListeners();
+        cancel();
+        var ws = webSocket;
+        if (ws != null && ws.isOpen()) {
+            ws.close();
+        }
+    }
+
+    public void dirtyClose() {
+        try {
+            event.setCancelled(true);
+            notifyListeners();
+            cancel();
+            var ws = webSocket;
+            if (ws != null) {
+                ws.close();
+            }
+        } catch (IOException ex) {
+            logger.trace("", ex);
+        }
+    }
+
+    @Override
+    public AtmosphereResource forceBinaryWrite(boolean forceBinaryWrite) {
+        this.forceBinaryWrite = forceBinaryWrite;
+        return this;
+    }
+
+    @Override
+    public boolean forceBinaryWrite() {
+        return forceBinaryWrite;
+    }
+
+    @Override
+    public HttpSession session() {
+        return session(true);
+    }
+
+    public AtmosphereResourceImpl session(HttpSession session) {
+        this.session = session;
+        return this;
+    }
+
+    public AtmosphereResourceImpl cloneState(AtmosphereResource r) {
+        for (AtmosphereResourceEventListener l : ((AtmosphereResourceImpl) r).atmosphereResourceEventListener()) {
+            addEventListener(l);
+        }
+        ((AtmosphereResourceImpl) r).session(r.session());
+        boolean isFirst = true;
+        for (Broadcaster b : broadcasters) {
+            if (isFirst) {
+                isFirst = false;
+                setBroadcaster(b);
+            } else {
+                addBroadcaster(b);
+            }
+        }
+        atmosphereHandler(r.getAtmosphereHandler());
+        return this;
+    }
+
+    public ConcurrentLinkedQueue<AtmosphereResourceEventListener> listeners() {
+        return listeners;
+    }
+
+    /**
+     * Disable invocation of {@link AtmosphereResourceEventListener#onSuspend(AtmosphereResourceEvent)} and
+     * {@link AtmosphereResourceEventListener#onPreSuspend(AtmosphereResourceEvent)}. You normally disable those events
+     * after the first onSuspend has been called so all transports behave the same way.
+     * <br/>
+     * {@link AtmosphereResourceEventListener} marked with {@link org.atmosphere.interceptor.AllowInterceptor} will not
+     * be affected by this property.
+     *
+     * @param disableSuspendEvent
+     * @return this
+     */
+    public AtmosphereResourceImpl disableSuspendEvent(boolean disableSuspendEvent) {
+        this.disableSuspendEvent = disableSuspendEvent;
+        return this;
+    }
+
+    /**
+     * Return true if {@link AtmosphereResourceEventListener#onSuspend(AtmosphereResourceEvent)} and
+     * {@link AtmosphereResourceEventListener#onPreSuspend(AtmosphereResourceEvent)} events are disabled.
+     *
+     * @return true if disabled
+     */
+    public boolean disableSuspendEvent() {
+        return disableSuspendEvent;
+    }
+
+    public WebSocket webSocket() {
+        return webSocket;
+    }
+
+    public AtmosphereResourceImpl webSocket(WebSocket webSocket) {
+        this.webSocket = webSocket;
+        return this;
+    }
+
+    static boolean isValidTrackingId(String trackingId) {
+        if (trackingId == null || trackingId.isEmpty() || trackingId.length() > 128) {
+            return false;
+        }
+        for (int i = 0; i < trackingId.length(); i++) {
+            char c = trackingId.charAt(i);
+            if (!Character.isLetterOrDigit(c) && c != '-' && c != '_') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+
+        AtmosphereResourceImpl that = (AtmosphereResourceImpl) o;
+
+        return uuid() != null ? uuid().equals(that.uuid()) : that.uuid() == null;
+    }
+
+    @Override
+    public int hashCode() {
+        return uuid() != null ? uuid().hashCode() : 0;
+    }
+
+    /**
+     * Atomically transitions to {@link LifecycleState#CLOSING} if not already in that state.
+     *
+     * @return true if the resource was already in the closing phase, false if this call initiated it
+     */
+    public boolean getAndSetInClosingPhase() {
+        while (true) {
+            var current = state.get();
+            if (current == LifecycleState.CLOSING || current == LifecycleState.CANCELLED) {
+                return true;
+            }
+            if (state.compareAndSet(current, LifecycleState.CLOSING)) {
+                return false;
+            }
+        }
+    }
+
+    /**
+     * @return true if this resource has a pending delayed close
+     */
+    public boolean isPendingClose () {
+        return isPendingClose.get();
+    }
+
+    public boolean getAndSetPendingClose() {
+        return isPendingClose.getAndSet(true);
+    }
+}

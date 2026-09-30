@@ -1,0 +1,1306 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.agent.processor;
+
+import org.atmosphere.agent.ClasspathDetector;
+import org.atmosphere.agent.annotation.Agent;
+import org.atmosphere.agent.command.CommandRegistry;
+import org.atmosphere.agent.command.CommandResult;
+import org.atmosphere.agent.command.CommandRouter;
+import org.atmosphere.agent.skill.ScopePolicyResolver;
+import org.atmosphere.agent.skill.SkillFileParser;
+import org.atmosphere.ai.AiConfig;
+import org.atmosphere.ai.AiConversationMemory;
+import org.atmosphere.ai.AiMetrics;
+import org.atmosphere.ai.AgentRuntime;
+import org.atmosphere.ai.AgentRuntimeResolver;
+import org.atmosphere.ai.CompactionConfig;
+import org.atmosphere.ai.ConversationPersistence;
+import org.atmosphere.ai.InMemoryConversationMemory;
+import org.atmosphere.ai.PersistentConversationMemory;
+import org.atmosphere.ai.PromptLoader;
+import org.atmosphere.ai.annotation.AiTool;
+import org.atmosphere.ai.annotation.Prompt;
+import org.atmosphere.ai.governance.memory.MemorySafetyConfig;
+import org.atmosphere.ai.governance.scope.ScopePolicy;
+import org.atmosphere.ai.llm.CacheHint;
+import org.atmosphere.ai.llm.PromptCacheDefaults;
+import org.atmosphere.ai.memory.LongTermMemories;
+import org.atmosphere.ai.preset.Harness;
+import org.atmosphere.ai.preset.HarnessPreset;
+import org.atmosphere.ai.processor.AiEndpointHandler;
+import org.atmosphere.ai.tool.DefaultToolRegistry;
+import org.atmosphere.ai.tool.ToolRegistry;
+import org.atmosphere.ai.workspace.AgentDefinition;
+import org.atmosphere.ai.workspace.WorkspaceExtensions;
+import org.atmosphere.annotation.AnnotationUtil;
+import org.atmosphere.annotation.Processor;
+import org.atmosphere.config.AtmosphereAnnotation;
+import org.atmosphere.config.managed.AnnotatedLifecycle;
+import org.atmosphere.cpr.AtmosphereFramework;
+import org.atmosphere.cpr.AtmosphereFrameworkListenerAdapter;
+import org.atmosphere.cpr.AtmosphereInterceptor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Locale;
+import java.util.ServiceLoader;
+
+/**
+ * Annotation processor for {@link Agent}. Handles instance creation, skill file
+ * parsing, command scanning, AI endpoint setup, and optional cross-protocol
+ * registration (A2A, MCP, AG-UI) when the corresponding modules are on the classpath.
+ */
+@AtmosphereAnnotation(Agent.class)
+public class AgentProcessor implements Processor<Object> {
+
+    private static final Logger logger = LoggerFactory.getLogger(AgentProcessor.class);
+    private static final int DEFAULT_MAX_HISTORY = 20;
+    private static final String AGENT_VERSION = resolveModuleVersion();
+
+    /**
+     * Live MCP server connections opened from {@code MCP.md} ({@link McpServerRegistry}
+     * instances, held as {@link AutoCloseable} so this class carries no
+     * compile-time MCP-client reference). Closed on framework pre-destroy
+     * (Correctness Invariant #1, Ownership). {@link java.util.concurrent.CopyOnWriteArrayList}
+     * because shutdown reads it on the destroy thread while {@code handle()} may
+     * still be appending on the annotation-scan thread.
+     */
+    private final List<AutoCloseable> ownedMcpRegistries =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    /**
+     * Ensures the shutdown listener is registered at most once per
+     * {@code (processor, framework)} pair — multiple {@code @Agent} classes
+     * share one processor instance, so without this guard we would register a
+     * duplicate listener for every agent in the same scan.
+     */
+    private final java.util.Set<AtmosphereFramework> mcpShutdownHookInstalledOn =
+            java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+
+    @Override
+    public void handle(AtmosphereFramework framework, Class<Object> annotatedClass) {
+        try {
+            var annotation = annotatedClass.getAnnotation(Agent.class);
+            if (annotation == null) {
+                return;
+            }
+
+            var agentName = annotation.name();
+            var path = "/atmosphere/agent/" + agentName;
+
+            // Step 1: Create instance and inject fields
+            var instance = framework.newClassInstance(Object.class, annotatedClass);
+            AnnotatedLifecycle.injectFields(framework, instance);
+
+            // Headless mode: if the class has @Skill methods but no @Prompt,
+            // or headless=true is set, register only protocol endpoints (no WebSocket UI).
+            if (isHeadless(annotation, annotatedClass)) {
+                // No prompt loop means no harness surface: the batteries-included
+                // harness() default (memory, cache seeding) never applies here.
+                logger.info("Agent '{}' is headless — harness features do not apply "
+                        + "(no prompt loop)", agentName);
+                handleHeadless(framework, annotation, instance, agentName);
+                return;
+            }
+
+            // Step 2: Parse skill file → system prompt
+            var skillFile = parseSkillFile(annotation);
+            var systemPrompt = skillFile.systemPrompt();
+
+            // Step 2b: Agent-as-artifact. When an OpenClaw / native workspace is
+            // configured (atmosphere.workspace), load it and apply its extension
+            // files BEFORE AI infrastructure is resolved so the workspace's
+            // runtime config (RUNTIME.md), governance (PERMISSIONS.md), and
+            // prompt (SKILLS.md + skill files) actually take effect. Loading is
+            // best-effort: a missing / unreadable workspace never aborts startup.
+            var workspaceDef = WorkspaceExtensions
+                    .load(WorkspaceExtensions.resolveLocation(framework))
+                    .orElse(null);
+            if (workspaceDef != null) {
+                WorkspaceExtensions.applyRuntime(workspaceDef, agentName);
+                systemPrompt = WorkspaceExtensions.augmentSystemPrompt(systemPrompt, workspaceDef);
+                WorkspaceExtensions.installPolicies(framework,
+                        WorkspaceExtensions.permissionPolicies(workspaceDef));
+            }
+
+            // Step 3: Scan @Command methods
+            var commandRegistry = new CommandRegistry();
+            commandRegistry.scan(annotatedClass);
+
+            // Step 4: Find @Prompt or use synthetic default
+            var promptMethod = findPromptMethod(annotatedClass);
+            // If synthetic, the prompt target must be a SyntheticPrompt instance
+            var promptTarget = promptMethod.getDeclaringClass() == SyntheticPrompt.class
+                    ? new SyntheticPrompt() : instance;
+
+            // Step 5: Resolve AI infrastructure
+            var settings = resolveSettings();
+            var runtime = resolveRuntime(settings);
+            AiConversationMemory memory = resolveMemory(DEFAULT_MAX_HISTORY, framework);
+            var toolRegistry = registerTools(instance);
+
+            // MCP.md: connect the workspace's outbound MCP servers and register
+            // their remote tools into this agent's registry so they flow to the
+            // handler + pipeline. Guarded behind the optional mcp-client module;
+            // the live connections are closed on framework pre-destroy.
+            if (workspaceDef != null && ClasspathDetector.hasMcpClient()) {
+                var mcpRefs = WorkspaceExtensions.mcpServerUris(workspaceDef);
+                if (!mcpRefs.isEmpty()) {
+                    var owned = WorkspaceMcpToolWiring.wire(agentName, mcpRefs, toolRegistry);
+                    if (owned != null) {
+                        ownedMcpRegistries.add(owned);
+                        installMcpShutdownHook(framework);
+                    }
+                }
+            }
+
+            // Warn on tool mismatch with skill file
+            crossReferenceTools(skillFile, toolRegistry);
+
+            var metrics = resolveMetrics();
+            var lifecycle = AnnotatedLifecycle.scan(annotatedClass);
+
+            // Step 6: Create AgentHandler
+            var responseType = annotation.responseAs() == Void.class
+                    ? null : annotation.responseAs();
+            // v0.5 foundation primitives — build per-agent instances and
+            // publish into injectables so @Prompt/@AiTool methods can declare
+            // the SPI types (AgentState, AgentIdentity, AgentWorkspace) and
+            // receive a wired instance. Previously these were aspirational in
+            // the sample javadocs — nothing in production instantiated them.
+            var agentInjectables = new java.util.LinkedHashMap<Class<?>, Object>();
+            if (responseType != null) {
+                agentInjectables.put(Class.class, responseType);
+            }
+            buildFoundationPrimitives(agentName, agentInjectables);
+            // Publish the agent's state into the framework registry so the
+            // admin control plane can serve /api/admin/agents/{id}/... from
+            // the SAME instances the runtime uses (registre#21). String-
+            // bridged key: StateController.STATES_PROPERTY.
+            if (agentInjectables.get(org.atmosphere.ai.state.AgentState.class)
+                    instanceof org.atmosphere.ai.state.AgentState agentState) {
+                @SuppressWarnings("unchecked")
+                var stateRegistry = (java.util.Map<String, org.atmosphere.ai.state.AgentState>)
+                        framework.getAtmosphereConfig().properties().computeIfAbsent(
+                                "org.atmosphere.agent.states",
+                                k -> new java.util.concurrent.ConcurrentHashMap<
+                                        String, org.atmosphere.ai.state.AgentState>());
+                stateRegistry.put(agentName, agentState);
+            }
+            if (workspaceDef != null) {
+                agentInjectables.put(AgentDefinition.class, workspaceDef);
+            }
+            // Enforce the framework governance policies (including those parsed
+            // from PERMISSIONS.md) on the web streaming path by wrapping each as
+            // a guardrail — the same mechanism AiEndpointProcessor uses for
+            // @AiEndpoint — and, when the skill file declares a ## Guardrails
+            // section, prepend its auto-built ScopePolicy so a guardrail-violating
+            // request is rejected at the cheapest gate. The identical chain is
+            // installed on the A2A / AG-UI / channel pipeline below so confinement
+            // is the same across every invocation mode (Correctness Invariant #7,
+            // Mode Parity).
+            var webGuardrails = buildWebGuardrails(framework, skillFile, annotatedClass,
+                    agentName, annotation.description());
+            // Harness: same long-term-memory attach and prompt-cache default
+            // seeding as the @AiEndpoint path (Correctness Invariant #7,
+            // Mode Parity). @Agent has no interceptors/promptCache attributes,
+            // so the harness is the only source of both on this path.
+            // @Agent's harness() default is batteries-included ({ALL}); the
+            // org.atmosphere.ai.harness.enabled=false kill switch and
+            // exclude-paths beat it, harness = {} opts one agent down.
+            var preset = HarnessPreset.install(framework);
+            var features = preset.featuresFor(path, annotation.harness(), true);
+            var aiInterceptors = LongTermMemories.withPresetLongTermMemory(
+                    List.of(), preset, features.contains(Harness.MEMORY), path, framework);
+            if (!aiInterceptors.isEmpty()) {
+                MemorySafetyConfig.installedDefault().publishActive(framework);
+            }
+            if (features.contains(Harness.MEMORY)) {
+                // An @Agent always resolves conversation memory (Step 5), so the
+                // harness conversation-memory primitive is genuinely ACTIVE here.
+                // Publish it as runtime truth so the console reflects the
+                // annotation-driven attach even when the app-wide switch is unset
+                // (Invariant #5). The long-term-memory state is updated inside
+                // withPresetLongTermMemory.
+                preset.updateRuntimeState(HarnessPreset.PRIMITIVE_CONVERSATION_MEMORY, "ACTIVE");
+            }
+            // Harness PLANNING / FILESYSTEM: attach the plan store + file
+            // provider (same workspace subtree as buildFoundationPrimitives)
+            // and register the built-in tool floors, unless the resolved
+            // runtime's native surface wins under the AUTO mode knobs.
+            registerPresetPlanning(toolRegistry, preset,
+                    features.contains(Harness.PLANNING), runtime, agentInjectables, agentName);
+            registerPresetFilesystem(toolRegistry, preset,
+                    features.contains(Harness.FILESYSTEM), runtime, agentInjectables, agentName);
+            var aiHandler = new AiEndpointHandler(
+                    promptTarget, promptMethod, 120_000L,
+                    systemPrompt, path, runtime, aiInterceptors,
+                    memory, lifecycle, toolRegistry,
+                    webGuardrails, List.of(), metrics, List.of(), null, agentInjectables);
+            var cachePolicy = PromptCacheDefaults.effective(
+                    null, framework.getAtmosphereConfig(), features.contains(Harness.CACHE));
+            if (cachePolicy != CacheHint.CachePolicy.NONE) {
+                aiHandler.setCachePolicy(cachePolicy);
+                // Upgrade the console runtime-state to the policy this agent
+                // actually seeds (Runtime Truth) — the global seed may read
+                // "none" when the annotation's harness() opted this agent in.
+                preset.updateRuntimeState(HarnessPreset.PRIMITIVE_PROMPT_CACHE_DEFAULT,
+                        cachePolicy.name().toLowerCase(Locale.ROOT));
+            }
+
+            var commandRouter = new CommandRouter(commandRegistry, instance);
+            var handler = new AgentHandler(aiHandler, commandRouter,
+                    instance, framework.getAtmosphereConfig());
+            handler.setAgentName(agentName);
+
+            // Step 7: Register handler at /atmosphere/agent/{name}
+            List<AtmosphereInterceptor> interceptors = new LinkedList<>();
+            AnnotationUtil.defaultManagedServiceInterceptors(framework, interceptors);
+            framework.addAtmosphereHandler(path, handler, interceptors);
+
+            // Step 8-11: Optional cross-protocol registration
+            var protocols = new ArrayList<String>();
+            // Install the framework's governance policies — and the skill's
+            // ## Guardrails ScopePolicy when present — so the A2A / AG-UI /
+            // channel pipelines admit against the same chain as the web path
+            // above (Mode Parity #7). Previously these pipelines were built with
+            // an empty policy list, leaving governance absent on those surfaces.
+            var pipeline = buildPipeline(framework, skillFile, annotatedClass, agentName,
+                    annotation.description(), runtime, systemPrompt, settings.model(),
+                    memory, toolRegistry, metrics);
+            // Thread the same injectables the web handler publishes into the
+            // pipeline's tool scope so the registered tools (write_todos, the
+            // file tools, user @AiTool methods) resolve their framework
+            // parameters identically on the A2A / AG-UI / channel paths
+            // (Correctness Invariant #7, Mode Parity).
+            pipeline.setToolInjectables(agentInjectables);
+            registerA2a(framework, annotation, skillFile, commandRegistry,
+                    commandRouter, promptTarget, promptMethod, pipeline,
+                    path, protocols);
+            registerMcp(framework, annotation, skillFile, toolRegistry, path, protocols);
+            registerAgUi(framework, promptTarget, promptMethod, path, pipeline, protocols);
+            // CHANNELS.md selects which channel types this agent serves; it
+            // merges with any "Channels" section in the skill file. An empty
+            // list means all channels (ChannelAiBridge default). Credentials
+            // always come from the channel module's own config, never the
+            // workspace file (Correctness Invariant #6).
+            var channels = new ArrayList<>(skillFile.listItems("Channels"));
+            if (workspaceDef != null) {
+                for (var ch : WorkspaceExtensions.channelNames(workspaceDef)) {
+                    if (!channels.contains(ch)) {
+                        channels.add(ch);
+                    }
+                }
+            }
+            wireChannelBridge(agentName, commandRouter, instance, systemPrompt, pipeline,
+                    channels, protocols);
+            // Opt-in OpenAI-compatible serving (atmosphere.ai.openai.enabled):
+            // expose the agent's governed pipeline as a chat-completions
+            // "model" named after the agent, dispatching through the exact
+            // same admission chain as the A2A / AG-UI / channel surfaces
+            // (Mode Parity #7). No-op while the endpoint is disabled.
+            if (org.atmosphere.ai.openai.OpenAiServingRegistrar.registerAgent(
+                    framework, agentName, pipeline, memory)) {
+                protocols.add("openai");
+            }
+            // Opt-in durable batch serving (atmosphere.ai.batch.enabled):
+            // expose the same governed pipeline behind the async submit/poll
+            // job surface, so every batch item rides the identical admission
+            // chain (Mode Parity #7). No-op while the endpoint is disabled.
+            if (org.atmosphere.ai.batch.BatchServingRegistrar.registerAgent(
+                    framework, agentName, pipeline, memory)) {
+                protocols.add("batch");
+            }
+
+            // Step 12: Log summary
+            logger.info("Agent '{}' registered at {} (class: {}, commands: {}, tools: {}, "
+                            + "memory: on(max={}), protocols: {})",
+                    agentName, path, annotatedClass.getSimpleName(),
+                    commandRegistry.size(), toolRegistry.allTools().size(),
+                    DEFAULT_MAX_HISTORY, protocols.isEmpty() ? "[web]" : protocols);
+
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to register Agent from " + annotatedClass.getName(), e);
+        }
+    }
+
+    /**
+     * Build the {@link ScopePolicy} an {@code @Agent}'s skill file mandates via
+     * its {@code ## Guardrails} section. Delegates to
+     * {@link ScopePolicyResolver#fromSkillGuardrails} — the shared wiring that
+     * makes a skill's guardrails an <em>enforced</em> admission boundary on
+     * every skill-consuming path ({@code @Coordinator} included).
+     *
+     * <p>Package-private so {@code AgentSkillScopeConfinementTest} can assert the
+     * skill content actually reaches the governance subsystem.</p>
+     */
+    ScopePolicy buildSkillScopePolicy(SkillFileParser skillFile, String agentName,
+                                      String agentDescription) {
+        return ScopePolicyResolver.fromSkillGuardrails(skillFile, agentName, agentDescription);
+    }
+
+    /**
+     * Extracts the enforceable forbidden topics from {@code ## Guardrails} lines
+     * ({@link ScopePolicyResolver#forbiddenTopicsFrom}). Package-private for
+     * direct assertion in tests.
+     */
+    static List<String> forbiddenTopicsFrom(List<String> guardrails) {
+        return ScopePolicyResolver.forbiddenTopicsFrom(guardrails);
+    }
+
+    /**
+     * Build the web streaming guardrail chain for an {@code @Agent}. Wraps every
+     * framework governance policy (including {@code PERMISSIONS.md}-derived ones)
+     * as a guardrail and, when the skill file declares a {@code ## Guardrails}
+     * section, prepends the scope policy so an off-topic / guardrail-violating
+     * request is rejected on the web path exactly as it is on the
+     * A2A / AG-UI / channel pipeline ({@link #buildPipeline}). Keeps confinement
+     * consistent across every invocation mode (Correctness Invariant #7 —
+     * Mode Parity).
+     *
+     * <p>Package-private so {@code AgentSkillScopeConfinementTest} can assert the
+     * scope guardrail is installed first on the web path too.</p>
+     */
+    List<org.atmosphere.ai.AiGuardrail> buildWebGuardrails(AtmosphereFramework framework,
+            SkillFileParser skillFile, Class<?> agentClass, String agentName,
+            String agentDescription) {
+        var guardrails = new ArrayList<org.atmosphere.ai.AiGuardrail>();
+        var scopePolicy = resolveScopePolicy(skillFile, agentClass, agentName, agentDescription);
+        if (scopePolicy != null) {
+            // Scope first — cheapest rejection, before any framework policy.
+            guardrails.add(new org.atmosphere.ai.governance.PolicyAsGuardrail(scopePolicy));
+        }
+        for (var policy : org.atmosphere.ai.governance.GovernancePolicies.installed(framework)) {
+            guardrails.add(new org.atmosphere.ai.governance.PolicyAsGuardrail(policy));
+        }
+        return guardrails;
+    }
+
+    /**
+     * Resolve the {@code @Agent}'s scope policy with the shared precedence
+     * ({@link ScopePolicyResolver#resolve}): a skill-level {@code scopeTier: none}
+     * opt-out beats everything, a {@code ## Guardrails}-derived policy wins next,
+     * otherwise the {@code @AgentScope} annotation on the class is honored.
+     */
+    ScopePolicy resolveScopePolicy(SkillFileParser skillFile, Class<?> agentClass,
+                                   String agentName, String agentDescription) {
+        return ScopePolicyResolver.resolve(skillFile, agentClass, agentName,
+                agentDescription, "/atmosphere/agent/" + agentName);
+    }
+
+    /**
+     * Build the {@code @Agent}'s protocol pipeline (the A2A / AG-UI / channel
+     * surface). Seeded with the framework's installed governance policies so the
+     * agent admits against the same chain as a plain {@code @AiEndpoint} instead
+     * of an empty policy list (Mode Parity #7). When the skill file declares a
+     * {@code ## Guardrails} section, the auto-built {@link ScopePolicy} is
+     * prepended so an off-topic request is rejected at the cheapest gate — the
+     * same confinement {@link #buildWebGuardrails} installs on the web path.
+     *
+     * <p>Package-private so {@code AgentSkillScopeConfinementTest} can drive a
+     * request through the real admission gate this method wires.</p>
+     */
+    org.atmosphere.ai.AiPipeline buildPipeline(AtmosphereFramework framework,
+            SkillFileParser skillFile, Class<?> agentClass, String agentName,
+            String agentDescription, AgentRuntime runtime, String systemPrompt, String model,
+            AiConversationMemory memory, ToolRegistry toolRegistry, AiMetrics metrics) {
+        List<org.atmosphere.ai.governance.GovernancePolicy> policies =
+                org.atmosphere.ai.governance.GovernancePolicies.installed(framework);
+        var scopePolicy = resolveScopePolicy(skillFile, agentClass, agentName, agentDescription);
+        if (scopePolicy != null) {
+            var extended = new ArrayList<org.atmosphere.ai.governance.GovernancePolicy>(
+                    policies.size() + 1);
+            extended.add(scopePolicy);      // scope runs first — cheapest rejection
+            extended.addAll(policies);
+            policies = List.copyOf(extended);
+        }
+        return new org.atmosphere.ai.AiPipeline(runtime, systemPrompt, model, memory,
+                toolRegistry, List.of(), policies, List.of(), metrics, null);
+    }
+
+    /**
+     * Returns {@code true} if the agent should run headless (no WebSocket UI):
+     * either explicitly set, or auto-detected when the class has skill handlers but no {@code @Prompt}.
+     */
+    // Package-private for testing
+    boolean isHeadless(Agent annotation, Class<?> clazz) {
+        if (annotation.headless()) {
+            return true;
+        }
+        // Auto-detect: has protocol-specific methods but no @Prompt
+        boolean hasPrompt = false;
+        boolean hasProtocolMethods = false;
+        for (var method : clazz.getDeclaredMethods()) {
+            if (method.isAnnotationPresent(Prompt.class)) {
+                hasPrompt = true;
+            }
+            if (ClasspathDetector.hasA2a()
+                    && method.isAnnotationPresent(org.atmosphere.a2a.annotation.AgentSkill.class)
+                    && method.isAnnotationPresent(org.atmosphere.a2a.annotation.AgentSkillHandler.class)) {
+                hasProtocolMethods = true;
+            }
+            if (ClasspathDetector.hasMcp() && hasMcpToolAnnotation(method)) {
+                hasProtocolMethods = true;
+            }
+        }
+        return hasProtocolMethods && !hasPrompt;
+    }
+
+    /**
+     * Returns {@code true} if the given method is annotated with
+     * {@code org.atmosphere.mcp.annotation.McpTool}. Resolved reflectively so
+     * {@code AgentProcessor} never links against MCP types when the optional
+     * {@code atmosphere-mcp} dependency is absent.
+     */
+    private static boolean hasMcpToolAnnotation(Method method) {
+        try {
+            // Class.forName on a string literal returns Class<?>; the cast to
+            // Class<? extends Annotation> is unavoidable because the annotation
+            // type cannot be a compile-time reference without pulling the
+            // optional atmosphere-mcp jar into AgentProcessor's linkage set.
+            @SuppressWarnings("unchecked")
+            Class<? extends java.lang.annotation.Annotation> mcpTool =
+                    (Class<? extends java.lang.annotation.Annotation>) Class.forName(
+                            "org.atmosphere.mcp.annotation.McpTool",
+                            false, Thread.currentThread().getContextClassLoader());
+            return method.isAnnotationPresent(mcpTool);
+        } catch (ClassNotFoundException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Handles a headless agent by registering only protocol endpoints (A2A, MCP)
+     * without a WebSocket UI handler. Uses the same {@link org.atmosphere.a2a.registry.A2aRegistry}
+     * pattern as {@code A2aServerProcessor}.
+     */
+    private void handleHeadless(AtmosphereFramework framework, Agent annotation,
+                                Object instance, String agentName) {
+        var protocols = new ArrayList<String>();
+        var basePath = "/atmosphere/agent/" + agentName;
+
+        try {
+            var toolRegistry = registerTools(instance);
+
+            // Register A2A if on classpath and agent has @AgentSkill methods
+            if (ClasspathDetector.hasA2a()) {
+                var registry = new org.atmosphere.a2a.registry.A2aRegistry();
+                registry.scan(instance);
+
+                if (!registry.skills().isEmpty()) {
+                    var a2aEndpoint = annotation.endpoint().isEmpty()
+                            ? basePath + "/a2a"
+                            : annotation.endpoint();
+                    var version = annotation.version();
+                    var description = annotation.description().isEmpty()
+                            ? "Headless agent: " + agentName
+                            : annotation.description();
+
+                    var pushOn = A2aCardDecorations.pushEnabled(framework);
+                    var card = A2aCardDecorations.signIfEnabled(
+                            A2aCardDecorations.advertiseSecurity(
+                                    registry.buildAgentCard(agentName, description, version, a2aEndpoint),
+                                    framework),
+                            framework, agentName);
+                    if (pushOn) {
+                        card = A2aCardDecorations.advertisePush(card);
+                    }
+                    var taskManager = new org.atmosphere.a2a.runtime.TaskManager();
+                    var protocolHandler = new org.atmosphere.a2a.runtime.A2aProtocolHandler(
+                            registry, taskManager, card);
+                    // Raw @AgentSkill handlers are invoked reflectively and never
+                    // reach AiPipeline's pre-admission loop; the framework reference
+                    // lets the handler resolve the installed governance chain.
+                    protocolHandler.setFramework(framework);
+                    if (pushOn) {
+                        A2aCardDecorations.wirePush(framework, protocolHandler, taskManager, agentName);
+                    }
+                    var a2aHandler = new org.atmosphere.a2a.runtime.A2aHandler(protocolHandler);
+                    // The A2A protocol is live on this framework — publish its
+                    // bridge so the admin plane reports reachable protocols
+                    // from runtime truth (registre#22).
+                    org.atmosphere.ai.bridge.ProtocolBridgeRegistry.install(
+                            framework.getAtmosphereConfig().properties(),
+                            new org.atmosphere.a2a.bridge.A2aProtocolBridge(framework));
+
+                    framework.addAtmosphereHandler(a2aEndpoint, a2aHandler, new java.util.ArrayList<>());
+                    A2aCardDecorations.warnIfUnauthenticated(framework, a2aEndpoint, agentName);
+                    protocols.add("a2a");
+                }
+            }
+
+            // Register MCP if on classpath (independent of A2A).
+            // If endpoint is explicitly set and ends with /mcp, register there directly.
+            // Otherwise, derive from basePath (/atmosphere/agent/{name}/mcp).
+            var mcpPath = annotation.endpoint().endsWith("/mcp")
+                    ? annotation.endpoint()
+                    : basePath + "/mcp";
+            registerMcpAt(framework, annotation, toolRegistry, instance, mcpPath, protocols);
+
+            if (protocols.isEmpty()) {
+                logger.warn("Agent '{}' is headless but no protocol modules on classpath. "
+                        + "Add atmosphere-a2a or atmosphere-mcp.", agentName);
+                return;
+            }
+
+            logger.info("Agent '{}' registered (headless, protocols: {})", agentName, protocols);
+        } catch (Exception e) {
+            logger.error("Failed to register headless agent '{}'", agentName, e);
+        }
+    }
+
+    /**
+     * Finds the {@code @Prompt} method or creates a synthetic one that calls
+     * {@code session.stream(message)}.
+     */
+    private Method findPromptMethod(Class<?> clazz) {
+        for (var method : clazz.getDeclaredMethods()) {
+            if (method.isAnnotationPresent(Prompt.class)) {
+                return method;
+            }
+        }
+        // No @Prompt found — use synthetic default: session.stream(message)
+        try {
+            return SyntheticPrompt.class.getDeclaredMethod("onPrompt",
+                    String.class, org.atmosphere.ai.StreamingSession.class);
+        } catch (NoSuchMethodException e) {
+            throw new IllegalStateException("Failed to find synthetic prompt method", e);
+        }
+    }
+
+    /**
+     * Synthetic prompt handler that auto-delegates to {@code session.stream(message)}.
+     * Used when the {@code @Agent} class has no {@code @Prompt} method.
+     */
+    static class SyntheticPrompt {
+        @Prompt
+        public void onPrompt(String message, org.atmosphere.ai.StreamingSession session) {
+            session.stream(message);
+        }
+    }
+
+    private SkillFileParser parseSkillFile(Agent annotation) {
+        var skillPath = annotation.skillFile();
+        if (org.atmosphere.ai.prompt.PromptResolver.isManaged(skillPath)) {
+            // prompt: prefix resolves a versioned, registry-managed prompt
+            // (rollout unit = the agent name); resolution fails closed on a
+            // missing version, integrity mismatch, or unresolved template
+            // variable — a managed prompt is an explicit deployment contract.
+            return SkillFileParser.parse(org.atmosphere.ai.prompt.PromptResolver
+                    .resolveSystemPrompt(skillPath, annotation.name()));
+        }
+        if (skillPath != null && !skillPath.isEmpty()) {
+            // skill: prefix loads from atmosphere-skills repo (classpath -> cache -> GitHub).
+            // Raw form: keeps the YAML frontmatter so hints like scopeTier reach the
+            // parser (resolve() strips it); SkillFileParser excludes the block from
+            // systemPrompt() so no metadata leaks into the LLM prompt.
+            var content = PromptLoader.resolveRaw(skillPath);
+            if (content == null) {
+                logger.warn("Skill '{}' not found for agent '{}'", skillPath, annotation.name());
+                return SkillFileParser.parse("");
+            }
+            return SkillFileParser.parse(content);
+        }
+        // Auto-discover skill file from classpath conventions
+        var agentName = annotation.name();
+        var candidates = new String[]{
+                "META-INF/skills/" + agentName + "/SKILL.md",
+                "prompts/" + agentName + ".md",
+                "prompts/" + agentName + "-skill.md",
+                "prompts/skill.md",
+        };
+        for (var candidate : candidates) {
+            var classLoader = Thread.currentThread().getContextClassLoader();
+            if (classLoader == null) {
+                classLoader = getClass().getClassLoader();
+            }
+            if (classLoader.getResource(candidate) != null) {
+                logger.info("Auto-discovered skill file at {} for agent '{}'", candidate, agentName);
+                var content = PromptLoader.load(candidate);
+                return SkillFileParser.parse(content);
+            }
+        }
+        logger.debug("No skill file found for agent '{}' — using empty system prompt", agentName);
+        return SkillFileParser.parse("");
+    }
+
+    private AiConfig.LlmSettings resolveSettings() {
+        var settings = AiConfig.get();
+        if (settings == null) {
+            settings = AiConfig.fromEnvironment();
+        }
+        return settings;
+    }
+
+    /**
+     * Wire the v0.5 foundation primitives into the endpoint's injectables map
+     * so {@code @Prompt} and {@code @AiTool} methods can declare them as
+     * parameters and receive live instances. Failures are non-fatal: if the
+     * workspace root can't be resolved or disk I/O fails, the agent keeps
+     * starting but the affected primitive simply isn't injected (callers
+     * declaring it as a parameter will see the same IllegalStateException as
+     * any other missing injectable, surfacing the misconfig at the point of
+     * use rather than silently).
+     */
+    private void buildFoundationPrimitives(String agentName,
+                                           java.util.Map<Class<?>, Object> injectables) {
+        var workspaceRoot = System.getProperty("atmosphere.workspace.root");
+        if (workspaceRoot == null) {
+            workspaceRoot = System.getenv("ATMOSPHERE_WORKSPACE_ROOT");
+        }
+        if (workspaceRoot == null) {
+            // Default: a per-user directory under the JVM's user.home, same
+            // shape as OpenClaw's convention. Tests can override with
+            // -Datmosphere.workspace.root.
+            workspaceRoot = System.getProperty("user.home") + "/.atmosphere/workspace";
+        }
+        try {
+            var root = java.nio.file.Path.of(workspaceRoot).resolve("agents").resolve(agentName);
+            java.nio.file.Files.createDirectories(root);
+            var state = new org.atmosphere.ai.state.FileSystemAgentState(root);
+            injectables.put(org.atmosphere.ai.state.AgentState.class, state);
+            injectables.put(org.atmosphere.ai.state.FileSystemAgentState.class, state);
+        } catch (Exception e) {
+            logger.warn("AgentState not wired for '{}': {}", agentName, e.getMessage());
+        }
+
+        try {
+            var credentials = org.atmosphere.ai.identity.AtmosphereEncryptedCredentialStore.withFreshKey();
+            var identity = new org.atmosphere.ai.identity.InMemoryAgentIdentity(credentials);
+            injectables.put(org.atmosphere.ai.identity.AgentIdentity.class, identity);
+            injectables.put(org.atmosphere.ai.identity.CredentialStore.class, credentials);
+        } catch (Exception e) {
+            logger.warn("AgentIdentity not wired for '{}': {}", agentName, e.getMessage());
+        }
+
+        try {
+            var loader = new org.atmosphere.ai.workspace.AgentWorkspaceLoader();
+            var adapters = loader.adapters();
+            if (!adapters.isEmpty()) {
+                injectables.put(org.atmosphere.ai.workspace.AgentWorkspace.class, adapters.get(0));
+            }
+        } catch (Exception e) {
+            logger.warn("AgentWorkspace not wired for '{}': {}", agentName, e.getMessage());
+        }
+    }
+
+    /**
+     * Harness PLANNING: attach the plan surface for one {@code @Agent} —
+     * {@link org.atmosphere.ai.plan.AgentPlanStore} into the injectables and
+     * the built-in {@code write_todos} floor into the registry unless the
+     * resolved runtime's native plan machinery wins under
+     * {@link org.atmosphere.ai.plan.PlanningMode} (registration-time truth:
+     * the same resolved {@link AgentRuntime} the handler dispatches through
+     * declares, or does not declare, {@code AiCapability.PLANNING}). Mirrors
+     * {@code CoordinatorProcessor.registerPresetDelegation}'s seam shape.
+     *
+     * <p>Package-private so {@code AgentProcessorHarnessTest} can pin the
+     * gating without driving a full annotation scan.</p>
+     */
+    void registerPresetPlanning(ToolRegistry toolRegistry, HarnessPreset preset,
+                                boolean planningOn, AgentRuntime runtime,
+                                java.util.Map<Class<?>, Object> injectables, String agentName) {
+        org.atmosphere.ai.plan.PlanningPreset.register(toolRegistry, preset, planningOn,
+                runtime, injectables,
+                org.atmosphere.ai.preset.HarnessWorkspace.ownerRoot("agents", agentName),
+                agentName);
+    }
+
+    /**
+     * Harness FILESYSTEM: attach the conversation-scoped file surface for one
+     * {@code @Agent} — {@link org.atmosphere.ai.fs.AgentFileSystemProvider}
+     * into the injectables (scoped per conversation at dispatch) and the
+     * built-in eight-tool floor into the registry unless the resolved runtime's
+     * native file surface wins under
+     * {@link org.atmosphere.ai.fs.FilesystemMode}. Same runtime-truth check
+     * as {@link #registerPresetPlanning}.
+     *
+     * <p>Package-private so {@code AgentProcessorHarnessTest} can pin the
+     * gating without driving a full annotation scan.</p>
+     */
+    void registerPresetFilesystem(ToolRegistry toolRegistry, HarnessPreset preset,
+                                  boolean filesystemOn, AgentRuntime runtime,
+                                  java.util.Map<Class<?>, Object> injectables, String agentName) {
+        org.atmosphere.ai.fs.FilesystemPreset.register(toolRegistry, preset, filesystemOn,
+                runtime, injectables,
+                org.atmosphere.ai.preset.HarnessWorkspace.ownerRoot("agents", agentName),
+                agentName);
+    }
+
+    /**
+     * Register a one-shot framework pre-destroy listener (at most once per
+     * framework) that closes every MCP server connection opened from MCP.md.
+     */
+    private void installMcpShutdownHook(AtmosphereFramework framework) {
+        synchronized (mcpShutdownHookInstalledOn) {
+            if (!mcpShutdownHookInstalledOn.add(framework)) {
+                return;
+            }
+        }
+        framework.frameworkListener(new AtmosphereFrameworkListenerAdapter() {
+            @Override
+            public void onPreDestroy(AtmosphereFramework f) {
+                closeOwnedMcpRegistries();
+            }
+        });
+    }
+
+    /**
+     * Close every MCP server connection opened from MCP.md. Safe to call
+     * repeatedly: each registry is removed before close so a second invocation
+     * skips it. A single misbehaving connection is logged at WARN and does not
+     * block siblings from releasing (Correctness Invariant #2, terminal paths).
+     */
+    void closeOwnedMcpRegistries() {
+        for (var registry : ownedMcpRegistries) {
+            if (!ownedMcpRegistries.remove(registry)) {
+                continue;
+            }
+            try {
+                registry.close();
+            } catch (Exception e) {
+                logger.warn("MCP server registry failed to close on shutdown; "
+                        + "connections may leak: {}", e.getMessage(), e);
+            }
+        }
+    }
+
+    /**
+     * Test hook: track an {@link AutoCloseable} as if it were an MCP server
+     * registry opened from MCP.md, so {@link #closeOwnedMcpRegistries()} can be
+     * exercised without standing up a live MCP server. Not part of the public API.
+     */
+    void trackMcpRegistryForTest(AutoCloseable registry) {
+        ownedMcpRegistries.add(registry);
+    }
+
+    private AgentRuntime resolveRuntime(AiConfig.LlmSettings settings) {
+        return resolveRuntime(settings, AgentRuntimeResolver.resolveAll());
+    }
+
+    /**
+     * Configure every available backend and return the first. Package-visible so
+     * {@code AgentProcessorRuntimeConfigGuardTest} can install a backend whose
+     * {@code configure()} throws and assert registration still completes.
+     */
+    AgentRuntime resolveRuntime(AiConfig.LlmSettings settings, List<AgentRuntime> allBackends) {
+        for (var backend : allBackends) {
+            // configure() may throw if a runtime tries to eagerly construct its
+            // native client and the underlying CDI / connection pool / TLS layer
+            // is not yet ready (Quarkus L4j synthetic ChatModel beans pull in
+            // TlsConfigurationRegistry which is not initialised during servlet
+            // init). Swallow the exception with a clear log line so agent
+            // registration completes; the runtime is re-resolved at request time
+            // when the bean graph is fully wired. Mirrors the identical guard in
+            // AiEndpointProcessor#resolveRuntimeWithRouting — @Agent and
+            // @AiEndpoint must tolerate eager-configure failure identically
+            // (Mode Parity), otherwise an @Agent aborts the whole Atmosphere
+            // annotation-scan phase on Quarkus and no endpoints register.
+            try {
+                backend.configure(settings);
+            } catch (RuntimeException e) {
+                logger.warn("Backend {} failed eager configure() — agent registration "
+                                + "will continue and the runtime will be re-resolved at request time. "
+                                + "Reason: {}", backend.name(), e.toString());
+            }
+        }
+        return allBackends.stream().findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                        "No AgentRuntime available. Add an AI provider "
+                                + "(e.g. atmosphere-langchain4j) to the classpath."));
+    }
+
+    // Package-visible so AgentProcessorCompactionTest can pin the
+    // org.atmosphere.ai.compaction seam on the @Agent path (Mode Parity).
+    AiConversationMemory resolveMemory(int maxHistory, AtmosphereFramework framework) {
+        var cfg = framework != null ? framework.getAtmosphereConfig() : null;
+        var persistence = ServiceLoader.load(ConversationPersistence.class).stream()
+                .map(ServiceLoader.Provider::get)
+                .filter(ConversationPersistence::isAvailable)
+                .findFirst();
+        if (persistence.isPresent()) {
+            logger.info("Auto-detected ConversationPersistence: {}",
+                    persistence.get().getClass().getName());
+            // PersistentConversationMemory hard-wires sliding-window eviction;
+            // the compaction seam applies only to the in-memory path.
+            CompactionConfig.warnIfIgnoredByPersistence(cfg, "AgentProcessor");
+            return new PersistentConversationMemory(persistence.get(), maxHistory);
+        }
+        return new InMemoryConversationMemory(maxHistory, CompactionConfig.resolve(cfg));
+    }
+
+    private ToolRegistry registerTools(Object instance) {
+        var registry = new DefaultToolRegistry();
+        // Scan the agent class itself for @AiTool methods
+        var hasTools = false;
+        for (var method : instance.getClass().getDeclaredMethods()) {
+            if (method.isAnnotationPresent(AiTool.class)) {
+                hasTools = true;
+                break;
+            }
+        }
+        if (hasTools) {
+            registry.register(instance);
+        }
+        return registry;
+    }
+
+    private void crossReferenceTools(SkillFileParser skillFile, ToolRegistry toolRegistry) {
+        var skillTools = skillFile.listItems("Tools");
+        if (skillTools.isEmpty()) {
+            return;
+        }
+        var registeredNames = toolRegistry.allTools().stream()
+                .map(t -> t.name())
+                .toList();
+        for (var skillTool : skillTools) {
+            // Extract tool name (before any ":" or description)
+            var toolName = skillTool.contains(":") ? skillTool.split(":")[0].trim() : skillTool.trim();
+            if (!registeredNames.contains(toolName)) {
+                logger.warn("Skill file declares tool '{}' but no matching @AiTool method found", toolName);
+            }
+        }
+    }
+
+    private AiMetrics resolveMetrics() {
+        try {
+            var metrics = ServiceLoader.load(AiMetrics.class).findFirst().orElse(AiMetrics.NOOP);
+            if (metrics != AiMetrics.NOOP) {
+                logger.info("Auto-detected AiMetrics: {}", metrics.getClass().getName());
+            }
+            return metrics;
+        } catch (Exception | NoClassDefFoundError | java.util.ServiceConfigurationError e) {
+            logger.debug("AiMetrics provider not available: {}", e.getMessage());
+            return AiMetrics.NOOP;
+        }
+    }
+
+    private void registerA2a(AtmosphereFramework framework, Agent annotation,
+                             SkillFileParser skillFile, CommandRegistry commandRegistry,
+                             CommandRouter commandRouter,
+                             Object promptTarget, Method promptMethod,
+                             org.atmosphere.ai.AiPipeline pipeline,
+                             String basePath, List<String> protocols) {
+        if (!ClasspathDetector.hasA2a()) {
+            return;
+        }
+        try {
+            var skills = buildSkills(skillFile, commandRegistry);
+            var guardrails = skillFile.listItems("Guardrails");
+            var a2aEndpoint = annotation.endpoint().isEmpty()
+                    ? basePath + "/a2a" : annotation.endpoint();
+            java.util.List<org.atmosphere.a2a.types.AgentExtension> extensions = null;
+            if (!guardrails.isEmpty()) {
+                extensions = java.util.List.of(new org.atmosphere.a2a.types.AgentExtension(
+                        org.atmosphere.a2a.types.AgentExtension.GUARDRAILS_URI,
+                        "Atmosphere agent guardrails", false,
+                        java.util.Map.of("guardrails", guardrails)));
+            }
+            var capabilities = new org.atmosphere.a2a.types.AgentCapabilities(
+                    true, false, extensions, true);
+            var card = new org.atmosphere.a2a.types.AgentCard(
+                    annotation.name(),
+                    annotation.description().isEmpty() ? skillFile.title() : annotation.description(),
+                    java.util.List.of(new org.atmosphere.a2a.types.AgentInterface(
+                            a2aEndpoint, org.atmosphere.a2a.types.AgentInterface.JSONRPC, "1.0")),
+                    null,
+                    annotation.version().isEmpty() ? AGENT_VERSION : annotation.version(),
+                    null,
+                    capabilities,
+                    null, null, null, null,
+                    skills,
+                    null, null);
+            card = A2aCardDecorations.advertiseSecurity(card, framework);
+            card = A2aCardDecorations.signIfEnabled(card, framework, annotation.name());
+            var pushOn = A2aCardDecorations.pushEnabled(framework);
+            if (pushOn) {
+                card = A2aCardDecorations.advertisePush(card);
+            }
+
+            var registry = new org.atmosphere.a2a.registry.A2aRegistry();
+
+            // Register executable skill handlers so A2A message/send can find them
+            var bridge = new SkillBridge(commandRouter, promptTarget, promptMethod);
+            bridge.setPipeline(pipeline);
+            var handleCmdMethod = SkillBridge.class.getDeclaredMethod(
+                    "handleCommand", org.atmosphere.a2a.runtime.TaskContext.class, String.class);
+            for (var cmd : commandRegistry.allCommands()) {
+                var skillId = "command" + cmd.prefix().replace("/", "_");
+                var cmdBridge = new SkillBridge(bridge, cmd.prefix());
+                registry.registerSkill(
+                        skillId, cmd.prefix(),
+                        cmd.description().isEmpty() ? "Execute " + cmd.prefix() : cmd.description(),
+                        List.of("command"), handleCmdMethod, cmdBridge,
+                        List.of(new org.atmosphere.a2a.registry.A2aRegistry.ParamEntry(
+                                "message", "Command arguments", false, String.class)));
+            }
+            var handlePromptMethod = SkillBridge.class.getDeclaredMethod(
+                    "handlePrompt", org.atmosphere.a2a.runtime.TaskContext.class, String.class);
+            registry.registerSkill(
+                    "default", "Natural Language",
+                    "Process natural language messages via the agent's prompt handler",
+                    List.of("nlp"), handlePromptMethod, bridge,
+                    List.of(new org.atmosphere.a2a.registry.A2aRegistry.ParamEntry(
+                            "message", "The message to process", true, String.class)));
+
+            var taskManager = new org.atmosphere.a2a.runtime.TaskManager();
+            var protocolHandler = new org.atmosphere.a2a.runtime.A2aProtocolHandler(
+                    registry, taskManager, card);
+            // Raw @AgentSkill handlers are invoked reflectively and never reach
+            // AiPipeline's pre-admission loop; the framework reference lets the
+            // handler resolve the installed governance chain.
+            protocolHandler.setFramework(framework);
+            if (pushOn) {
+                A2aCardDecorations.wirePush(framework, protocolHandler, taskManager, annotation.name());
+            }
+            var a2aHandler = new org.atmosphere.a2a.runtime.A2aHandler(protocolHandler);
+
+            var a2aPath = annotation.endpoint().isEmpty() ? basePath + "/a2a" : annotation.endpoint();
+            framework.addAtmosphereHandler(a2aPath, a2aHandler, new java.util.ArrayList<>());
+            A2aCardDecorations.warnIfUnauthenticated(framework, a2aPath, annotation.name());
+            protocols.add("a2a");
+            logger.debug("A2A endpoint registered at {} with {} skills ({} executable)",
+                    a2aPath, skills.size(), registry.skills().size());
+        } catch (Exception e) {
+            logger.warn("Failed to register A2A endpoint for agent: {}", e.getMessage());
+        }
+    }
+
+    private List<org.atmosphere.a2a.types.AgentSkill> buildSkills(
+            SkillFileParser skillFile, CommandRegistry commandRegistry) {
+        var skills = new java.util.ArrayList<org.atmosphere.a2a.types.AgentSkill>();
+
+        // Skills from skill.md
+        for (var item : skillFile.listItems("Skills")) {
+            skills.add(new org.atmosphere.a2a.types.AgentSkill(
+                    slugify(item), item, item, List.of()));
+        }
+
+        // Commands as skills
+        for (var cmd : commandRegistry.allCommands()) {
+            skills.add(new org.atmosphere.a2a.types.AgentSkill(
+                    "command" + cmd.prefix().replace("/", "_"),
+                    cmd.prefix(),
+                    cmd.description().isEmpty() ? "Execute " + cmd.prefix() : cmd.description(),
+                    List.of("command")));
+        }
+
+        return List.copyOf(skills);
+    }
+
+    /**
+     * Registers the agent's {@code @AiTool} methods as MCP tools via
+     * programmatic registration into an MCP registry. The MCP endpoint is
+     * registered at {@code basePath + "/mcp"}.
+     *
+     * <p>All MCP type references live in {@code McpAgentRegistration}, which
+     * is loaded reflectively only when {@link ClasspathDetector#hasMcp()}
+     * succeeds — so samples that depend on {@code atmosphere-agent} without
+     * the optional {@code atmosphere-mcp} dependency never link any MCP
+     * symbols.</p>
+     */
+    private void registerMcp(AtmosphereFramework framework, Agent annotation,
+                              SkillFileParser skillFile, ToolRegistry toolRegistry,
+                              String basePath, List<String> protocols) {
+        registerMcpAt(framework, annotation, toolRegistry, null, basePath + "/mcp",
+                skillFile.listItems("Guardrails"), protocols);
+    }
+
+    private void registerMcpAt(AtmosphereFramework framework, Agent annotation,
+                                ToolRegistry toolRegistry, Object instance,
+                                String mcpPath, List<String> protocols) {
+        registerMcpAt(framework, annotation, toolRegistry, instance, mcpPath,
+                List.of(), protocols);
+    }
+
+    private void registerMcpAt(AtmosphereFramework framework, Agent annotation,
+                                ToolRegistry toolRegistry, Object instance,
+                                String mcpPath, List<String> guardrails,
+                                List<String> protocols) {
+        if (!ClasspathDetector.hasMcp()) {
+            logger.debug("MCP not on classpath; skipping MCP registration for agent '{}'",
+                    annotation.name());
+            return;
+        }
+        try {
+            // Load the MCP bridge reflectively so AgentProcessor.class never
+            // carries symbolic references to org.atmosphere.mcp.* — otherwise
+            // linking this class would NoClassDefFoundError on samples that
+            // omit the optional atmosphere-mcp dependency.
+            var bridge = Class.forName(
+                    "org.atmosphere.agent.processor.McpAgentRegistration",
+                    true, Thread.currentThread().getContextClassLoader());
+            var register = bridge.getDeclaredMethod("register",
+                    AtmosphereFramework.class, String.class, String.class,
+                    ToolRegistry.class, Object.class, String.class,
+                    List.class, List.class);
+            register.setAccessible(true);
+            var version = annotation.version().isEmpty() ? AGENT_VERSION : annotation.version();
+            register.invoke(null, framework, annotation.name(), version,
+                    toolRegistry, instance, mcpPath, guardrails, protocols);
+        } catch (ClassNotFoundException e) {
+            logger.debug("MCP bridge class not loadable; skipping MCP registration for agent '{}'",
+                    annotation.name());
+        } catch (ReflectiveOperationException e) {
+            var cause = e.getCause() != null ? e.getCause() : e;
+            logger.warn("Failed to register MCP endpoint for agent '{}': {}",
+                    annotation.name(), cause.getMessage());
+        }
+    }
+
+    /**
+     * Registers an AG-UI endpoint that bridges the agent's {@code @Prompt}
+     * method into the AG-UI SSE protocol. The endpoint is registered at
+     * {@code basePath + "/agui"}.
+     */
+    private void registerAgUi(AtmosphereFramework framework,
+                               Object promptTarget, Method promptMethod,
+                               String basePath,
+                               org.atmosphere.ai.AiPipeline pipeline,
+                               List<String> protocols) {
+        if (!ClasspathDetector.hasAgUi()) {
+            return;
+        }
+        try {
+            var bridge = new AgUiAgentBridge(promptTarget, promptMethod);
+            var actionMethod = AgUiAgentBridge.class.getDeclaredMethod(
+                    "onAction",
+                    org.atmosphere.agui.runtime.RunContext.class,
+                    org.atmosphere.ai.StreamingSession.class);
+
+            var handler = new org.atmosphere.agui.runtime.AgUiHandler(
+                    bridge, actionMethod, pipeline);
+            framework.addAtmosphereHandler(basePath + "/agui", handler, new java.util.ArrayList<>());
+            protocols.add("ag-ui");
+            org.atmosphere.ai.bridge.ProtocolBridgeRegistry.install(
+                    framework.getAtmosphereConfig().properties(),
+                    new org.atmosphere.agui.bridge.AgUiProtocolBridge(framework));
+            logger.debug("AG-UI endpoint registered at {}/agui", basePath);
+        } catch (Exception e) {
+            logger.warn("Failed to register AG-UI endpoint for agent: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Bridge between the agent's {@code @Prompt} method and the AG-UI
+     * {@link org.atmosphere.agui.runtime.RunContext}-based action protocol.
+     * Only loaded when atmosphere-agui is on the classpath.
+     */
+    // Public so the AG-UI handler (a sibling module, org.atmosphere.agui.runtime)
+    // can reflectively invoke onAction across the package/module boundary —
+    // a public method on a package-private class is not cross-package accessible.
+    public static class AgUiAgentBridge {
+        private final org.atmosphere.ai.processor.PromptMethodInvoker promptInvoker;
+
+        AgUiAgentBridge(Object promptTarget, Method promptMethod) {
+            // Shared @Prompt dispatch seam — same binding (and @SandboxTool
+            // scope) as the web path, so AG-UI keeps Mode Parity (#7) for
+            // prompt methods with framework-injected parameters.
+            this.promptInvoker = org.atmosphere.ai.processor.PromptMethodInvoker
+                    .forMethod(promptTarget, promptMethod);
+        }
+
+        @SuppressWarnings("unused") // invoked reflectively by AgUiHandler
+        public void onAction(org.atmosphere.agui.runtime.RunContext context,
+                             org.atmosphere.ai.StreamingSession session) {
+            var message = context.lastUserMessage();
+            if (message != null && !message.isBlank()) {
+                try {
+                    promptInvoker.invoke(message, session, null, java.util.Map.of());
+                } catch (java.lang.reflect.InvocationTargetException e) {
+                    session.error(e.getCause() != null ? e.getCause() : e);
+                } catch (Exception e) {
+                    session.error(e);
+                }
+            } else {
+                session.complete();
+            }
+        }
+    }
+
+    /**
+     * Bridge between A2A skill execution and the agent's command/prompt handling.
+     * Each command skill gets its own bridge instance with the command prefix,
+     * while the default NL skill delegates to the {@code @Prompt} method.
+     */
+    static class SkillBridge implements org.atmosphere.a2a.runtime.PipelineBackedSkill {
+        private final CommandRouter commandRouter;
+        private final org.atmosphere.ai.processor.PromptMethodInvoker promptInvoker;
+        private final String commandPrefix;
+        private volatile org.atmosphere.ai.AiPipeline pipeline;
+
+        /** Primary constructor for the default (NL) bridge. */
+        SkillBridge(CommandRouter commandRouter, Object promptTarget, Method promptMethod) {
+            this.commandRouter = commandRouter;
+            // Shared @Prompt dispatch seam — same binding (and @SandboxTool
+            // scope) as the web path, so A2A keeps Mode Parity (#7) for
+            // prompt methods with framework-injected parameters.
+            this.promptInvoker = org.atmosphere.ai.processor.PromptMethodInvoker
+                    .forMethod(promptTarget, promptMethod);
+            this.commandPrefix = null;
+        }
+
+        /** Command-specific constructor that wraps a parent bridge with a fixed prefix. */
+        SkillBridge(SkillBridge parent, String commandPrefix) {
+            this.commandRouter = parent.commandRouter;
+            this.promptInvoker = parent.promptInvoker;
+            this.commandPrefix = commandPrefix;
+            this.pipeline = parent.pipeline;
+        }
+
+        /** Set the AI pipeline for stream() delegation. */
+        void setPipeline(org.atmosphere.ai.AiPipeline pipeline) {
+            this.pipeline = pipeline;
+        }
+
+        /**
+         * Handles an A2A skill invocation for a command. Prepends the command prefix
+         * and routes through the CommandRouter.
+         */
+        @SuppressWarnings("unused") // invoked reflectively by A2aProtocolHandler
+        public void handleCommand(org.atmosphere.a2a.runtime.TaskContext taskCtx, String message) {
+            var fullMessage = message != null && !message.isBlank()
+                    ? commandPrefix + " " + message : commandPrefix;
+            var result = commandRouter.route(taskCtx.taskId(), fullMessage);
+            switch (result) {
+                case CommandResult.Executed exec ->
+                        taskCtx.complete(exec.response());
+                case CommandResult.ConfirmationRequired confirm ->
+                        taskCtx.complete(confirm.prompt());
+                case CommandResult.NotACommand ignored ->
+                        taskCtx.fail("Command not recognized: " + commandPrefix);
+            }
+        }
+
+        /**
+         * Handles an A2A skill invocation for natural-language messages by delegating
+         * to the agent's {@code @Prompt} method.
+         */
+        @SuppressWarnings("unused") // invoked reflectively by A2aProtocolHandler
+        public void handlePrompt(org.atmosphere.a2a.runtime.TaskContext taskCtx, String message) {
+            if (message == null || message.isBlank()) {
+                taskCtx.fail("Empty message");
+                return;
+            }
+
+            // Fast-path: if the incoming A2A message is an @RequiresApproval
+            // protocol response ("/__approval/<id>/approve"), route it through
+            // the pipeline's ApprovalRegistry to unpark the waiting virtual
+            // thread from a previous tool-gated invocation, rather than
+            // dispatching it as a new prompt. Without this, clients using A2A
+            // would see every tool-gated call time out.
+            if (pipeline != null
+                    && org.atmosphere.ai.approval.ApprovalRegistry.isApprovalMessage(message)
+                    && pipeline.tryResolveApproval(message)) {
+                taskCtx.complete("");
+                return;
+            }
+
+            try {
+                // For A2A we capture the output synchronously by invoking with
+                // a simple adapter that collects the response text; the shared
+                // invoker binds it to the @Prompt method's StreamingSession
+                // parameter (there is no AtmosphereResource on this path).
+                var collector = new A2aStreamCollector(taskCtx, pipeline);
+                promptInvoker.invoke(message, collector, null, java.util.Map.of());
+                collector.awaitAndFinalize(120_000L);
+            } catch (java.lang.reflect.InvocationTargetException e) {
+                var cause = e.getCause() != null ? e.getCause() : e;
+                taskCtx.fail(cause.getMessage());
+            } catch (Exception e) {
+                taskCtx.fail(e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Thin nested alias over
+     * {@link org.atmosphere.a2a.runtime.A2aStreamCollector}, kept only so
+     * call sites inside this file can write {@code new A2aStreamCollector(...)}
+     * without importing the fully-qualified shared base. The real concurrency,
+     * finalization, and error semantics live in the shared base — previously
+     * this class and {@code CoordinatorProcessor.A2aCoordinatorCollector} were
+     * copy-paste clones with divergent thread-safety.
+     */
+    static final class A2aStreamCollector extends org.atmosphere.a2a.runtime.A2aStreamCollector {
+        A2aStreamCollector(org.atmosphere.a2a.runtime.TaskContext taskCtx,
+                           org.atmosphere.ai.AiPipeline pipeline) {
+            super(taskCtx, pipeline);
+        }
+    }
+
+    /**
+     * Registers the agent's CommandRouter, system prompt, and AI pipeline with
+     * ChannelAiBridge via reflection. Multiple agents can register; commands
+     * route in registration order (first match wins). NL messages go through
+     * the first registered agent's pipeline.
+     */
+    private void wireChannelBridge(String agentName, CommandRouter commandRouter,
+                                    Object instance, String systemPrompt,
+                                    org.atmosphere.ai.AiPipeline pipeline,
+                                    List<String> channels, List<String> protocols) {
+        if (!ClasspathDetector.hasChannels()) {
+            return;
+        }
+        try {
+            var bridgeClass = Class.forName("org.atmosphere.channels.ChannelAiBridge",
+                    true, Thread.currentThread().getContextClassLoader());
+
+            var register = bridgeClass.getMethod("registerAgent",
+                    String.class, Object.class, Object.class,
+                    String.class, Object.class, List.class);
+            register.invoke(null, agentName, commandRouter, instance,
+                    systemPrompt, pipeline, channels);
+
+            protocols.add("channels");
+            logger.debug("Agent '{}' registered with ChannelAiBridge for channel integration", agentName);
+        } catch (ClassNotFoundException e) {
+            logger.debug("ChannelAiBridge not on classpath, skipping channel integration");
+        } catch (Exception e) {
+            logger.warn("Failed to register agent '{}' with ChannelAiBridge: {}", agentName, e.getMessage());
+        }
+    }
+
+    private String slugify(String text) {
+        return text.toLowerCase()
+                .replaceAll("[^a-z0-9]+", "-")
+                .replaceAll("^-|-$", "");
+    }
+
+    private static String resolveModuleVersion() {
+        try (var stream = AgentProcessor.class.getResourceAsStream(
+                "/META-INF/maven/org.atmosphere/atmosphere-agent/pom.properties")) {
+            if (stream != null) {
+                var props = new java.util.Properties();
+                props.load(stream);
+                var version = props.getProperty("version");
+                if (version != null && !version.isBlank()) {
+                    return version;
+                }
+            }
+        } catch (Exception e) {
+            // fall through
+        }
+        return "1.0.0";
+    }
+}

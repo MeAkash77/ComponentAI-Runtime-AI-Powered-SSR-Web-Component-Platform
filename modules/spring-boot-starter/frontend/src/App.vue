@@ -1,0 +1,515 @@
+<script setup lang="ts">
+import { ref, computed, onMounted } from 'vue'
+import ChatContainer from './components/ChatContainer.vue'
+import GovernancePolicies from './components/GovernancePolicies.vue'
+import GovernanceDecisions from './components/GovernanceDecisions.vue'
+import GovernanceOwasp from './components/GovernanceOwasp.vue'
+import GovernanceCommitments from './components/GovernanceCommitments.vue'
+import Sessions from './components/Sessions.vue'
+import Workspace from './components/Workspace.vue'
+import Interactions from './components/Interactions.vue'
+import Validation from './components/Validation.vue'
+import Checkpoints from './components/Checkpoints.vue'
+import Rooms from './components/Rooms.vue'
+import Observability from './components/Observability.vue'
+import Tape from './components/Tape.vue'
+import McpApps from './components/McpApps.vue'
+import { livePlan } from './lib/workspaceStore'
+import type { FleetAgent, FleetInfo } from './lib/fleet'
+import type { ConsoleTransportName } from './transports'
+import logoUrl from './assets/logo.svg'
+
+type Tab = 'chat' | 'sessions' | 'workspace' | 'interactions' | 'validation' | 'checkpoints' | 'tape' | 'apps' | 'rooms' | 'observability' | 'policies' | 'decisions' | 'owasp' | 'commitments'
+
+const subtitle = ref('')
+const endpoint = ref('/atmosphere/ai-chat')
+// 'ai' is the safe default — the bundled console is AI-shaped. Server picks
+// 'broadcast' for endpoints whose registered handler is not in the
+// org.atmosphere.{ai,agent,coordinator} packages (e.g. @ManagedService chats
+// in spring-boot-mcp-server / spring-boot-otel-chat).
+const mode = ref<'ai' | 'broadcast'>('ai')
+// Wire transport for the chat connection. 'atmosphere' (WS + long-polling)
+// unless the sample opts into a foreign protocol via
+// atmosphere.console-transport — value is server-validated
+// (AtmosphereConsoleInfoEndpoint#detectTransport), so only known names arrive.
+const transport = ref<ConsoleTransportName>('atmosphere')
+// HTTP/3 sidecar coordinates — present only when the server confirmed a live
+// WebTransport bind; the chat then connects WT-first with WS fallback.
+const webTransport = ref<{ port: number; certificateHash?: string } | undefined>(undefined)
+// Room Protocol room the chat joins (presence + history-synced reconnects).
+const room = ref<string | undefined>(undefined)
+// Selectable endpoints (path-templated samples): picker before connecting.
+const endpointOptions = ref<Array<{ label: string; endpoint: string }>>([])
+const pickedEndpoint = ref<string | undefined>(undefined)
+const ready = ref(false)
+const activeTab = ref<Tab>('chat')
+// The live MCP endpoint, when one is registered — enables the MCP Apps host tab.
+const mcpEndpoint = ref<string | null>(null)
+const mcpSandboxOrigin = ref<string | null>(null)
+const governanceAvailable = ref(false)
+const governancePolicyCount = ref<number | null>(null)
+const agentsAvailable = ref(false)
+const workspaceAvailable = ref(false)
+const interactionsAvailable = ref(false)
+const validationAvailable = ref(false)
+const checkpointsAvailable = ref(false)
+const tapeAvailable = ref(false)
+const roomsAvailable = ref(false)
+const actuatorAvailable = ref(false)
+// Metrics read plane, as the server resolved it: the path it confirmed
+// responds plus the wire format served there (actuator JSON on Spring Boot,
+// Prometheus text on Quarkus). Both stay undefined unless the server said so,
+// so the Observability tab never guesses a URL or a parser.
+const metricsPath = ref<string | undefined>(undefined)
+const metricsFormat = ref<'actuator' | 'prometheus' | undefined>(undefined)
+
+async function probeGovernance() {
+  try {
+    const res = await fetch('/api/admin/governance/summary', {
+      headers: { Accept: 'application/json' },
+    })
+    if (!res.ok) return
+    const data = await res.json()
+    governanceAvailable.value = true
+    governancePolicyCount.value = typeof data.policyCount === 'number'
+      ? data.policyCount : null
+  } catch {
+    // /api/admin/governance/summary not wired — hide the governance tabs.
+  }
+}
+
+async function probeAgents() {
+  try {
+    const res = await fetch('/api/admin/agents', { headers: { Accept: 'application/json' } })
+    if (res.ok) {
+      agentsAvailable.value = true
+      // A coordinator fleet is the runtime-truth roster for the multi-agent
+      // welcome screen + activity strip. Only fetched behind the successful
+      // agents probe, so slim samples never see a 404.
+      await fetchFleet()
+    }
+  } catch {
+    // /api/admin/agents not wired — hide the Sessions tab.
+  }
+}
+
+const fleet = ref<FleetInfo | undefined>(undefined)
+
+async function fetchFleet() {
+  try {
+    const res = await fetch('/api/admin/coordinators', { headers: { Accept: 'application/json' } })
+    if (!res.ok) return
+    const coordinators = await res.json() as Array<{ name?: string }>
+    const first = Array.isArray(coordinators) ? coordinators[0]?.name : undefined
+    if (!first) return
+    const detail = await fetch(`/api/admin/coordinators/${encodeURIComponent(first)}/fleet`,
+      { headers: { Accept: 'application/json' } })
+    if (!detail.ok) return
+    const data = await detail.json() as { name?: string; agents?: FleetAgent[] }
+    if (data?.agents?.length) {
+      fleet.value = { name: data.name ?? first, agents: data.agents }
+    }
+  } catch {
+    // No coordinator fleet — the chat renders its regular empty state.
+  }
+}
+
+async function probeWorkspace() {
+  // The Workspace tab shows only when at least one plan / filesystem surface
+  // genuinely attached — the owners list is populated by the harness attach
+  // engines at registration time, never from config intent (Runtime Truth).
+  // Only called when the console-info harness block exists AND the agents
+  // probe succeeded, which together guarantee the endpoint is mapped — so
+  // this fetch can never 404-spam the browser console on slim samples.
+  try {
+    const res = await fetch('/api/admin/workspace/owners', {
+      headers: { Accept: 'application/json' },
+    })
+    if (res.ok) {
+      const list = await res.json()
+      workspaceAvailable.value = Array.isArray(list) && list.length > 0
+    }
+  } catch {
+    // /api/admin/workspace/owners not wired — hide the Workspace tab.
+  }
+}
+
+// Interactions + Validation availability are read from /api/console/info's
+// runtime-resolved capability flags (hasInteractions / hasVerifier) in
+// onMounted — NOT probed. A speculative fetch to /api/interactions or
+// /api/admin/verifier/summary on a sample without those modules returns 404,
+// which the browser logs as a red console error that JS cannot suppress.
+// Gating on the server-confirmed flag keeps the console quiet (Runtime Truth).
+
+// The Workspace tab renders when a plan / filesystem surface is browsable via
+// the admin API, or as soon as a live plan-update event arrived on the chat
+// connection (covers deployments whose admin reads are token-gated).
+const workspaceVisible = computed(() =>
+  workspaceAvailable.value || livePlan.value !== null)
+
+const tabs = computed(() => {
+  const list: Array<{ id: Tab; label: string; badge?: string }> = [
+    { id: 'chat', label: 'Chat' },
+  ]
+  if (agentsAvailable.value) {
+    list.push({ id: 'sessions', label: 'Sessions' })
+  }
+  if (workspaceVisible.value) {
+    list.push({ id: 'workspace', label: 'Workspace' })
+  }
+  if (interactionsAvailable.value) {
+    list.push({ id: 'interactions', label: 'Interactions' })
+  }
+  if (validationAvailable.value) {
+    list.push({ id: 'validation', label: 'Validation' })
+  }
+  if (checkpointsAvailable.value) {
+    list.push({ id: 'checkpoints', label: 'Checkpoints' })
+  }
+  if (tapeAvailable.value) {
+    list.push({ id: 'tape', label: 'Tape' })
+  }
+  if (mcpEndpoint.value) {
+    list.push({ id: 'apps', label: 'MCP Apps' })
+  }
+  if (roomsAvailable.value) {
+    list.push({ id: 'rooms', label: 'Rooms' })
+  }
+  // Either plane on its own is worth the tab: Quarkus publishes metrics with
+  // no actuator health endpoint, and a Spring host can expose health while
+  // keeping metrics off the web exposure list.
+  if (actuatorAvailable.value || metricsPath.value) {
+    list.push({ id: 'observability', label: 'Observability' })
+  }
+  if (governanceAvailable.value) {
+    list.push({
+      id: 'policies',
+      label: 'Policies',
+      badge: governancePolicyCount.value !== null
+        ? String(governancePolicyCount.value) : undefined,
+    })
+    list.push({ id: 'decisions', label: 'Decisions' })
+    list.push({ id: 'commitments', label: 'Commitments' })
+    list.push({ id: 'owasp', label: 'OWASP' })
+  }
+  return list
+})
+
+onMounted(async () => {
+  // Truthy only when the harness preset genuinely ran on this server — the
+  // console-info harness block is runtime state, not config intent. Used to
+  // gate the workspace probe below.
+  let harnessPresent = false
+  let adminDeclaredAbsent = false
+  let workspaceDeclaredAbsent = false
+  try {
+    const res = await fetch('/api/console/info')
+    if (res.ok) {
+      const data = await res.json()
+      if (data.subtitle) subtitle.value = data.subtitle
+      if (data.endpoint) endpoint.value = data.endpoint
+      if (data.mode === 'broadcast' || data.mode === 'ai') mode.value = data.mode
+      // Narrow to the known adapter names — the server already validates,
+      // but the frontend must not trust the wire (Boundary Safety).
+      if (data.transport === 'grpc' || data.transport === 'a2a'
+          || data.transport === 'ag-ui' || data.transport === 'atmosphere') {
+        transport.value = data.transport
+      }
+      if (data.webTransport && typeof data.webTransport.port === 'number') {
+        webTransport.value = {
+          port: data.webTransport.port,
+          ...(typeof data.webTransport.certificateHash === 'string'
+            ? { certificateHash: data.webTransport.certificateHash } : {}),
+        }
+      }
+      if (typeof data.room === 'string' && data.room) room.value = data.room
+      if (Array.isArray(data.endpointOptions)) {
+        endpointOptions.value = data.endpointOptions.filter(
+          (o: { label?: unknown; endpoint?: unknown }) =>
+            typeof o?.label === 'string' && typeof o?.endpoint === 'string'
+            && (o.endpoint as string).startsWith('/'))
+      }
+      if (data.mcpEndpoint) mcpEndpoint.value = data.mcpEndpoint
+      if (data.mcpSandboxOrigin) mcpSandboxOrigin.value = data.mcpSandboxOrigin
+      // Runtime-resolved capability flags — gate the optional tabs without a
+      // 404-producing probe. Absent/false means the module isn't wired here.
+      interactionsAvailable.value = data.hasInteractions === true
+      validationAvailable.value = data.hasVerifier === true
+      checkpointsAvailable.value = data.hasCheckpoints === true
+      tapeAvailable.value = data.hasTape === true
+      roomsAvailable.value = data.hasRooms === true
+      actuatorAvailable.value = data.hasActuator === true
+      // Only accept a path the server itself resolved, and only the two
+      // formats the console ships a parser for (Boundary Safety — the
+      // frontend must not trust the wire even when the server validates).
+      if (data.hasMetrics === true && typeof data.metricsPath === 'string'
+          && data.metricsPath.startsWith('/')
+          && (data.metricsFormat === 'actuator' || data.metricsFormat === 'prometheus')) {
+        metricsPath.value = data.metricsPath
+        metricsFormat.value = data.metricsFormat
+      } else if (data.hasMetrics === undefined && data.hasActuator === true) {
+        // Compatibility with servers predating the metricsPath field: the
+        // actuator health plane is live, and its metrics endpoint is where it
+        // has always been. Newer servers always send the explicit fields, so
+        // this branch never runs against a host that can describe itself.
+        metricsPath.value = '/actuator/metrics'
+        metricsFormat.value = 'actuator'
+      }
+      // hasAdmin === false means the host declared it has no admin read
+      // plane — skip the legacy governance/agents probes so bare-Jetty and
+      // similar hosts never see 404 noise. Absent flag = probe (older
+      // servers, the Quarkus admin extension). hasWorkspace === false
+      // likewise suppresses the workspace probe (Quarkus lacks the route).
+      adminDeclaredAbsent = data.hasAdmin === false
+      workspaceDeclaredAbsent = data.hasWorkspace === false
+      harnessPresent = data.harness != null && typeof data.harness === 'object'
+    }
+  } catch {
+    // Console info not available — use defaults
+  }
+  if (!adminDeclaredAbsent) {
+    await Promise.all([probeGovernance(), probeAgents()])
+  }
+  // harness block ⇒ atmosphere-ai (and the workspace endpoint class) is on
+  // the classpath; agents probe OK ⇒ the AtmosphereAdmin bean is live. Both
+  // together mean /api/admin/workspace/owners is mapped — no 404 probe spam.
+  if (harnessPresent && agentsAvailable.value && !workspaceDeclaredAbsent) {
+    await probeWorkspace()
+  }
+  ready.value = true
+})
+</script>
+
+<template>
+  <div class="app">
+    <header class="app-header">
+      <div class="header-content">
+        <img :src="logoUrl" alt="Atmosphere" class="header-logo" />
+        <div class="header-titles">
+          <h1 class="header-title">Atmosphere AI Console</h1>
+          <span v-if="subtitle" class="header-subtitle">{{ subtitle }}</span>
+        </div>
+        <span class="header-badge">v4</span>
+      </div>
+      <nav v-if="ready && tabs.length > 1" class="tab-nav" data-testid="console-tabs">
+        <button
+          v-for="tab in tabs"
+          :key="tab.id"
+          :class="['tab-btn', { active: activeTab === tab.id }]"
+          @click="activeTab = tab.id"
+          :data-testid="`tab-${tab.id}`"
+        >
+          {{ tab.label }}
+          <span v-if="tab.badge !== undefined" class="tab-badge">{{ tab.badge }}</span>
+        </button>
+      </nav>
+    </header>
+    <main class="app-main">
+      <!-- Path-templated samples pick their room-endpoint before connecting -->
+      <div v-if="ready && activeTab === 'chat' && endpointOptions.length > 0 && !pickedEndpoint"
+           class="endpoint-picker" data-testid="endpoint-picker">
+        <p class="picker-title">Pick a room</p>
+        <div class="picker-cards">
+          <button v-for="opt in endpointOptions" :key="opt.endpoint" class="picker-card"
+                  :data-testid="`pick-${opt.label.toLowerCase()}`"
+                  @click="pickedEndpoint = opt.endpoint">
+            {{ opt.label }}
+          </button>
+        </div>
+      </div>
+      <ChatContainer v-else-if="ready && activeTab === 'chat'"
+                     :key="pickedEndpoint ?? endpoint"
+                     :endpoint="pickedEndpoint ?? endpoint" :mode="mode" :transport="transport"
+                     :web-transport="webTransport" :fleet="fleet" :room="room" />
+      <Sessions v-if="ready && agentsAvailable" v-show="activeTab === 'sessions'"
+                :active="activeTab === 'sessions'" />
+      <Workspace v-if="ready && workspaceVisible" v-show="activeTab === 'workspace'"
+                 :active="activeTab === 'workspace'" />
+      <Interactions v-if="ready && interactionsAvailable" v-show="activeTab === 'interactions'"
+                    :active="activeTab === 'interactions'" />
+      <Validation v-if="ready && validationAvailable" v-show="activeTab === 'validation'"
+                  :active="activeTab === 'validation'" />
+      <Checkpoints v-if="ready && checkpointsAvailable" v-show="activeTab === 'checkpoints'"
+                   :active="activeTab === 'checkpoints'" />
+      <Tape v-if="ready && tapeAvailable" v-show="activeTab === 'tape'"
+            :active="activeTab === 'tape'" />
+      <McpApps v-if="ready && mcpEndpoint" v-show="activeTab === 'apps'"
+               :endpoint="mcpEndpoint" :active="activeTab === 'apps'"
+               :sandbox-origin="mcpSandboxOrigin ?? undefined" />
+      <Rooms v-if="ready && roomsAvailable" v-show="activeTab === 'rooms'"
+             :active="activeTab === 'rooms'" />
+      <Observability v-if="ready && (actuatorAvailable || metricsPath)"
+                     v-show="activeTab === 'observability'"
+                     :active="activeTab === 'observability'"
+                     :health-path="actuatorAvailable ? '/actuator/health' : undefined"
+                     :metrics-path="metricsPath" :metrics-format="metricsFormat" />
+      <GovernancePolicies v-if="ready" v-show="activeTab === 'policies'"
+                          :active="activeTab === 'policies'" />
+      <GovernanceDecisions v-if="ready" v-show="activeTab === 'decisions'"
+                           :active="activeTab === 'decisions'" />
+      <GovernanceCommitments v-if="ready" v-show="activeTab === 'commitments'"
+                             :active="activeTab === 'commitments'" />
+      <GovernanceOwasp v-if="ready" v-show="activeTab === 'owasp'"
+                       :active="activeTab === 'owasp'" />
+    </main>
+  </div>
+</template>
+
+<style scoped>
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: var(--bg-primary);
+}
+
+.app-header {
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-surface);
+  padding: 0 1.5rem;
+  min-height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.header-content {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.header-logo {
+  width: 28px;
+  height: 28px;
+}
+
+.header-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.header-title {
+  font-size: 1.125rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+  line-height: 1.2;
+}
+
+.header-subtitle {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  font-weight: 400;
+}
+
+.header-badge {
+  font-size: 0.6875rem;
+  font-weight: 600;
+  color: var(--accent-color);
+  background: var(--accent-bg);
+  padding: 0.125rem 0.5rem;
+  border-radius: 9999px;
+  letter-spacing: 0.025em;
+}
+
+.tab-nav {
+  display: flex;
+  align-items: center;
+  gap: 0.125rem;
+}
+
+.tab-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.375rem 0.875rem;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: none;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.12s;
+}
+
+.tab-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.tab-btn.active {
+  background: var(--accent-bg);
+  color: var(--accent-color);
+}
+
+.tab-badge {
+  font-size: 0.6875rem;
+  font-weight: 700;
+  padding: 0.0625rem 0.375rem;
+  border-radius: 9999px;
+  background: var(--border-color);
+  color: var(--text-secondary);
+}
+
+.tab-btn.active .tab-badge {
+  background: var(--accent-color);
+  color: var(--bg-surface);
+}
+
+.app-main {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+.endpoint-picker {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 1rem;
+}
+
+.picker-title {
+  font-size: 1.125rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+.picker-cards {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.picker-card {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--accent-color);
+  background: var(--accent-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  padding: 0.875rem 1.75rem;
+  cursor: pointer;
+  transition: all 0.12s;
+}
+
+.picker-card:hover {
+  background: var(--bg-hover);
+}
+
+/*
+ * All governance views use height: 100% + overflow: auto internally, so
+ * wrapping them in the flex main without forcing a child layout mode keeps
+ * the existing chat layout unchanged.
+ */
+</style>

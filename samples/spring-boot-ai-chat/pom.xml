@@ -1,0 +1,247 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.atmosphere</groupId>
+        <artifactId>atmosphere-project</artifactId>
+        <version>4.0.72-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <groupId>org.atmosphere.samples</groupId>
+    <artifactId>atmosphere-spring-boot-ai-chat</artifactId>
+    <name>atmosphere-spring-boot-ai-chat</name>
+    <description>Real-time AI chat using Atmosphere + OpenAI-compatible APIs (Gemini, Ollama, OpenAI)</description>
+
+    <properties>
+        <!-- Self-contained netty pin: covers samples scaffolded standalone against
+             a released parent POM that may not yet declare netty.version. -->
+        <netty.version>4.2.17.Final</netty.version>
+        <maven.deploy.skip>true</maven.deploy.skip>
+        <atmosphere.starter>atmosphere-spring-boot-starter</atmosphere.starter>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+<!-- netty-bom imported BEFORE spring-boot-dependencies so its
+                 first-wins rule pulls patched netty 4.x for this sample,
+                 overriding Spring Boot's transitively-pinned vulnerable line. -->
+            <dependency>
+                <groupId>io.netty</groupId>
+                <artifactId>netty-bom</artifactId>
+                <version>${netty.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <!-- tools.jackson pinned one patch above Spring Boot 4.1.0's
+                 managed 3.1.4: 3.1.5 closes GHSA-5gvw-p9qm-jgwh
+                 (jackson-databind DoS). Imported BEFORE spring-boot-dependencies
+                 so Maven's first-declared-wins rule takes the patched line. -->
+            <dependency>
+                <groupId>tools.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>3.1.5</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-dependencies</artifactId>
+                <version>${spring-boot.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>${atmosphere.starter}</artifactId>
+        </dependency>
+
+        <!-- @Agent annotation (MultiModalAgent) — the starter pulls atmosphere-agent
+             only as an optional dependency, so the sample declares it explicitly. -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-agent</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-ai</artifactId>
+        </dependency>
+
+        <!-- Durable session tape: brings the crash-durable SqliteTapeStore onto
+             the classpath so atmosphere.ai.tape.store=sqlite records the AI
+             session as a replayable, resumable artifact instead of falling back
+             to the in-memory store. -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-checkpoint</artifactId>
+        </dependency>
+        <!-- SQLite JDBC driver: atmosphere-checkpoint declares it optional (so
+             non-SQLite users don't pull it), so a sample using store=sqlite must
+             bring it explicitly — same contract as SqliteCheckpointStore. -->
+        <dependency>
+            <groupId>org.xerial</groupId>
+            <artifactId>sqlite-jdbc</artifactId>
+            <version>3.53.2.0</version>
+            <scope>runtime</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-channels</artifactId>
+        </dependency>
+
+        <!-- Admin control plane dashboard -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-admin</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-skills</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- Tape lifecycle E2E (record -> admin-read -> replay -> extract). -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>jakarta.inject</groupId>
+            <artifactId>jakarta.inject-api</artifactId>
+        </dependency>
+
+        <!-- WebTransport over HTTP/3 -->
+        <dependency>
+            <groupId>io.projectreactor.netty</groupId>
+            <artifactId>reactor-netty-http</artifactId>
+        </dependency>
+
+        <!-- Parent POM restricts logback to test scope; override for runtime logging -->
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-core</artifactId>
+            <version>${logback-version}</version>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>${logback-version}</version>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- Test: delivery proof that audio input reaches the runtime
+             (MultiModalAudioInputDeliveryTest). Versions managed by the
+             spring-boot-dependencies BOM imported above. -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <version>${spring-boot.version}</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+    <profiles>
+        <!--
+          Native profile mirrors samples/spring-boot-chat, including the
+          maven-shared-utils pin (CI runners' plugin realm no longer inherits it
+          from the Maven distribution). This sample is the native lane's only AI
+          dispatch: the two existing native targets contain zero @AiEndpoint /
+          @Agent call sites, so the lane proved a server could start, never that
+          an agent could run under Native Image.
+        -->
+        <profile>
+            <id>native</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.springframework.boot</groupId>
+                        <artifactId>spring-boot-maven-plugin</artifactId>
+                        <version>${spring-boot.version}</version>
+                        <configuration>
+                            <classifier>exec</classifier>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <id>process-aot</id>
+                                <goals>
+                                    <goal>process-aot</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.graalvm.buildtools</groupId>
+                        <artifactId>native-maven-plugin</artifactId>
+                        <!-- The plugin realm no longer inherits maven-shared-utils from the
+                             Maven distribution on current CI runners; without this pin the
+                             build fails with "A required class was missing ... MessageUtils". -->
+                        <dependencies>
+                            <dependency>
+                                <groupId>org.apache.maven.shared</groupId>
+                                <artifactId>maven-shared-utils</artifactId>
+                                <version>3.4.2</version>
+                            </dependency>
+                        </dependencies>
+                        <configuration>
+                            <mainClass>org.atmosphere.samples.springboot.aichat.AiChatApplication</mainClass>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <id>build-native</id>
+                                <goals>
+                                    <goal>compile-no-fork</goal>
+                                </goals>
+                                <phase>package</phase>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <profile>
+            <id>spring-boot3</id>
+            <properties>
+                <spring-boot.version>3.5.15</spring-boot.version>
+                <netty.version>4.1.137.Final</netty.version>
+                <atmosphere.starter>atmosphere-spring-boot3-starter</atmosphere.starter>
+            </properties>
+        </profile>
+    </profiles>
+</project>

@@ -1,0 +1,226 @@
+{
+  "name": "atmosphere.js",
+  "version": "5.0.46",
+  "description": "Modern TypeScript client for Atmosphere Framework - WebSocket/SSE/Comet support",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      },
+      "types": "./dist/index.d.ts"
+    },
+    "./react": {
+      "import": {
+        "types": "./dist/react.d.ts",
+        "default": "./dist/react.js"
+      },
+      "require": {
+        "types": "./dist/react.d.cts",
+        "default": "./dist/react.cjs"
+      },
+      "types": "./dist/react.d.ts"
+    },
+    "./vue": {
+      "import": {
+        "types": "./dist/vue.d.ts",
+        "default": "./dist/vue.js"
+      },
+      "require": {
+        "types": "./dist/vue.d.cts",
+        "default": "./dist/vue.cjs"
+      },
+      "types": "./dist/vue.d.ts"
+    },
+    "./svelte": {
+      "import": {
+        "types": "./dist/svelte.d.ts",
+        "default": "./dist/svelte.js"
+      },
+      "require": {
+        "types": "./dist/svelte.d.cts",
+        "default": "./dist/svelte.cjs"
+      },
+      "types": "./dist/svelte.d.ts"
+    },
+    "./chat": {
+      "import": {
+        "types": "./dist/chat.d.ts",
+        "default": "./dist/chat.js"
+      },
+      "require": {
+        "types": "./dist/chat.d.cts",
+        "default": "./dist/chat.cjs"
+      },
+      "types": "./dist/chat.d.ts"
+    },
+    "./react-native": {
+      "import": {
+        "types": "./dist/react-native.d.ts",
+        "default": "./dist/react-native.js"
+      },
+      "require": {
+        "types": "./dist/react-native.d.cts",
+        "default": "./dist/react-native.cjs"
+      },
+      "types": "./dist/react-native.d.ts"
+    },
+    "./room": {
+      "import": {
+        "types": "./dist/room.d.ts",
+        "default": "./dist/room.js"
+      },
+      "require": {
+        "types": "./dist/room.d.cts",
+        "default": "./dist/room.cjs"
+      },
+      "types": "./dist/room.d.ts"
+    },
+    "./streaming": {
+      "import": {
+        "types": "./dist/streaming.d.ts",
+        "default": "./dist/streaming.js"
+      },
+      "require": {
+        "types": "./dist/streaming.d.cts",
+        "default": "./dist/streaming.cjs"
+      },
+      "types": "./dist/streaming.d.ts"
+    },
+    "./queue": {
+      "import": {
+        "types": "./dist/queue.d.ts",
+        "default": "./dist/queue.js"
+      },
+      "require": {
+        "types": "./dist/queue.d.cts",
+        "default": "./dist/queue.cjs"
+      },
+      "types": "./dist/queue.d.ts"
+    },
+    "./history": {
+      "import": {
+        "types": "./dist/history.d.ts",
+        "default": "./dist/history.js"
+      },
+      "require": {
+        "types": "./dist/history.d.cts",
+        "default": "./dist/history.cjs"
+      },
+      "types": "./dist/history.d.ts"
+    },
+    "./interactions": {
+      "import": {
+        "types": "./dist/interactions.d.ts",
+        "default": "./dist/interactions.js"
+      },
+      "require": {
+        "types": "./dist/interactions.d.cts",
+        "default": "./dist/interactions.cjs"
+      },
+      "types": "./dist/interactions.d.ts"
+    }
+  },
+  "peerDependencies": {
+    "@react-native-community/netinfo": ">=9.0.0",
+    "react": ">=18.0.0",
+    "react-native": ">=0.70.0",
+    "svelte": ">=4.0.0",
+    "vue": ">=3.3.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "react-native": {
+      "optional": true
+    },
+    "@react-native-community/netinfo": {
+      "optional": true
+    },
+    "vue": {
+      "optional": true
+    },
+    "svelte": {
+      "optional": true
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "dev": "tsup --watch",
+    "build": "npm run clean && tsup && node scripts/build-dts.mjs && node scripts/check-export-types.mjs && npm run verify:types",
+    "verify:types": "tsc -p consumer-check/tsconfig.bundler.json && tsc -p consumer-check/tsconfig.node16.json && tsc -p consumer-check/tsconfig.cjs.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:ui": "vitest --ui",
+    "test:ci": "vitest run --coverage",
+    "lint": "tsc --noEmit && echo 'Lint passed'",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build && npm run test:ci"
+  },
+  "keywords": [
+    "atmosphere",
+    "websocket",
+    "sse",
+    "server-sent-events",
+    "comet",
+    "long-polling",
+    "realtime",
+    "push",
+    "streaming",
+    "async",
+    "typescript",
+    "react-native",
+    "expo"
+  ],
+  "author": "Jeanfrancois Arcand <jfarcand@apache.org>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Atmosphere/atmosphere.git",
+    "directory": "atmosphere.js"
+  },
+  "bugs": {
+    "url": "https://github.com/Atmosphere/atmosphere/issues"
+  },
+  "homepage": "https://github.com/Atmosphere/atmosphere#readme",
+  "overrides": {
+    "esbuild": ">=0.28.1",
+    "nanoid": "^3.3.18"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.2",
+    "@types/node": "^26.0.1",
+    "@types/react": "^19.2.14",
+    "@vitest/coverage-v8": "^4.1.11",
+    "@vitest/ui": "^4.1.11",
+    "eslint": "^10.1.0",
+    "jsdom": "^30.0.1",
+    "prettier": "^3.8.1",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "svelte": "^5.55.7",
+    "tsup": "^8.5.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11",
+    "vue": "^3.5.31"
+  },
+  "dependencies": {
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  }
+}

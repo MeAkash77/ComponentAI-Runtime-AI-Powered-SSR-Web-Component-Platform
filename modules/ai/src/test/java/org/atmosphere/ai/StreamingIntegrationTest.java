@@ -1,0 +1,393 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.ai;
+
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
+import org.atmosphere.cpr.AtmosphereResource;
+import org.atmosphere.cpr.Broadcaster;
+import org.atmosphere.cpr.RawMessage;
+import org.mockito.ArgumentCaptor;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Future;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.mockito.Mockito.*;
+
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Integration tests for the AI streaming SPI — concurrency, multi-session,
+ * and error recovery scenarios.
+ */
+@SuppressWarnings("unchecked")
+public class StreamingIntegrationTest {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    private static String raw(RawMessage msg) {
+        return (String) msg.message();
+    }
+
+    @Test
+    public void testConcurrentStreamingTextSending() throws Exception {
+        var resource = mock(AtmosphereResource.class);
+        when(resource.uuid()).thenReturn("res-1");
+        var broadcaster = mock(Broadcaster.class);
+        when(resource.getBroadcaster()).thenReturn(broadcaster);
+        when(broadcaster.broadcast(any(RawMessage.class), any(Set.class))).thenReturn(mock(Future.class));
+        var session = StreamingSessions.start("concurrent-session", resource);
+
+        int threadCount = 10;
+        int textsPerThread = 100;
+        var latch = new CountDownLatch(threadCount);
+
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (int t = 0; t < threadCount; t++) {
+                executor.submit(() -> {
+                    try {
+                        for (int i = 0; i < textsPerThread; i++) {
+                            session.send("text-" + i);
+                        }
+                    } finally {
+                        latch.countDown();
+                    }
+                });
+            }
+        }
+
+        assertTrue(latch.await(10, TimeUnit.SECONDS), "All threads should complete");
+
+        var captor = ArgumentCaptor.forClass(RawMessage.class);
+        verify(broadcaster, times(threadCount * textsPerThread)).broadcast(captor.capture(), any(Set.class));
+
+        // Verify all sequence numbers are unique
+        Set<Long> seqs = ConcurrentHashMap.newKeySet();
+        for (var msg : captor.getAllValues()) {
+            var json = MAPPER.readTree(raw(msg));
+            assertTrue(seqs.add(json.get("seq").asLong()),
+                    "Sequence number should be unique: " + json.get("seq"));
+        }
+
+        assertEquals(threadCount * textsPerThread, seqs.size());
+    }
+
+    @Test
+    public void testMultipleSessionsSameBroadcaster() throws Exception {
+        var resource = mock(AtmosphereResource.class);
+        when(resource.uuid()).thenReturn("res-1");
+        var broadcaster = mock(Broadcaster.class);
+        when(resource.getBroadcaster()).thenReturn(broadcaster);
+        when(broadcaster.broadcast(any(RawMessage.class), any(Set.class))).thenReturn(mock(Future.class));
+
+        var session1 = StreamingSessions.start("session-1", resource);
+        var session2 = StreamingSessions.start("session-2", resource);
+
+        session1.send("Hello from 1");
+        session2.send("Hello from 2");
+        session1.complete();
+        session2.send("Still going");
+        session2.complete();
+
+        var captor = ArgumentCaptor.forClass(RawMessage.class);
+        verify(broadcaster, times(5)).broadcast(captor.capture(), any(Set.class));
+
+        var messages = captor.getAllValues().stream()
+                .map(m -> {
+                    try {
+                        return MAPPER.readTree(raw(m));
+                    } catch (Exception e) {
+                        fail("Failed to parse JSON: " + m);
+                        return null;
+                    }
+                })
+                .toList();
+
+        // Count messages per session
+        long session1Count = messages.stream()
+                .filter(j -> "session-1".equals(j.get("sessionId").stringValue()))
+                .count();
+        long session2Count = messages.stream()
+                .filter(j -> "session-2".equals(j.get("sessionId").stringValue()))
+                .count();
+
+        assertEquals(2, session1Count, "Session 1 should have 2 messages (streaming text + complete)");
+        assertEquals(3, session2Count, "Session 2 should have 3 messages (2 streaming texts + complete)");
+    }
+
+    @Test
+    public void testSessionIsolation() {
+        var resource1 = mock(AtmosphereResource.class);
+        when(resource1.uuid()).thenReturn("res-1");
+        var broadcaster1 = mock(Broadcaster.class);
+        when(resource1.getBroadcaster()).thenReturn(broadcaster1);
+        when(broadcaster1.broadcast(any(RawMessage.class))).thenReturn(mock(Future.class));
+        var resource2 = mock(AtmosphereResource.class);
+        when(resource2.uuid()).thenReturn("res-2");
+        var broadcaster2 = mock(Broadcaster.class);
+        when(resource2.getBroadcaster()).thenReturn(broadcaster2);
+        when(broadcaster2.broadcast(any(RawMessage.class))).thenReturn(mock(Future.class));
+
+        var session1 = StreamingSessions.start("iso-1", resource1);
+        var session2 = StreamingSessions.start("iso-2", resource2);
+
+        session1.send("Only for broadcaster1");
+        session2.send("Only for broadcaster2");
+
+        verify(broadcaster1, times(1)).broadcast(any(RawMessage.class), any(Set.class));
+        verify(broadcaster2, times(1)).broadcast(any(RawMessage.class), any(Set.class));
+
+        // Closing one should not affect the other
+        session1.complete();
+        assertTrue(session1.isClosed());
+        assertFalse(session2.isClosed());
+
+        session2.send("Still works");
+        verify(broadcaster2, times(2)).broadcast(any(RawMessage.class), any(Set.class));
+    }
+
+    @Test
+    public void testConcurrentCloseAndSend() throws Exception {
+        var resource = mock(AtmosphereResource.class);
+        when(resource.uuid()).thenReturn("res-1");
+        var broadcaster = mock(Broadcaster.class);
+        when(resource.getBroadcaster()).thenReturn(broadcaster);
+        when(broadcaster.broadcast(any(RawMessage.class), any(Set.class))).thenReturn(mock(Future.class));
+        var session = StreamingSessions.start("race-session", resource);
+
+        int threadCount = 50;
+        var startLatch = new CountDownLatch(1);
+        var doneLatch = new CountDownLatch(threadCount);
+        var errors = new AtomicInteger(0);
+
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            // Half the threads send, half try to close
+            for (int t = 0; t < threadCount; t++) {
+                final int idx = t;
+                executor.submit(() -> {
+                    try {
+                        startLatch.await();
+                        if (idx % 2 == 0) {
+                            session.send("text-" + idx);
+                        } else {
+                            session.complete();
+                        }
+                    } catch (Exception e) {
+                        errors.incrementAndGet();
+                    } finally {
+                        doneLatch.countDown();
+                    }
+                });
+            }
+            startLatch.countDown();
+        }
+
+        assertTrue(doneLatch.await(10, TimeUnit.SECONDS));
+        assertEquals(0, errors.get(), "No exceptions should be thrown");
+        assertTrue(session.isClosed(), "Session should be closed");
+    }
+
+    @Test
+    public void testAutoCloseInTryWithResources() throws Exception {
+        var resource = mock(AtmosphereResource.class);
+        when(resource.uuid()).thenReturn("res-1");
+        var broadcaster = mock(Broadcaster.class);
+        when(resource.getBroadcaster()).thenReturn(broadcaster);
+        when(broadcaster.broadcast(any(RawMessage.class), any(Set.class))).thenReturn(mock(Future.class));
+        List<String> capturedTypes = new ArrayList<>();
+
+        doAnswer(inv -> {
+            RawMessage rawMsg = inv.getArgument(0);
+            String json = raw(rawMsg);
+            var node = MAPPER.readTree(json);
+            capturedTypes.add(node.get("type").stringValue());
+            return null;
+        }).when(broadcaster).broadcast(any(RawMessage.class), any(Set.class));
+
+        try (var session = StreamingSessions.start("auto-close", resource)) {
+            session.send("text1");
+            session.send("text2");
+            session.progress("Working...");
+        }
+
+        // Should have: streaming text, streaming text, progress, complete (auto-close)
+        assertEquals(4, capturedTypes.size());
+        assertEquals("streaming-text", capturedTypes.get(0));
+        assertEquals("streaming-text", capturedTypes.get(1));
+        assertEquals("progress", capturedTypes.get(2));
+        assertEquals("complete", capturedTypes.get(3));
+    }
+
+    @Test
+    public void testMetadataInterspersedWithStreamingTexts() throws Exception {
+        var resource = mock(AtmosphereResource.class);
+        when(resource.uuid()).thenReturn("res-1");
+        var broadcaster = mock(Broadcaster.class);
+        when(resource.getBroadcaster()).thenReturn(broadcaster);
+        when(broadcaster.broadcast(any(RawMessage.class), any(Set.class))).thenReturn(mock(Future.class));
+        var session = StreamingSessions.start("meta-session", resource);
+
+        session.sendMetadata("model", "gpt-4o");
+        session.sendMetadata("temperature", 0.7);
+        session.send("Hello");
+        session.sendMetadata("texts_used", 42);
+        session.send(" world");
+        session.complete("Hello world");
+
+        var captor = ArgumentCaptor.forClass(RawMessage.class);
+        verify(broadcaster, times(6)).broadcast(captor.capture(), any(Set.class));
+
+        var messages = captor.getAllValues().stream()
+                .map(m -> {
+                    try {
+                        return MAPPER.readTree(raw(m));
+                    } catch (Exception e) {
+                        return null;
+                    }
+                })
+                .toList();
+
+        // Verify metadata messages have key/value pairs
+        var metaMsgs = messages.stream()
+                .filter(j -> "metadata".equals(j.get("type").stringValue()))
+                .toList();
+        assertEquals(3, metaMsgs.size());
+        assertEquals("model", metaMsgs.get(0).get("key").stringValue());
+        assertEquals("gpt-4o", metaMsgs.get(0).get("value").stringValue());
+        assertEquals("temperature", metaMsgs.get(1).get("key").stringValue());
+        assertEquals(0.7, metaMsgs.get(1).get("value").asDouble());
+        assertEquals("texts_used", metaMsgs.get(2).get("key").stringValue());
+        assertEquals(42, metaMsgs.get(2).get("value").asInt());
+    }
+
+    @Test
+    public void testErrorClosesSession() {
+        var resource = mock(AtmosphereResource.class);
+        when(resource.uuid()).thenReturn("res-1");
+        var broadcaster = mock(Broadcaster.class);
+        when(resource.getBroadcaster()).thenReturn(broadcaster);
+        when(broadcaster.broadcast(any(RawMessage.class), any(Set.class))).thenReturn(mock(Future.class));
+        var session = StreamingSessions.start("error-session", resource);
+
+        session.send("some data");
+        session.error(new IllegalStateException("Something went wrong"));
+
+        assertTrue(session.isClosed());
+
+        // Subsequent sends should be ignored
+        session.send("ignored");
+
+        verify(broadcaster, times(2)).broadcast(any(RawMessage.class), any(Set.class)); // streaming text + error only
+    }
+
+    @Test
+    public void testErrorAfterCompleteIsIgnored() {
+        var resource = mock(AtmosphereResource.class);
+        when(resource.uuid()).thenReturn("res-1");
+        var broadcaster = mock(Broadcaster.class);
+        when(resource.getBroadcaster()).thenReturn(broadcaster);
+        when(broadcaster.broadcast(any(RawMessage.class), any(Set.class))).thenReturn(mock(Future.class));
+        var session = StreamingSessions.start("double-close", resource);
+
+        session.complete();
+        session.error(new RuntimeException("Should be ignored"));
+
+        verify(broadcaster, times(1)).broadcast(any(RawMessage.class), any(Set.class)); // only complete
+    }
+
+    @Test
+    public void testWireProtocolFormat() throws Exception {
+        var resource = mock(AtmosphereResource.class);
+        when(resource.uuid()).thenReturn("res-1");
+        var broadcaster = mock(Broadcaster.class);
+        when(resource.getBroadcaster()).thenReturn(broadcaster);
+        when(broadcaster.broadcast(any(RawMessage.class), any(Set.class))).thenReturn(mock(Future.class));
+        var session = StreamingSessions.start("wire-test", resource);
+
+        session.send("Hello");
+
+        var captor = ArgumentCaptor.forClass(RawMessage.class);
+        verify(broadcaster).broadcast(captor.capture(), any(Set.class));
+
+        String wireJson = raw(captor.getValue());
+        JsonNode json = MAPPER.readTree(wireJson);
+
+        // Verify all required wire protocol fields are present
+        assertTrue(json.has("type"), "Must have 'type' field");
+        assertTrue(json.has("data"), "Streaming text must have 'data' field");
+        assertTrue(json.has("sessionId"), "Must have 'sessionId' field");
+        assertTrue(json.has("seq"), "Must have 'seq' field");
+
+        assertEquals("streaming-text", json.get("type").stringValue());
+        assertEquals("Hello", json.get("data").stringValue());
+        assertEquals("wire-test", json.get("sessionId").stringValue());
+        assertTrue(json.get("seq").asLong() > 0, "Seq should be positive");
+
+        // Verify it's valid JSON that JavaScript can parse
+        assertNotNull(MAPPER.readTree(wireJson));
+    }
+
+    @Test
+    public void testLargeStreamingTextPayload() throws Exception {
+        var resource = mock(AtmosphereResource.class);
+        when(resource.uuid()).thenReturn("res-1");
+        var broadcaster = mock(Broadcaster.class);
+        when(resource.getBroadcaster()).thenReturn(broadcaster);
+        when(broadcaster.broadcast(any(RawMessage.class), any(Set.class))).thenReturn(mock(Future.class));
+        var session = StreamingSessions.start("large-session", resource);
+
+        // Simulate a large streaming text (e.g. a code block)
+        String largeText = "x".repeat(10_000);
+        session.send(largeText);
+
+        var captor = ArgumentCaptor.forClass(RawMessage.class);
+        verify(broadcaster).broadcast(captor.capture(), any(Set.class));
+
+        var json = MAPPER.readTree(raw(captor.getValue()));
+        assertEquals(10_000, json.get("data").stringValue().length());
+    }
+
+    @Test
+    public void testSpecialCharactersInStreamingTexts() throws Exception {
+        var resource = mock(AtmosphereResource.class);
+        when(resource.uuid()).thenReturn("res-1");
+        var broadcaster = mock(Broadcaster.class);
+        when(resource.getBroadcaster()).thenReturn(broadcaster);
+        when(broadcaster.broadcast(any(RawMessage.class), any(Set.class))).thenReturn(mock(Future.class));
+        var session = StreamingSessions.start("special-session", resource);
+
+        session.send("He said \"hello\" and\nnewline\ttab");
+        session.send("Unicode: 你好世界 🌍");
+        session.send("<script>alert('xss')</script>");
+
+        var captor = ArgumentCaptor.forClass(RawMessage.class);
+        verify(broadcaster, times(3)).broadcast(captor.capture(), any(Set.class));
+
+        // All should be valid JSON
+        for (var msg : captor.getAllValues()) {
+            JsonNode json = MAPPER.readTree(raw(msg));
+            assertNotNull(json.get("data").stringValue());
+        }
+    }
+}

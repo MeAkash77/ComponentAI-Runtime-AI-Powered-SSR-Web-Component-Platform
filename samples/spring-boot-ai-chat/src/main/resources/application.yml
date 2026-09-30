@@ -1,0 +1,88 @@
+# Atmosphere AI Chat - Configuration
+# Supports any OpenAI-compatible API: Gemini, Ollama, OpenAI, Azure, etc.
+
+atmosphere:
+  console-subtitle: Real-time streaming AI chat — WebTransport/HTTP3, WebSocket, SSE, long-polling
+  packages: org.atmosphere.samples.springboot.aichat
+  web-transport:
+    enabled: true
+    port: 4443
+  # Token auth is OFF by default so the bundled AI Console connects out-of-box
+  # (this sample's headline is AI streaming, not auth). The framework default is
+  # fail-closed (Correctness Invariant #6); this sample-level override is
+  # explicit and documented in README.md. Demo the AuthConfig token flow with:
+  #   --atmosphere.auth.enabled=true   (then send X-Atmosphere-Auth: demo-token)
+  auth:
+    enabled: false
+    demo-token: ${ATMOSPHERE_AUTH_TOKEN:demo-token}
+  # NOTE: this sample keeps the framework's fail-closed default for recorded-
+  # content admin reads (/api/admin/governance/decisions etc., Inv #6) — the
+  # gap-admin-core e2e asserts that default here. The governance-feedback demo,
+  # which needs the token-less console to render the Decisions tab, opts out at
+  # RUN time (see .github/workflows/e2e-real-llm.yml and the spec's REQUIRES
+  # note): --atmosphere.admin.content-read-auth-required=false.
+  cache:
+    enabled: true
+  # Session tape: record every AI turn (typed AiEvent steps: text, tool calls,
+  # structured output, terminals) as a durable, replayable, resumable artifact.
+  # The atmosphere-checkpoint dependency (pom.xml) supplies the crash-durable
+  # SqliteTapeStore; without it the tape falls back to the in-memory store with
+  # a startup warning. Override the file with ATMOSPHERE_TAPE_PATH.
+  ai:
+    tape:
+      enabled: true
+      store: sqlite
+      path: ${ATMOSPHERE_TAPE_PATH:${java.io.tmpdir}/atmosphere-ai-chat-tape.db}
+    # Inner-loop dev inspector: keeps the last N AI turns (prompt, response,
+    # tool calls, token usage, terminal status) in a bounded in-memory ring and
+    # serves them from GET /api/admin/ai/dev/inspector. Where the tape is the
+    # durable, replayable record, this is the "what did the model just see and
+    # say?" view you hit while iterating on a prompt — no store, no replay.
+    # Records prompt/response content, so the read is authenticated like every
+    # other recorded-content admin surface and a startup WARN fires. Dev-only:
+    # turn it off for production (see README "Dev inspector").
+    dev-inspector:
+      enabled: true
+      capacity: 100
+    # OpenAI-compatible serving: expose the ai-chat endpoint as a drop-in
+    # "model" for OpenAI-wire clients (Open WebUI, LibreChat, OpenAI SDKs)
+    # at POST /atmosphere/v1/chat/completions (+ GET /atmosphere/v1/models).
+    # The models map is a whitelist: only "atmosphere-ai-chat" is served and
+    # it dispatches through the same governed AiPipeline as every other
+    # protocol surface. See README.md ("OpenAI-compatible endpoint") for the
+    # auth posture and curl / SDK examples.
+    openai:
+      enabled: true
+      models:
+        atmosphere-ai-chat: ai-chat
+
+# LLM Configuration
+# Set via .envrc, environment variables, or override here.
+#
+# LLM_MODE: "remote" (cloud API, default) or "local" (Ollama)
+# LLM_MODEL: model name (e.g. gemini-2.5-flash, gpt-4o, llama3.2)
+# LLM_API_KEY or GEMINI_API_KEY: API key for remote providers
+# LLM_BASE_URL: override the API endpoint (auto-detected from mode if omitted)
+#
+# Example .envrc for Gemini:
+#   export LLM_MODE=remote
+#   export LLM_MODEL=gemini-2.5-flash
+#   export LLM_API_KEY=AIza...
+#
+# Example .envrc for local Ollama:
+#   export LLM_MODE=local
+#   export LLM_MODEL=llama3.2
+#
+# Example .envrc for OpenAI:
+#   export LLM_MODE=remote
+#   export LLM_MODEL=gpt-4o-mini
+#   export LLM_BASE_URL=https://api.openai.com/v1
+#   export LLM_API_KEY=sk-...
+llm:
+  mode: ${LLM_MODE:remote}
+  model: ${LLM_MODEL:gemini-2.5-flash}
+  base-url: ${LLM_BASE_URL:}
+  api-key: ${LLM_API_KEY:${GEMINI_API_KEY:}}
+
+server:
+  port: 8080

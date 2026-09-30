@@ -1,0 +1,124 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.quarkus.runtime;
+
+import java.util.List;
+import java.util.Map;
+
+import jakarta.websocket.DeploymentException;
+import jakarta.websocket.server.ServerEndpointConfig;
+
+import io.quarkus.runtime.RuntimeValue;
+import io.quarkus.runtime.ShutdownContext;
+import io.quarkus.runtime.annotations.Recorder;
+import io.undertow.servlet.api.InstanceFactory;
+import io.undertow.websockets.ServerWebSocketContainer;
+import io.vertx.core.Handler;
+import io.vertx.ext.web.RoutingContext;
+import org.atmosphere.container.JSR356Endpoint;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Quarkus {@link Recorder} that captures runtime initialization logic for the Atmosphere
+ * framework, including servlet instance factory creation and WebSocket endpoint registration.
+ */
+@Recorder
+public class AtmosphereRecorder {
+
+    private static final Logger logger = LoggerFactory.getLogger(AtmosphereRecorder.class);
+    public InstanceFactory<QuarkusAtmosphereServlet> createInstanceFactory(
+            Map<String, List<String>> annotationClassNames) {
+        return new AtmosphereServletInstanceFactory(annotationClassNames);
+    }
+
+    /**
+     * Registers a shutdown hook that resets the {@link LazyAtmosphereConfigurator}
+     * so that Quarkus dev mode live reloads get a fresh latch and framework reference.
+     * Without this, the {@code CountDownLatch} from the previous run would already be
+     * counted down, and the framework reference would be stale.
+     * <p>
+     * The {@code ShutdownContext} is automatically injected by Quarkus into recorder
+     * methods that declare it as a parameter.
+     */
+    public void registerShutdownHook(ShutdownContext shutdownContext) {
+        shutdownContext.addShutdownTask(LazyAtmosphereConfigurator::reset);
+    }
+
+    /**
+     * Completes the deferred servlet initialization for native image builds.
+     * During STATIC_INIT the servlet skips framework init to avoid creating threads
+     * that would be captured in the image heap. This method triggers the actual init
+     * at RUNTIME_INIT, after the Undertow deployment is ready.
+     */
+    public void performDeferredInit() {
+        QuarkusAtmosphereServlet servlet = QuarkusAtmosphereServlet.getInstance();
+        if (servlet != null) {
+            try {
+                servlet.performDeferredInit();
+            } catch (jakarta.servlet.ServletException e) {
+                throw new RuntimeException("Failed to initialize Atmosphere framework at runtime", e);
+            }
+        }
+    }
+
+    /**
+     * Starts the framework for the Vert.x container mode and returns the route
+     * handler serving the Atmosphere mapping. The framework and its executor are
+     * released on shutdown.
+     */
+    public Handler<RoutingContext> createVertxHandler(Map<String, String> initParams,
+                                                      Map<String, List<String>> annotationClassNames,
+                                                      String mapping, long maxBodyBytes,
+                                                      long drainTimeoutMs,
+                                                      ShutdownContext shutdownContext) {
+        try {
+            var container = VertxAtmosphereContainer.start(initParams, annotationClassNames,
+                    mapping, maxBodyBytes, drainTimeoutMs);
+            shutdownContext.addShutdownTask(container::stop);
+            return container.handler();
+        } catch (jakarta.servlet.ServletException e) {
+            throw new RuntimeException("Failed to initialize Atmosphere on the Vert.x router", e);
+        }
+    }
+
+    public void registerWebSocketEndpoints(RuntimeValue<ServerWebSocketContainer> container) {
+        ServerWebSocketContainer wsContainer = container.getValue();
+        LazyAtmosphereConfigurator configurator = new LazyAtmosphereConfigurator();
+
+        // Register endpoints with increasing path depth so Atmosphere can match
+        // URLs like /ws, /ws/chat, /ws/chat/room, etc.
+        String[] paths = {
+                "/{path}",
+                "/{path}/{path0}",
+                "/{path}/{path0}/{path1}",
+                "/{path}/{path0}/{path1}/{path2}",
+                "/{path}/{path0}/{path1}/{path2}/{path3}"
+        };
+        for (String wsPath : paths) {
+            try {
+                wsContainer.addEndpoint(ServerEndpointConfig.Builder
+                        .create(JSR356Endpoint.class, wsPath)
+                        .configurator(configurator)
+                        .build());
+            } catch (DeploymentException e) {
+                logger.warn("Failed to register WebSocket endpoint path {}: {}", wsPath, e.getMessage());
+            }
+        }
+
+        logger.info("Registered {} JSR-356 WebSocket endpoint paths for Atmosphere", paths.length);
+    }
+}

@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <parent>
+        <groupId>org.atmosphere</groupId>
+        <artifactId>atmosphere-project</artifactId>
+        <version>4.0.72-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <modelVersion>4.0.0</modelVersion>
+    <artifactId>atmosphere-ai-spring-boot-starter</artifactId>
+    <packaging>jar</packaging>
+    <name>atmosphere-ai-spring-boot-starter</name>
+    <description>AI-inclusive Spring Boot starter: one dependency brings the full Atmosphere AI layer
+        (AI pipeline, @Agent processing, @Coordinator) on top of the transport starter and Console,
+        so a single @Agent class runs with no further dependencies.</description>
+    <url>https://github.com/Atmosphere/atmosphere</url>
+
+    <properties>
+        <atmosphere.module.name>org.atmosphere.spring.boot.ai</atmosphere.module.name>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- netty-bom imported BEFORE spring-boot-dependencies so its
+                 first-wins resolution rule pulls the patched netty line across
+                 every transitive netty artifact, matching the base starter. -->
+            <dependency>
+                <groupId>io.netty</groupId>
+                <artifactId>netty-bom</artifactId>
+                <version>${netty.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <!-- tools.jackson pinned one patch above Spring Boot 4.1.0's
+                 managed 3.1.4: 3.1.5 closes GHSA-5gvw-p9qm-jgwh
+                 (jackson-databind DoS). Imported BEFORE spring-boot-dependencies
+                 so Maven's first-declared-wins rule takes the patched line. -->
+            <dependency>
+                <groupId>tools.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>3.1.5</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-dependencies</artifactId>
+                <version>${spring-boot.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <!-- Transport starter: brings the framework runtime, the Spring Boot
+             auto-configuration (incl. the AI + coordinator auto-configs gated on
+             those modules' presence), and the Atmosphere Console static assets.
+             The base starter is the transport-first foundation. -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-spring-boot-starter</artifactId>
+        </dependency>
+
+        <!-- The AI layer the base starter declares <optional>true</optional>.
+             Pinned NON-optional here so adding this single starter is enough to
+             run an @Agent: the AI pipeline + AiConfig auto-configure, AgentRuntime
+             discovery works, and @Agent / @Coordinator classes are processed. -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-ai</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-agent</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-coordinator</artifactId>
+        </dependency>
+
+        <!-- Deep-agent preset substrate. atmosphere-checkpoint supplies the
+             crash-durable SqliteEffectJournal so atmosphere.durable-runs (and
+             the preset's durable-runs implication) is genuinely crash-durable
+             out of the box instead of silently degrading to the in-memory
+             journal; atmosphere-skills ships the prebuilt META-INF/skills
+             SKILL.md packs @Agent classes discover by convention. -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-checkpoint</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-skills</artifactId>
+        </dependency>
+        <!-- atmosphere-sandbox supplies the SandboxProvider SPI + @SandboxTool
+             binding so a @SandboxTool method has a backend when declared. Code
+             execution stays default-off (org.atmosphere.ai.code.enabled); this
+             only makes the capability reachable, it never enables it. -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-sandbox</artifactId>
+        </dependency>
+        <!-- atmosphere-checkpoint declares sqlite-jdbc <optional> so it does not
+             transit; pin the same version modules/checkpoint compiles against
+             (not centrally managed — keep in sync with modules/checkpoint/pom.xml). -->
+        <dependency>
+            <groupId>org.xerial</groupId>
+            <artifactId>sqlite-jdbc</artifactId>
+            <version>3.53.2.0</version>
+        </dependency>
+
+        <!-- Embedded servlet container + Spring MVC, pinned NON-optionally so a
+             downstream app that declares ONLY this starter boots a running web
+             server out of the box (the base starter keeps spring-boot-web-server
+             <optional>true</optional> for embeddable/transport-first use). This
+             is what makes "one dependency + a single @Agent class is a running
+             streaming chat app" true end to end: without it the AtmosphereServlet
+             has no container to register against and the app never serves. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- Delivery proof: boot a Spring context with ONLY this starter plus a
+             single @Agent class and assert the live beans. No direct dependency
+             on atmosphere-ai / atmosphere-agent here — they must arrive
+             transitively through this starter for the test to compile and pass. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>

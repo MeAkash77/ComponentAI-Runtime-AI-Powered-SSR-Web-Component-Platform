@@ -1,0 +1,131 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.ai;
+
+/**
+ * SPI for AI safety guardrails. Implementations inspect requests before
+ * they reach the LLM and responses before they reach the client.
+ *
+ * <p>Guardrails run in the interceptor chain with the following order:</p>
+ * <pre>
+ * Guardrails (pre) → Rate Limit → RAG → [LLM call] → Guardrails (post) → Observability
+ * </pre>
+ *
+ * <p>Common use cases:</p>
+ * <ul>
+ *   <li>PII detection and scrubbing</li>
+ *   <li>Prompt injection detection</li>
+ *   <li>Content policy enforcement</li>
+ *   <li>Output validation</li>
+ * </ul>
+ *
+ * <p>Example:</p>
+ * <pre>{@code
+ * public class PiiGuardrail implements AiGuardrail {
+ *     @Override
+ *     public GuardrailResult inspectRequest(AiRequest request) {
+ *         if (containsPii(request.message())) {
+ *             return GuardrailResult.block("PII detected in request");
+ *         }
+ *         return GuardrailResult.pass();
+ *     }
+ * }
+ * }</pre>
+ */
+public interface AiGuardrail {
+
+    /**
+     * Framework-property key under which a {@code List<AiGuardrail>} can be
+     * bridged by Spring / Quarkus / CDI auto-configuration. Mirrors the
+     * {@code FactResolver.FACT_RESOLVER_PROPERTY} and
+     * {@code CoordinatorProcessor.COORDINATION_JOURNAL_PROPERTY} pattern —
+     * framework-scoped wiring so a user-defined {@code @AiEndpoint} picks
+     * up the same guardrail list as the default endpoint.
+     *
+     * <p>{@code AiEndpointProcessor} reads this property and merges its
+     * contents with annotation-declared guardrails plus ServiceLoader
+     * discovery. Spring's {@code AtmosphereAiAutoConfiguration} writes here
+     * when user beans are present.</p>
+     */
+    String GUARDRAILS_PROPERTY = "org.atmosphere.ai.guardrails";
+
+    /**
+     * Inspect a request before it reaches the LLM.
+     *
+     * @param request the AI request
+     * @return the guardrail result (pass, modify, or block)
+     */
+    default GuardrailResult inspectRequest(AiRequest request) {
+        return GuardrailResult.pass();
+    }
+
+    /**
+     * Inspect a response streaming text before it reaches the client. Called for
+     * each accumulated response (not per-streaming-text for efficiency).
+     *
+     * @param accumulatedResponse the response text accumulated so far
+     * @return the guardrail result (pass or block)
+     */
+    default GuardrailResult inspectResponse(String accumulatedResponse) {
+        return GuardrailResult.pass();
+    }
+
+    /**
+     * Identity-aware variant of {@link #inspectResponse(String)}: the
+     * originating request rides along so output-side checks can evaluate
+     * against the caller's userId / sessionId / agentId / conversationId
+     * (identity-scoped output authorization). The default delegates to the
+     * text-only variant, so existing guardrails are unaffected; override
+     * this one when the check needs the subject.
+     *
+     * @param originatingRequest  the request that produced this response;
+     *                            never {@code null} (an empty request when
+     *                            the producer has no request context)
+     * @param accumulatedResponse the response text accumulated so far
+     * @return the guardrail result (pass or block)
+     */
+    default GuardrailResult inspectResponse(AiRequest originatingRequest,
+                                            String accumulatedResponse) {
+        return inspectResponse(accumulatedResponse);
+    }
+
+    /**
+     * Result of a guardrail check.
+     */
+    sealed interface GuardrailResult {
+
+        /** The request/response passed the guardrail check. */
+        record Pass() implements GuardrailResult { }
+
+        /** The request should be modified before proceeding. */
+        record Modify(AiRequest modifiedRequest) implements GuardrailResult { }
+
+        /** The request/response was blocked by the guardrail. */
+        record Block(String reason) implements GuardrailResult { }
+
+        static GuardrailResult pass() {
+            return new Pass();
+        }
+
+        static GuardrailResult modify(AiRequest modifiedRequest) {
+            return new Modify(modifiedRequest);
+        }
+
+        static GuardrailResult block(String reason) {
+            return new Block(reason);
+        }
+    }
+}

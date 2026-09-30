@@ -1,0 +1,298 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.ai.tool;
+
+import org.junit.jupiter.api.Test;
+
+import java.util.List;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Tests for {@link ToolBridgeUtils}.
+ */
+public class ToolBridgeUtilsTest {
+
+    // --- parseJsonArgs tests ---
+
+    @Test
+    public void testParseJsonArgsNull() {
+        assertEquals(Map.of(), ToolBridgeUtils.parseJsonArgs(null));
+    }
+
+    @Test
+    public void testParseJsonArgsBlank() {
+        assertEquals(Map.of(), ToolBridgeUtils.parseJsonArgs(""));
+        assertEquals(Map.of(), ToolBridgeUtils.parseJsonArgs("   "));
+    }
+
+    @Test
+    public void testParseJsonArgsEmptyObject() {
+        assertEquals(Map.of(), ToolBridgeUtils.parseJsonArgs("{}"));
+        assertEquals(Map.of(), ToolBridgeUtils.parseJsonArgs("  {}  "));
+    }
+
+    @Test
+    public void testParseJsonArgsStringValues() {
+        var result = ToolBridgeUtils.parseJsonArgs("{\"name\":\"Alice\",\"city\":\"Paris\"}");
+        assertEquals("Alice", result.get("name"));
+        assertEquals("Paris", result.get("city"));
+    }
+
+    @Test
+    public void testParseJsonArgsNumericValues() {
+        var result = ToolBridgeUtils.parseJsonArgs("{\"count\":42,\"ratio\":3.14}");
+        assertEquals(42L, result.get("count"));
+        assertEquals(3.14, result.get("ratio"));
+    }
+
+    @Test
+    public void testParseJsonArgsBooleanValues() {
+        var result = ToolBridgeUtils.parseJsonArgs("{\"active\":true,\"deleted\":false}");
+        assertEquals(true, result.get("active"));
+        assertEquals(false, result.get("deleted"));
+    }
+
+    @Test
+    public void testParseJsonArgsNullValues() {
+        var result = ToolBridgeUtils.parseJsonArgs("{\"value\":null}");
+        assertTrue(result.containsKey("value"));
+        assertNull(result.get("value"));
+    }
+
+    @Test
+    public void testParseJsonArgsEscapedStringValues() {
+        // Escapes are DECODED. The hand-rolled tokenizer this replaced left the
+        // backslashes literal, so a tool received `He said \\"hello\\"` — every
+        // escaped quote, newline, and tab in a model-supplied argument was
+        // corrupted before it reached the executor (Correctness Invariant #4).
+        var result = ToolBridgeUtils.parseJsonArgs("{\"msg\":\"He said \\\"hello\\\"\"}");
+        assertEquals("He said \"hello\"", result.get("msg"));
+    }
+
+    @Test
+    public void testParseJsonArgsDecodesUnicodeEscapes() {
+        var result = ToolBridgeUtils.parseJsonArgs(
+                "{\"city\":\"Z\\u00fcrich\",\"emoji\":\"\\ud83d\\ude00\"}");
+        assertEquals("Z\u00fcrich", result.get("city"));
+        assertEquals("\ud83d\ude00", result.get("emoji"), "surrogate pairs must round-trip");
+    }
+
+    @Test
+    public void testParseJsonArgsDecodesControlEscapes() {
+        var result = ToolBridgeUtils.parseJsonArgs(
+                "{\"multi\":\"line1\\nline2\\ttabbed\",\"path\":\"C:\\\\tmp\"}");
+        assertEquals("line1\nline2\ttabbed", result.get("multi"));
+        assertEquals("C:\\tmp", result.get("path"));
+    }
+
+    @Test
+    public void testParseJsonArgsMixedTypes() {
+        var result = ToolBridgeUtils.parseJsonArgs(
+                "{\"name\":\"Bob\",\"age\":30,\"active\":true,\"score\":9.5,\"tag\":null}");
+        assertEquals("Bob", result.get("name"));
+        assertEquals(30L, result.get("age"));
+        assertEquals(true, result.get("active"));
+        assertEquals(9.5, result.get("score"));
+        assertNull(result.get("tag"));
+    }
+
+    // --- nested JSON regression tests ---
+    // Nested values decode to real Maps/Lists. The old tokenizer captured them
+    // as raw text spans, so a tool declaring a List or a record parameter
+    // received a String it could not bind. See ToolArgJacksonParseTest for the
+    // full decoding table.
+
+    @Test
+    public void testParseJsonArgsNestedArrayBecomesList() {
+        // A nested array is a real List now. It used to be handed back as raw
+        // JSON text, so a tool declaring List<...> got a String and the reflective
+        // invoke failed with an argument-type mismatch.
+        var result = ToolBridgeUtils.parseJsonArgs("{\"name\":\"alice\",\"items\":[1,2,3]}");
+        assertEquals("alice", result.get("name"));
+        assertEquals(List.of(1L, 2L, 3L), result.get("items"));
+    }
+
+    @Test
+    public void testParseJsonArgsNestedObjectBecomesMap() {
+        var result = ToolBridgeUtils.parseJsonArgs("{\"filter\":{\"key\":\"value\",\"n\":42}}");
+        assertEquals(Map.of("key", "value", "n", 42L), result.get("filter"));
+    }
+
+    @Test
+    public void testParseJsonArgsDeeplyNestedArrayOfObjects() {
+        var result = ToolBridgeUtils.parseJsonArgs(
+                "{\"rows\":[{\"a\":1},{\"a\":2}],\"count\":2}");
+        assertEquals(List.of(Map.of("a", 1L), Map.of("a", 2L)), result.get("rows"));
+        assertEquals(2L, result.get("count"));
+    }
+
+    @Test
+    public void testParseJsonArgsNestedIgnoresBracketsInStrings() {
+        // A '}' inside a quoted string must not terminate the nested value.
+        var result = ToolBridgeUtils.parseJsonArgs("{\"payload\":{\"msg\":\"hello}world\"}}");
+        assertEquals(Map.of("msg", "hello}world"), result.get("payload"));
+    }
+
+    @Test
+    public void testParseJsonArgsMalformedNumberReturnsRawToken() {
+        // Previously this threw NumberFormatException; now the malformed token
+        // is stored as a raw string and the tool validator surfaces the error.
+        var result = ToolBridgeUtils.parseJsonArgs("{\"count\":abc123}");
+        assertEquals("abc123", result.get("count"));
+    }
+
+    /**
+     * Regression (registre#37): a payload cut off mid-string used to deliver
+     * the truncated remainder as the argument value — the tool received a
+     * value the caller never sent, with no error and no marker. The
+     * truncated pair must be dropped so a required argument fails
+     * validation with a structured error instead.
+     */
+    @Test
+    public void testTruncatedStringValueIsDroppedNotDelivered() {
+        var result = ToolBridgeUtils.parseJsonArgs(
+                "{\"city\":\"Paris\",\"body\":\"Dear customer, your refund of $4");
+
+        assertEquals("Paris", result.get("city"),
+                "complete leading pairs stay salvageable");
+        assertFalse(result.containsKey("body"),
+                "a truncated string must never pass through as a shortened value: "
+                        + result.get("body"));
+    }
+
+    @Test
+    public void testCompleteFinalStringWithoutClosingBraceStillParses() {
+        // Truncation after a COMPLETE value (only the brace missing) keeps
+        // every pair — only an unterminated string is dropped.
+        var result = ToolBridgeUtils.parseJsonArgs("{\"a\":\"x\",\"b\":\"y\"");
+        assertEquals("x", result.get("a"));
+        assertEquals("y", result.get("b"));
+    }
+
+    @Test
+    public void testFindMatchingCloseBracketRespectsNesting() {
+        assertEquals(8, ToolBridgeUtils.findMatchingCloseBracket("[[1,2],3]", 0));
+        assertEquals(12, ToolBridgeUtils.findMatchingCloseBracket("{\"a\":{\"b\":1}}", 0));
+        assertEquals(-1, ToolBridgeUtils.findMatchingCloseBracket("[1,2,3", 0));
+    }
+
+    // --- escapeJson tests ---
+
+    @Test
+    public void testEscapeJsonNull() {
+        assertEquals("", ToolBridgeUtils.escapeJson(null));
+    }
+
+    @Test
+    public void testEscapeJsonNoSpecialChars() {
+        assertEquals("hello world", ToolBridgeUtils.escapeJson("hello world"));
+    }
+
+    @Test
+    public void testEscapeJsonQuotes() {
+        assertEquals("say \\\"hi\\\"", ToolBridgeUtils.escapeJson("say \"hi\""));
+    }
+
+    @Test
+    public void testEscapeJsonBackslash() {
+        assertEquals("path\\\\to\\\\file", ToolBridgeUtils.escapeJson("path\\to\\file"));
+    }
+
+    @Test
+    public void testEscapeJsonNewlineAndTab() {
+        assertEquals("line1\\nline2\\ttab", ToolBridgeUtils.escapeJson("line1\nline2\ttab"));
+    }
+
+    @Test
+    public void testEscapeJsonCarriageReturn() {
+        assertEquals("a\\rb", ToolBridgeUtils.escapeJson("a\rb"));
+    }
+
+    // --- buildJsonSchemaString tests ---
+
+    @Test
+    public void testBuildJsonSchemaStringEmpty() {
+        var schema = ToolBridgeUtils.buildJsonSchemaString(List.of());
+        assertEquals("{\"type\":\"object\",\"properties\":{},\"required\":[]}", schema);
+    }
+
+    @Test
+    public void testBuildJsonSchemaStringWithParams() {
+        var params = List.of(
+                new ToolParameter("city", "The city name", "string", true),
+                new ToolParameter("units", "Temperature units", "string", false)
+        );
+        var schema = ToolBridgeUtils.buildJsonSchemaString(params);
+
+        assertTrue(schema.contains("\"city\""));
+        assertTrue(schema.contains("\"The city name\""));
+        assertTrue(schema.contains("\"required\":[\"city\"]"));
+        // "units" should NOT be in the required array
+        assertFalse(schema.contains("\"required\":[\"city\",\"units\"]"));
+    }
+
+    @Test
+    public void testBuildJsonSchemaStringAllRequired() {
+        var params = List.of(
+                new ToolParameter("a", "Param A", "string", true),
+                new ToolParameter("b", "Param B", "integer", true)
+        );
+        var schema = ToolBridgeUtils.buildJsonSchemaString(params);
+
+        assertTrue(schema.contains("\"a\""));
+        assertTrue(schema.contains("\"b\""));
+        assertTrue(schema.contains("\"required\":[\"a\",\"b\"]"));
+    }
+
+    @Test
+    public void testBuildJsonSchemaStringEscapesDescription() {
+        var params = List.of(
+                new ToolParameter("query", "The user's \"search\" query", "string", true)
+        );
+        var schema = ToolBridgeUtils.buildJsonSchemaString(params);
+
+        // Escaped quotes in description
+        assertTrue(schema.contains("\\\"search\\\""));
+    }
+
+    // --- findUnescapedQuote tests ---
+
+    @Test
+    public void testFindUnescapedQuoteSimple() {
+        assertEquals(5, ToolBridgeUtils.findUnescapedQuote("hello\"world", 0));
+    }
+
+    @Test
+    public void testFindUnescapedQuoteSkipsEscaped() {
+        // "hello\"world" - the escaped quote at index 5-6 should be skipped
+        assertEquals(8, ToolBridgeUtils.findUnescapedQuote("hello\\\"w\"orld", 0));
+    }
+
+    @Test
+    public void testFindUnescapedQuoteNotFound() {
+        assertEquals(5, ToolBridgeUtils.findUnescapedQuote("hello", 0));
+    }
+
+    @Test
+    public void testFindUnescapedQuoteTrailingBackslashDoesNotOvershoot() {
+        // Malformed input ending in a lone backslash must return s.length()
+        // (quote not found) without advancing the index past the end of the
+        // string or throwing. "hello\\" is the 6-char string hello\ .
+        assertEquals(6, ToolBridgeUtils.findUnescapedQuote("hello\\", 0));
+    }
+}

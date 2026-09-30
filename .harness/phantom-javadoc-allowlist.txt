@@ -1,0 +1,36 @@
+# External (JDK / Spring / library / competitor) class names referenced in
+# Javadoc {@code}/{@link} that legitimately have no class in this reactor.
+# Checked by scripts/validate-no-phantom-javadoc-refs.sh. One token per line.
+ExecutorService          # java.util.concurrent
+ScheduledExecutorService # java.util.concurrent
+InvocationHandler        # java.lang.reflect
+DriverManager            # java.sql
+MeterRegistry            # Micrometer
+VectorStore              # Spring AI
+ChatCompletionService    # Semantic Kernel
+EmbeddingGenerationService     # Semantic Kernel
+TextEmbeddingGenerationService # Semantic Kernel
+PromptExecutorInterceptor      # Koog
+PolicyProviderHandler          # Microsoft Agent Framework
+ConfigProvider                 # MicroProfile Config
+ResourceHttpRequestHandler     # Spring MVC
+ClassPathScanningCandidateComponentProvider # Spring
+HTTP3ServerConnectionFactory   # Jetty
+TlsConfigurationRegistry       # Jetty
+PooledObjectFactory      # Apache Commons Pool
+ClassShutter             # Mozilla Rhino
+ContextFactory           # Mozilla Rhino
+SimpleVectorStore        # Spring AI
+StreamingChatResponseHandler # LangChain4j
+ThreadPoolExecutor       # java.util.concurrent
+BaseSessionService       # Google ADK
+SessionService           # Google ADK
+AIAgentStrategy          # JetBrains Koog
+KoogStrategy             # JetBrains Koog
+SdkTracerProvider        # OpenTelemetry SDK
+# Spring AI Alibaba GA todo interceptor (com.alibaba.cloud.ai.graph.agent.interceptor.todolist, javap-verified 1.1.2.3) — planning bridge docs
+TodoListInterceptor
+# Google ADK artifact service (com.google.adk.artifacts, javap-verified 1.5.0) — VFS bridge docs
+BaseArtifactService
+# Spring resource resolution (org.springframework.core.io.support, javap-verified 7.0.x) — build-time annotation scan docs
+PathMatchingResourcePatternResolver

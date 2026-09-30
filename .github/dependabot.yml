@@ -1,0 +1,101 @@
+version: 2
+updates:
+  - package-ecosystem: "maven"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    ignore:
+      # ── In-track pins ───────────────────────────────────────────────────
+      # Replaces the AUTO-BUMP tier of the removed dependency-update-check.yml
+      # workflow (Dependabot now owns every Maven update PR). Each tracked
+      # AI/JVM library is held to its current release line so a *version*
+      # update PR can never cross a major/minor boundary (e.g. Spring AI 2.0.x
+      # must not jump to a 3.x line, Netty must not leave 4.2.x). These
+      # update-types ignores apply to version updates only — a Dependabot
+      # *security* update for a CVE still opens a PR regardless of track.
+      - dependency-name: "org.springframework.boot:*"    # hold 4.0.x
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "org.springframework.ai:*"      # hold 2.0.x (and the 1.1.x Alibaba overlay)
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "com.alibaba.cloud.ai:*"        # hold 1.1.x
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "dev.langchain4j:*"             # hold 1.x
+        update-types: ["version-update:semver-major"]
+      # hold 1.x. NOTE: an ignore of semver-major on a dependency that is still
+      # on 0.x means "never reach 1.0" — it suppresses the GA transition, which
+      # is the one bump you most want reviewed. This rule read `hold 0.x` from
+      # 2026-06-30 until the 1.5.0 bump, and Embabel shipped nothing but
+      # major-crossing releases in that window (1.0.0-RC1, 1.0.0, 1.5.0), so it
+      # suppressed 100% of available upgrades and the pin sat on 0.5.0 for 25
+      # days after 1.0.0 GA. Only apply a major-only ignore to a dependency
+      # already past 1.0.
+      - dependency-name: "com.embabel.agent:*"           # hold 1.x
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "com.google.adk:*"              # hold 1.x
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "ai.koog:*"                     # hold 1.x
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "io.agentscope:*"               # hold 1.x
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "io.modelcontextprotocol.sdk:*" # hold 2.0.x (mcp + mcp-core + mcp-json-jackson3 pinned in lockstep)
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      # Quarkus + gRPC + Netty move in lockstep — version skew across the three
+      # triggers AbstractMethodError at runtime. Hold all three to patch-only so
+      # a minor/major bump is a deliberate, coordinated human change rather than
+      # an isolated auto-PR. (Quarkus/gRPC were previously surfaced as watch-only
+      # tracking issues by dependency-update-check.yml, now removed.)
+      # OpenTelemetry: samples/quarkus-ai-chat pins opentelemetry-api / -common /
+      # -context together at the Quarkus BOM's baseline (1.62.0 in Quarkus 3.39.5).
+      # api >= 1.62 references ApiUsageLogger in io.opentelemetry.common.impl, so a
+      # lone api bump against an older pinned -common throws NoClassDefFoundError
+      # at startup. PR #2694 made exactly that bump and broke the sample; PR #2752
+      # re-proposed it. Hold to patch-only so the trio can only move as a
+      # deliberate, coordinated change alongside the Quarkus BOM.
+      - dependency-name: "io.opentelemetry:*"            # lockstep with Quarkus's baseline
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "io.netty:*"                    # hold 4.2.x
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "io.quarkus:*"                  # hold current minor (lockstep)
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "io.grpc:*"                     # hold current minor (lockstep)
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+      # The Maven wrapper distribution (.mvn/wrapper/maven-wrapper.properties).
+      # Dependabot's `maven-wrapper-updater` experiment shells out to
+      # `maven-wrapper-plugin:wrapper` to rewrite that file, and the subprocess
+      # dies inside their container:
+      #     Updating org.apache.maven:apache-maven from 3.9.11 to 3.9.16
+      #     ERROR ... (HelperSubprocessFailed)
+      #       maven/file_updater/wrapper_updater.rb:220 run_wrapper_command
+      # which fails the whole `maven in /.` job — every other update in the run is
+      # discarded with it. This is not version-specific (3.9.11 -> 3.9.16 is a patch
+      # bump, so an update-types ignore does not prevent the attempt) and nothing in
+      # this repo triggers it: the job passed 2026-08-07 and has failed on every run
+      # since 2026-08-14, matching the feature's rollout, with .mvn/ untouched
+      # throughout. Ignore the coordinate outright. Wrapper bumps stay a
+      # deliberate manual change.
+      - dependency-name: "org.apache.maven:apache-maven"
+
+  # Sample frontends + atmosphere.js + spring-boot-starter front-end.
+  # Without watchers here, postcss/react/etc. CVEs in sample lockfiles
+  # accumulate as alerts but never get auto-PR'd. Consolidated under one
+  # update config via the `directories:` plural form.
+  - package-ecosystem: "npm"
+    directories:
+      - "/atmosphere.js"
+      - "/modules/spring-boot-starter/frontend"
+      - "/samples/spring-boot-multi-agent-startup-team/frontend"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      sample-frontend:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 2

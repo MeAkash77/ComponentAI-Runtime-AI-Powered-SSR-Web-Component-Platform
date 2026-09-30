@@ -1,0 +1,2171 @@
+#!/bin/sh
+# Atmosphere CLI — run samples, scaffold projects, explore the framework.
+# https://github.com/Atmosphere/atmosphere
+#
+# Copyright 2008-2026 Async-IO.org — Apache License 2.0
+
+set -e
+
+VERSION="4.0.71"
+ATMOSPHERE_HOME="${ATMOSPHERE_HOME:-$HOME/.atmosphere}"
+CACHE_DIR="$ATMOSPHERE_HOME/cache"
+
+# ── Source ref ──────────────────────────────────────────────────────────────
+# Every artefact the CLI fetches from GitHub — sample sources, the registry,
+# the runtime overlays — must come from the same ref as the Atmosphere version
+# it pins into the generated pom.xml (see install_source /
+# patch_pom_for_standalone, both of which pin the parent to $VERSION).
+#
+# `main` carries samples that call APIs which have not been released yet.
+# Pairing that source with the last released parent produces a project that
+# cannot compile — e.g. samples/spring-boot-ai-tools on main calls
+# AiConfig.LlmSettings#hasReachableModel(), which does not exist in 4.0.65, so
+# `atmosphere new my-app --template ai-tools` scaffolded a project that failed
+# `mvn compile` with "cannot find symbol".
+#
+# The release workflow pushes the `atmosphere-<version>` tag before it rewrites
+# VERSION= in this script, so the tag matching VERSION always exists by the time
+# a user has this copy.
+#
+# ATMOSPHERE_VERSION_OVERRIDE points the generated pom at a locally-installed
+# build instead of the pinned release; when that build is a SNAPSHOT the
+# matching source is `main`. ATMOSPHERE_SOURCE_REF overrides the ref outright.
+if [ -n "${ATMOSPHERE_SOURCE_REF:-}" ]; then
+    SOURCE_REF="$ATMOSPHERE_SOURCE_REF"
+elif [ -z "${ATMOSPHERE_VERSION_OVERRIDE:-}" ]; then
+    SOURCE_REF="atmosphere-$VERSION"
+else
+    case "$ATMOSPHERE_VERSION_OVERRIDE" in
+        *SNAPSHOT) SOURCE_REF="main" ;;
+        *)         SOURCE_REF="atmosphere-$ATMOSPHERE_VERSION_OVERRIDE" ;;
+    esac
+fi
+# Branches and tags live under different paths in GitHub's archive API.
+case "$SOURCE_REF" in
+    main|master) SOURCE_ARCHIVE_REF="refs/heads/$SOURCE_REF" ;;
+    *)           SOURCE_ARCHIVE_REF="refs/tags/$SOURCE_REF" ;;
+esac
+
+SAMPLES_JSON_URL="https://raw.githubusercontent.com/Atmosphere/atmosphere/$SOURCE_REF/cli/samples.json"
+RUNTIME_OVERLAYS_URL="https://raw.githubusercontent.com/Atmosphere/atmosphere/$SOURCE_REF/cli/runtime-overlays.json"
+SOURCE_TARBALL_URL="https://github.com/Atmosphere/atmosphere/archive/$SOURCE_ARCHIVE_REF.tar.gz"
+
+# ── Colors ──────────────────────────────────────────────────────────────────
+if [ -t 1 ]; then
+    BOLD='\033[1m'
+    DIM='\033[2m'
+    CYAN='\033[36m'
+    GREEN='\033[32m'
+    YELLOW='\033[33m'
+    RED='\033[31m'
+    RESET='\033[0m'
+else
+    BOLD='' DIM='' CYAN='' GREEN='' YELLOW='' RED='' RESET=''
+fi
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+die()   { printf "${RED}error:${RESET} %s\n" "$1" >&2; exit 1; }
+info()  { printf "${CYAN}→${RESET} %s\n" "$1"; }
+ok()    { printf "${GREEN}✓${RESET} %s\n" "$1"; }
+warn()  { printf "${YELLOW}!${RESET} %s\n" "$1"; }
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not found. Please install it first."
+}
+
+# Extract the major version from `java -version`. The banner line is
+#   openjdk version "21.0.2" 2024-01-16 LTS      → 21
+#   java version "1.8.0_402"                     → 1
+# Anchoring on `version "` matters: a bare `.*"` is greedy and consumes through
+# the *closing* quote, capturing the empty string for every JVM ever shipped.
+# Scanning all lines (rather than head -1) tolerates JVMs that print
+# "Picked up JAVA_TOOL_OPTIONS" before the banner.
+java_major_version() {
+    java -version 2>&1 | sed -n 's/.*version "\([0-9][0-9]*\).*/\1/p' | head -1
+}
+
+ensure_java() {
+    need_cmd java
+    java_version=$(java_major_version)
+    # Fail closed: an unparseable banner must not be read as "new enough".
+    case "$java_version" in
+        ''|*[!0-9]*)
+            die "Java 21+ is required, but the version of the 'java' on PATH could not be determined. Install with: brew install openjdk@21" ;;
+    esac
+    if [ "$java_version" -lt 21 ]; then
+        die "Java 21+ is required (found Java $java_version). Install with: brew install openjdk@21"
+    fi
+}
+
+ensure_cache_dir() {
+    mkdir -p "$CACHE_DIR"
+}
+
+# Download a file, preferring curl > wget
+download() {
+    url="$1"
+    dest="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --progress-bar -o "$dest" "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --show-progress -O "$dest" "$url"
+    else
+        die "curl or wget is required for downloads"
+    fi
+    # Verify download produced a non-empty file
+    if [ ! -s "$dest" ]; then
+        rm -f "$dest"
+        die "Download failed or produced empty file: $url"
+    fi
+}
+
+# Compute SHA-256 checksum (portable across macOS/Linux)
+sha256sum_portable() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    else
+        echo "no-checksum-tool"
+    fi
+}
+
+# Percent-encode a string so it can be interpolated into a URL path segment or
+# query value. Unreserved set per RFC 3986: A-Z a-z 0-9 - . _ ~
+# Everything else (spaces, &, ?, /, #, UTF-8 bytes) becomes %XX.
+urlencode() {
+    LC_ALL=C awk '
+        BEGIN {
+            s = ARGV[1]
+            for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i
+            n = length(s)
+            for (i = 1; i <= n; i++) {
+                c = substr(s, i, 1)
+                if (c ~ /^[A-Za-z0-9._~-]$/) printf "%s", c
+                else printf "%%%02X", ord[c]
+            }
+        }' "$1"
+}
+
+# Get the local samples.json — bundled with CLI or download it
+get_samples_json() {
+    # Prefer bundled samples.json (installed via Homebrew or alongside the script)
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    if [ -f "$script_dir/samples.json" ]; then
+        cat "$script_dir/samples.json"
+        return
+    fi
+    # Fall back to cached version
+    if [ -f "$CACHE_DIR/samples.json" ]; then
+        cat "$CACHE_DIR/samples.json"
+        return
+    fi
+    # Download
+    ensure_cache_dir
+    info "Downloading sample registry..."
+    download "$SAMPLES_JSON_URL" "$CACHE_DIR/samples.json"
+    cat "$CACHE_DIR/samples.json"
+}
+
+# Get the local runtime-overlays.json — bundled with CLI or download it
+get_runtime_overlays_json() {
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    if [ -f "$script_dir/runtime-overlays.json" ]; then
+        cat "$script_dir/runtime-overlays.json"
+        return
+    fi
+    if [ -f "$CACHE_DIR/runtime-overlays.json" ]; then
+        cat "$CACHE_DIR/runtime-overlays.json"
+        return
+    fi
+    ensure_cache_dir
+    info "Downloading runtime overlay registry..."
+    download "$RUNTIME_OVERLAYS_URL" "$CACHE_DIR/runtime-overlays.json"
+    cat "$CACHE_DIR/runtime-overlays.json"
+}
+
+# Parse JSON without jq — extract field from a sample block
+# Usage: json_field "field_name" <<< "$json_block"
+# This is intentionally simple; we use jq when available.
+has_jq() { command -v jq >/dev/null 2>&1; }
+
+get_sample_field() {
+    sample_name="$1"
+    field="$2"
+    json="$3"
+    if has_jq; then
+        printf '%s' "$json" | jq -r ".samples[] | select(.name == \"$sample_name\") | .$field"
+    else
+        # Fallback: grep-based extraction (fragile but works for simple fields)
+        printf '%s' "$json" | grep -A 30 "\"name\": \"$sample_name\"" | grep "\"$field\"" | head -1 | sed 's/.*: *"\{0,1\}\([^",}]*\)"\{0,1\}.*/\1/'
+    fi
+}
+
+list_sample_names() {
+    json="$1"
+    if has_jq; then
+        printf '%s' "$json" | jq -r '.samples[].name'
+    else
+        printf '%s' "$json" | grep '"name"' | sed 's/.*: *"\([^"]*\)".*/\1/'
+    fi
+}
+
+# ── Commands ────────────────────────────────────────────────────────────────
+
+cmd_version() {
+    printf "${BOLD}Atmosphere${RESET} %s\n" "$VERSION"
+}
+
+cmd_help() {
+    cat <<EOF
+${BOLD}Atmosphere CLI${RESET} v${VERSION}
+
+${BOLD}Usage:${RESET}
+  atmosphere <command> [options]
+
+${BOLD}Commands:${RESET}
+  ${GREEN}install${RESET}           Interactive sample picker — browse, choose, run
+  ${GREEN}list${RESET}              List all available samples
+  ${GREEN}run${RESET}  <sample>     Build and run a sample application
+  ${GREEN}new${RESET}  <name>       Scaffold a new Atmosphere project
+  ${GREEN}info${RESET} <sample>     Show details about a sample
+  ${GREEN}import${RESET} <url>      Import a skill file and scaffold a project
+  ${GREEN}compose${RESET} <dir>     Generate a multi-agent project from skill files
+  ${GREEN}skills${RESET}            Browse and run skills from the registry
+  ${GREEN}plugins${RESET}           List installed import plugins (--target)
+  ${GREEN}checkpoint${RESET}        Inspect a running agent's CheckpointStore (list/show/fork/approve/delete)
+  ${GREEN}version${RESET}           Print version
+  ${GREEN}help${RESET}              Show this help
+
+${BOLD}Examples:${RESET}
+  atmosphere install
+  atmosphere install --tag ai
+  atmosphere list
+  atmosphere run spring-boot-chat
+  atmosphere run spring-boot-ai-chat --env LLM_API_KEY=sk-xxx
+  atmosphere new my-chat-app
+  atmosphere new my-ai-app --template ai-chat
+  atmosphere new my-ai-app --template ai-chat --runtime langchain4j
+  atmosphere new my-ai-app --template ai-chat --runtime spring-ai --force
+  atmosphere new my-ai-app --template ai-chat --routing
+  atmosphere checkpoint list --coordination dispatch
+  atmosphere checkpoint approve abc-123 --by alice
+
+${BOLD}Environment:${RESET}
+  ATMOSPHERE_HOME              Cache directory (default: ~/.atmosphere)
+  ATMOSPHERE_CHECKPOINT_URL    Base URL for 'atmosphere checkpoint' (default: http://localhost:8095)
+  JAVA_OPTS                    Extra JVM options passed to samples
+
+EOF
+}
+
+cmd_list() {
+    filter_tag=""
+    filter_category=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --tag)      filter_tag="$2"; shift 2 ;;
+            --category) filter_category="$2"; shift 2 ;;
+            -*)         die "Unknown option: $1" ;;
+            *)          die "Unknown argument: $1" ;;
+        esac
+    done
+
+    json=$(get_samples_json)
+
+    if has_jq; then
+        filter='.'
+        if [ -n "$filter_tag" ]; then
+            filter="$filter | select(.tags | index(\"$filter_tag\"))"
+        fi
+        if [ -n "$filter_category" ]; then
+            filter="$filter | select(.category == \"$filter_category\")"
+        fi
+
+        printf "\n${BOLD}%-36s %-8s %-14s %s${RESET}\n" "SAMPLE" "PORT" "CATEGORY" "DESCRIPTION"
+        printf "%-36s %-8s %-14s %s\n" "------" "----" "--------" "-----------"
+
+        printf '%s' "$json" | jq -r "
+            .samples[] | $filter |
+            \"\(.name)|\(.port)|\(.category)|\(.runnable)|\(.description)\"
+        " | while IFS='|' read -r name port category runnable desc; do
+            if [ "$runnable" = "true" ]; then
+                marker="${GREEN}●${RESET}"
+            else
+                marker="${DIM}○${RESET}"
+            fi
+            printf "${marker} %-35s %-8s %-14s %s\n" "$name" "$port" "$category" "$desc"
+        done
+
+        printf "\n${DIM}● = runnable with 'atmosphere run'  ○ = requires manual setup${RESET}\n\n"
+    else
+        printf "\n${BOLD}Available Samples:${RESET}\n\n"
+        list_sample_names "$json" | while read -r name; do
+            printf "  %s\n" "$name"
+        done
+        printf "\n${DIM}Install jq for richer output: brew install jq${RESET}\n\n"
+    fi
+}
+
+cmd_info() {
+    [ -z "$1" ] && die "Usage: atmosphere info <sample>"
+    sample="$1"
+    json=$(get_samples_json)
+
+    if has_jq; then
+        block=$(printf '%s' "$json" | jq ".samples[] | select(.name == \"$sample\")")
+        [ -z "$block" ] && die "Unknown sample: $sample"
+
+        name=$(printf '%s' "$block" | jq -r '.name')
+        desc=$(printf '%s' "$block" | jq -r '.description')
+        category=$(printf '%s' "$block" | jq -r '.category')
+        port=$(printf '%s' "$block" | jq -r '.port')
+        runnable=$(printf '%s' "$block" | jq -r '.runnable')
+        packaging=$(printf '%s' "$block" | jq -r '.packaging')
+        tags=$(printf '%s' "$block" | jq -r '.tags | join(", ")')
+        has_frontend=$(printf '%s' "$block" | jq -r '.hasFrontend')
+        note=$(printf '%s' "$block" | jq -r '.note // empty')
+        env_vars=$(printf '%s' "$block" | jq -r '.envVars // empty | to_entries[] | "  \(.key): \(.value)"' 2>/dev/null)
+
+        printf "\n${BOLD}%s${RESET}\n" "$name"
+        printf "  %s\n\n" "$desc"
+        printf "  ${DIM}Category:${RESET}    %s\n" "$category"
+        printf "  ${DIM}Tags:${RESET}        %s\n" "$tags"
+        printf "  ${DIM}Port:${RESET}        %s\n" "$port"
+        printf "  ${DIM}Packaging:${RESET}   %s\n" "$packaging"
+        printf "  ${DIM}Frontend:${RESET}    %s\n" "$has_frontend"
+        printf "  ${DIM}Runnable:${RESET}    %s\n" "$runnable"
+
+        if [ -n "$note" ]; then
+            printf "\n  ${YELLOW}Note:${RESET} %s\n" "$note"
+        fi
+
+        if [ -n "$env_vars" ]; then
+            printf "\n  ${BOLD}Environment Variables:${RESET}\n"
+            printf '%s\n' "$env_vars"
+        fi
+
+        if [ "$runnable" = "true" ]; then
+            printf "\n  ${GREEN}Run:${RESET} atmosphere run %s\n" "$name"
+        fi
+        printf "\n"
+    else
+        printf "\n  %s\n" "$sample"
+        printf "  ${DIM}Install jq for detailed info: brew install jq${RESET}\n\n"
+    fi
+}
+
+# ── Install (interactive picker) ────────────────────────────────────────────
+
+cmd_install() {
+    filter_tag=""
+    filter_category=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --tag)      filter_tag="$2"; shift 2 ;;
+            --category) filter_category="$2"; shift 2 ;;
+            -*)         die "Unknown option: $1" ;;
+            *)          die "Unknown argument: $1" ;;
+        esac
+    done
+
+    json=$(get_samples_json)
+
+    if ! has_jq; then
+        die "The install command requires jq. Install it: brew install jq"
+    fi
+
+    # Build jq filter
+    jq_filter='.samples[] | select(.runnable == true)'
+    if [ -n "$filter_tag" ]; then
+        jq_filter="$jq_filter | select(.tags | index(\"$filter_tag\"))"
+    fi
+    if [ -n "$filter_category" ]; then
+        jq_filter="$jq_filter | select(.category == \"$filter_category\")"
+    fi
+
+    # Build the display lines: "name | category | description"
+    lines=$(printf '%s' "$json" | jq -r "$jq_filter | \"\(.name)|\(.category)|\(.port)|\(.description)\"")
+
+    if [ -z "$lines" ]; then
+        die "No samples match your filter"
+    fi
+
+    # Try fzf first, then fall back to numbered menu
+    if command -v fzf >/dev/null 2>&1; then
+        selected=$(install_with_fzf "$lines" "$json")
+    else
+        selected=$(install_with_menu "$lines")
+    fi
+
+    if [ -z "$selected" ]; then
+        printf "\n${DIM}No sample selected${RESET}\n"
+        exit 0
+    fi
+
+    # Show info and confirm
+    printf "\n"
+    cmd_info "$selected"
+
+    printf "  ${BOLD}What would you like to do?${RESET}\n\n"
+    printf "    ${GREEN}1${RESET}) Run it now          ${DIM}(builds from source, caches JAR, starts on configured port)${RESET}\n"
+    printf "    ${GREEN}2${RESET}) Install source code  ${DIM}(clones sample into ./$selected/)${RESET}\n"
+    printf "    ${GREEN}3${RESET}) Cancel\n\n"
+    printf "  Choice [1]: "
+    read -r choice
+
+    case "${choice:-1}" in
+        1)  cmd_run "$selected" ;;
+        2)  install_source "$selected" "$json" ;;
+        *)  printf "\n${DIM}Cancelled${RESET}\n" ;;
+    esac
+}
+
+install_with_fzf() {
+    lines="$1"
+    json="$2"
+
+    # Format for fzf display
+    display=$(printf '%s' "$lines" | while IFS='|' read -r name category port desc; do
+        printf "%-36s %-14s %-6s %s\n" "$name" "$category" ":$port" "$desc"
+    done)
+
+    header=$(printf "%-36s %-14s %-6s %s" "SAMPLE" "CATEGORY" "PORT" "DESCRIPTION")
+
+    chosen=$(printf '%s' "$display" | fzf \
+        --header "$header" \
+        --header-first \
+        --height 40% \
+        --layout reverse \
+        --border rounded \
+        --prompt "Choose a sample > " \
+        --pointer "▸" \
+        --marker "●" \
+        --preview-window hidden \
+        --ansi \
+        --no-multi \
+        2>/dev/tty) || true
+
+    if [ -n "$chosen" ]; then
+        # Extract the sample name (first column)
+        printf '%s' "$chosen" | awk '{print $1}'
+    fi
+}
+
+install_with_menu() {
+    lines="$1"
+    tmp_names="/tmp/atmo_install_names.$$"
+    trap 'rm -f "$tmp_names"' EXIT
+
+    printf "\n${BOLD}  Choose a sample to install:${RESET}\n\n" >&2
+
+    # Group by category, build flat ordered list, display with global numbering
+    categories=$(printf '%s\n' "$lines" | while IFS='|' read -r name category port desc; do
+        printf '%s\n' "$category"
+    done | sort -u)
+
+    # Build the flat list first (category-grouped)
+    : > "$tmp_names"
+    for cat in $categories; do
+        printf '%s\n' "$lines" | while IFS='|' read -r name category port desc; do
+            if [ "$category" = "$cat" ]; then
+                printf '%s|%s|%s\n' "$name" "$cat" "$desc"
+            fi
+        done
+    done > "$tmp_names"
+
+    total=$(wc -l < "$tmp_names")
+    total=$(printf '%s' "$total" | tr -d ' ')
+
+    # Display grouped with global numbering
+    idx=0
+    prev_cat=""
+    while IFS='|' read -r name cat desc; do
+        if [ "$cat" != "$prev_cat" ]; then
+            [ -n "$prev_cat" ] && printf "\n" >&2
+            printf "  ${BOLD}${CYAN}%s${RESET}\n" "$(printf '%s' "$cat" | tr '[:lower:]' '[:upper:]')" >&2
+            prev_cat="$cat"
+        fi
+        idx=$((idx + 1))
+        printf "    ${GREEN}%2d${RESET}) %-34s %s\n" "$idx" "$name" "${DIM}$desc${RESET}" >&2
+    done < "$tmp_names"
+
+    printf "\n  ${BOLD}Enter number [1-%s]:${RESET} " "$total" >&2
+    read -r num
+
+    if [ -z "$num" ] || ! printf '%s' "$num" | grep -qE '^[0-9]+$'; then
+        rm -f "$tmp_names"
+        printf '' # empty = cancelled
+        return
+    fi
+
+    if [ "$num" -lt 1 ] || [ "$num" -gt "$total" ]; then
+        rm -f "$tmp_names"
+        printf "Invalid selection: %s\n" "$num" >&2
+        printf '' # empty = cancelled
+        return
+    fi
+
+    selected=$(sed -n "${num}p" "$tmp_names" | cut -d'|' -f1)
+    rm -f "$tmp_names"
+
+    printf '%s' "$selected"
+}
+
+# Copy the jarless Maven wrapper from a source repo/archive root into a scaffold
+# so the generated project runs with just a JDK — no system Maven, version
+# pinned by maven-wrapper.properties (portable + reproducible). Deliberately
+# copies ONLY the wrapper; never the reactor-internal GIB files
+# (.mvn/extensions.xml, .mvn/gib.properties, .mvn/maven.config), which assume
+# the multi-module reactor and would break a standalone build.
+#   $1 = source root containing mvnw + .mvn/   $2 = target project dir
+copy_maven_wrapper() {
+    src="$1"; dst="$2"
+    cp "$src/mvnw" "$dst/" 2>/dev/null || true
+    cp "$src/mvnw.cmd" "$dst/" 2>/dev/null || true
+    if [ -f "$src/.mvn/wrapper/maven-wrapper.properties" ]; then
+        mkdir -p "$dst/.mvn/wrapper"
+        cp "$src/.mvn/wrapper/maven-wrapper.properties" "$dst/.mvn/wrapper/" 2>/dev/null || true
+    fi
+    chmod +x "$dst/mvnw" 2>/dev/null || true
+}
+
+install_source() {
+    sample="$1"
+    json="$2"
+    # Optional override: target directory name (defaults to "./$sample").
+    # Used by `atmosphere new` to clone a sample under a user-chosen name.
+    target_dir="${3:-./$sample}"
+    # Optional: when "quiet", suppress the trailing next-steps banner.
+    # `cmd_new` prints its own banner with the user-chosen project name.
+    quiet="${4:-}"
+
+    if [ -d "$target_dir" ]; then
+        die "Directory '$target_dir' already exists"
+    fi
+
+    info "Installing $sample source code to $target_dir..."
+
+    # Clone just the sample directory using sparse checkout
+    tmp_dir=$(mktemp -d)
+    trap 'rm -rf "$tmp_dir"' EXIT
+
+    if command -v git >/dev/null 2>&1; then
+        # --branch pins the checkout to the ref that matches the version this
+        # scaffold's pom.xml will resolve from Central. Report the failure
+        # rather than letting `set -e` abort with no output.
+        git clone --depth 1 --filter=blob:none --sparse --branch "$SOURCE_REF" \
+            https://github.com/Atmosphere/atmosphere.git "$tmp_dir/repo" 2>/dev/null \
+            || die "Could not fetch sample sources at ref '$SOURCE_REF' from https://github.com/Atmosphere/atmosphere.git. Check your network, or set ATMOSPHERE_SOURCE_REF to an existing branch/tag."
+
+        cd "$tmp_dir/repo"
+        # Include the sample plus the jarless Maven wrapper dir; root-level files
+        # (mvnw, mvnw.cmd) come along automatically in cone-mode sparse checkout.
+        git sparse-checkout set "samples/$sample" ".mvn/wrapper" 2>/dev/null
+
+        if [ -d "samples/$sample" ]; then
+            cp -r "samples/$sample" "$OLDPWD/$target_dir"
+            copy_maven_wrapper "." "$OLDPWD/$target_dir"
+            cd "$OLDPWD"
+            ok "Installed source to $target_dir/"
+        else
+            cd "$OLDPWD"
+            die "Sample '$sample' not found in repository"
+        fi
+    else
+        # Fallback: download tarball and extract
+        info "Downloading source archive..."
+        download "$SOURCE_TARBALL_URL" "$tmp_dir/archive.tar.gz"
+        tar xzf "$tmp_dir/archive.tar.gz" -C "$tmp_dir"
+        src_dir=$(find "$tmp_dir" -maxdepth 2 -type d -name "$sample" | head -1)
+
+        if [ -n "$src_dir" ] && [ -d "$src_dir" ]; then
+            cp -r "$src_dir" "$target_dir"
+            # archive layout: <tmp>/atmosphere-main/samples/<sample>
+            copy_maven_wrapper "$(dirname "$(dirname "$src_dir")")" "$target_dir"
+            ok "Installed source to $target_dir/"
+        else
+            die "Sample '$sample' not found in archive"
+        fi
+    fi
+
+    # ── Make the cloned pom.xml standalone ────────────────────────────────
+    # Samples inherit from the reactor root pom (../../pom.xml), which is
+    # absent after sparse-clone. The release parent `org.atmosphere:atmosphere-project`
+    # is published to Maven Central, so we can make the sample build by:
+    #   1. dropping <relativePath> so Maven resolves the parent from Central
+    #   2. pinning SNAPSHOT → pinned release from cli/samples.json
+    #   3. disabling checkstyle/pmd inside <properties> — the atmosphere parent
+    #      binds them to `validate` and they look for config files under
+    #      config/ that only exist inside the atmosphere repo.
+    pom="$target_dir/pom.xml"
+    if [ -f "$pom" ] && grep -q "atmosphere-project" "$pom" 2>/dev/null; then
+        # ATMOSPHERE_VERSION_OVERRIDE lets test fixtures point a scaffolded
+        # project at a locally-installed SNAPSHOT instead of the pinned
+        # release. This is the only way to e2e-validate adapter changes that
+        # haven't shipped to Maven Central yet.
+        release_version="${ATMOSPHERE_VERSION_OVERRIDE:-$VERSION}"
+        awk -v version="$release_version" '
+          BEGIN { in_parent = 0; injected_skips = 0 }
+          /<parent>/ { in_parent = 1 }
+          in_parent && /<relativePath>.*<\/relativePath>/ { next }
+          in_parent && /<version>[^<]*-SNAPSHOT<\/version>/ {
+              gsub(/[0-9]+\.[0-9]+\.[0-9]+-SNAPSHOT/, version)
+          }
+          /<\/parent>/ { in_parent = 0 }
+          !injected_skips && /<\/properties>/ {
+              print "        <!-- atmosphere parent binds checkstyle/pmd to validate with repo-local config. -->"
+              print "        <checkstyle.skip>true</checkstyle.skip>"
+              print "        <pmd.skip>true</pmd.skip>"
+              injected_skips = 1
+          }
+          { print }
+        ' "$pom" > "$pom.new" && mv "$pom.new" "$pom"
+    fi
+
+    if [ "$quiet" = "quiet" ]; then
+        return 0
+    fi
+
+    has_frontend=$(get_sample_field "$sample" "hasFrontend" "$json")
+    port=$(get_sample_field "$sample" "port" "$json")
+    display_dir="${target_dir#./}"
+
+    printf "\n${BOLD}Next steps:${RESET}\n\n"
+    printf "  cd %s\n" "$display_dir"
+
+    if [ "$has_frontend" = "true" ]; then
+        printf "\n  ${DIM}# Build the frontend${RESET}\n"
+        printf "  cd frontend && npm install && npm run build && cd ..\n"
+    fi
+
+    printf "\n  ${DIM}# Build and run${RESET}\n"
+    printf "  mvn spring-boot:run\n"
+    printf "\n  Then open ${CYAN}http://localhost:%s${RESET}\n\n" "$port"
+}
+
+# ── Build from source ──────────────────────────────────────────────────────
+
+# Download the source tarball for the resolved ref (always fresh). The cache
+# file is named per ref so a `main` tarball can never be mistaken for the
+# release sources the built JAR is supposed to come from.
+download_source_tarball() {
+    tarball="$CACHE_DIR/atmosphere-src-$SOURCE_REF.tar.gz"
+    info "Downloading source from $SOURCE_REF..." >&2
+    download "$SOURCE_TARBALL_URL" "$tarball" || {
+        rm -f "$tarball"
+        die "Download failed. Check your network connection."
+    }
+    printf '%s' "$tarball"
+}
+
+# Extract sample dir + mvnw from tarball into a build directory
+extract_sample() {
+    sample="$1"
+    tarball="$2"
+    build_dir="$3"
+
+    # GitHub tarballs use prefix: {repo}-{branch}/ e.g. "atmosphere-main/"
+    prefix=$(tar tzf "$tarball" | head -1 | cut -d'/' -f1)
+
+    mkdir -p "$build_dir"
+
+    # Extract mvnw + .mvn wrapper
+    tar xzf "$tarball" -C "$build_dir" --strip-components=1 \
+        "$prefix/mvnw" "$prefix/.mvn" 2>/dev/null || true
+
+    # Extract sample source
+    tar xzf "$tarball" -C "$build_dir" --strip-components=1 \
+        "$prefix/samples/$sample" 2>/dev/null || \
+        die "Sample '$sample' not found in the repository"
+
+    [ -d "$build_dir/samples/$sample" ] || die "Sample '$sample' not found in the repository"
+
+    chmod +x "$build_dir/mvnw" 2>/dev/null || true
+}
+
+# Patch POM so it builds standalone (parent from Central, not local filesystem)
+patch_pom_for_standalone() {
+    pom="$1"
+    tmp_pom="${pom}.tmp"
+    # 1. Remove relativePath so parent resolves from Maven Central
+    # 2. Pin parent version to the released VERSION (source carries -SNAPSHOT).
+    #    Honour ATMOSPHERE_VERSION_OVERRIDE the same way install_source does, so
+    #    the pinned artefacts and the ref the source came from always agree.
+    pom_version="${ATMOSPHERE_VERSION_OVERRIDE:-$VERSION}"
+    sed -e 's|<relativePath>../../pom.xml</relativePath>|<relativePath/>|' \
+        -e 's|<version>[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*-SNAPSHOT</version>|<version>'"$pom_version"'</version>|' \
+        "$pom" > "$tmp_pom"
+    mv "$tmp_pom" "$pom"
+}
+
+# Build a sample from source and cache the resulting JAR
+build_sample() {
+    sample="$1"
+    packaging="$2"
+    jar_file="$3"
+
+    ensure_cache_dir
+    tarball=$(download_source_tarball)
+
+    build_dir=$(mktemp -d)
+    build_cleanup() { rm -rf "$build_dir"; }
+    trap build_cleanup EXIT
+
+    info "Extracting $sample source..."
+    extract_sample "$sample" "$tarball" "$build_dir"
+
+    patch_pom_for_standalone "$build_dir/samples/$sample/pom.xml"
+
+    printf "\n"
+    info "Building $sample (first run downloads dependencies)..."
+    printf "${DIM}This may take a minute — subsequent runs use the cached JAR.${RESET}\n\n"
+
+    # Build with the extracted mvnw
+    save_dir="$PWD"
+    cd "$build_dir/samples/$sample"
+    "$build_dir/mvnw" package -DskipTests -Dcheckstyle.skip=true -Dpmd.skip=true -B 2>&1 || {
+        cd "$save_dir"
+        die "Build failed for $sample. Check output above for details."
+    }
+    cd "$save_dir"
+
+    # Find and cache the built JAR
+    if [ "$packaging" = "quarkus" ]; then
+        # Quarkus: cache the entire quarkus-app directory
+        quarkus_app="$build_dir/samples/$sample/target/quarkus-app"
+        if [ -d "$quarkus_app" ]; then
+            # Namespace the cached app directory per sample. A shared name lets
+            # a second Quarkus sample overwrite the first one's exploded app
+            # while the first sample's marker still points at it — the next
+            # `atmosphere run <first-sample>` then reports a cache hit and boots
+            # the *other* application.
+            cache_qdir="$(dirname "$jar_file")/$sample-quarkus-app"
+            rm -rf "$cache_qdir"
+            cp -r "$quarkus_app" "$cache_qdir"
+            # Create a marker file so cmd_run knows this is a quarkus app
+            printf '%s' "$cache_qdir" > "$jar_file"
+            ok "Built and cached $sample"
+        else
+            die "No quarkus-app directory found after build"
+        fi
+    else
+        built_jar=$(find "$build_dir/samples/$sample/target" -maxdepth 1 \
+            -name "*.jar" ! -name "*-original*" ! -name "*-sources*" ! -name "*-javadoc*" \
+            | head -1)
+
+        if [ -z "$built_jar" ] || [ ! -f "$built_jar" ]; then
+            die "No JAR found after build in $build_dir/samples/$sample/target/"
+        fi
+
+        cp "$built_jar" "$jar_file"
+        # Record checksum for cache integrity verification
+        sha256sum_portable "$jar_file" > "${jar_file}.sha256"
+        ok "Built and cached $sample"
+    fi
+
+    rm -rf "$build_dir"
+    trap - EXIT
+}
+
+# ── Run ────────────────────────────────────────────────────────────────────
+
+cmd_run() {
+    [ -z "$1" ] && die "Usage: atmosphere run <sample> [--env KEY=VALUE ...]"
+    sample="$1"; shift
+
+    # Parse --env flags
+    env_args=""
+    env_exports=""
+    extra_args=""
+    port_override=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --env)
+                [ -z "$2" ] && die "--env requires KEY=VALUE"
+                case "$2" in
+                    *=*) ;;
+                    *) die "--env requires KEY=VALUE" ;;
+                esac
+                # Set a REAL environment variable on the launched JVM (and keep
+                # the -D mirror for sysprop readers). Env is what the flag name
+                # promises, and an explicit child env also beats an ambient
+                # export from the operator's shell profile — with only -D, an
+                # inherited LLM_BASE_URL silently redirected a "--env
+                # LLM_MODE=local" run to a remote provider.
+                env_args="$env_args -D$2"
+                env_exports="$env_exports $2"
+                shift 2
+                ;;
+            --port|-p)
+                [ -z "$2" ] && die "--port requires a port number"
+                # Resolved once the sample's packaging is known: the HTTP port
+                # property differs per stack, and the banner has to name the
+                # port we actually bind rather than the registry default.
+                port_override="$2"
+                shift 2
+                ;;
+            --)
+                shift; extra_args="$*"; break ;;
+            -*)
+                die "Unknown option: $1" ;;
+            *)
+                extra_args="$extra_args $1"; shift ;;
+        esac
+    done
+
+    # Validate the argument before the toolchain: a sample that cannot be run at
+    # all should say so whatever Java is installed. When ensure_java came first,
+    # `atmosphere run chat` reported the JDK on the box instead of the fact that
+    # `chat` is a WAR, and the message a user got depended on their machine.
+    json=$(get_samples_json)
+
+    runnable=$(get_sample_field "$sample" "runnable" "$json")
+    [ "$runnable" != "true" ] && die "'$sample' is not directly runnable. See: atmosphere info $sample"
+
+    ensure_java
+
+    packaging=$(get_sample_field "$sample" "packaging" "$json")
+    port=$(get_sample_field "$sample" "port" "$json")
+
+    # `--port` has to map to the HTTP port property of the sample's own stack.
+    # Spring Boot reads server.port; Quarkus reads quarkus.http.port and ignores
+    # server.port outright, so a single hard-coded property silently no-ops on
+    # every Quarkus sample. `port` also drives the "Open http://localhost:N"
+    # banner, which must name the port we bind, not the registry default.
+    if [ -n "$port_override" ]; then
+        case "$port_override" in
+            ''|*[!0-9]*) die "--port requires a numeric port number (got '$port_override')" ;;
+        esac
+        port="$port_override"
+        if [ "$packaging" = "quarkus" ]; then
+            env_args="$env_args -Dquarkus.http.port=$port_override"
+        else
+            env_args="$env_args -Dserver.port=$port_override"
+        fi
+    fi
+
+    ensure_cache_dir
+    jar_dir="$CACHE_DIR/v$VERSION"
+    mkdir -p "$jar_dir"
+
+    if [ "$packaging" = "quarkus" ]; then
+        jar_file="$jar_dir/$sample-runner.jar"
+    else
+        jar_file="$jar_dir/$sample.jar"
+    fi
+
+    # Build from source if not cached
+    if [ ! -f "$jar_file" ]; then
+        build_sample "$sample" "$packaging" "$jar_file"
+    else
+        # Verify cached JAR integrity if checksum exists
+        if [ -f "${jar_file}.sha256" ]; then
+            expected=$(cat "${jar_file}.sha256")
+            actual=$(sha256sum_portable "$jar_file")
+            if [ "$expected" != "$actual" ] && [ "$actual" != "no-checksum-tool" ]; then
+                warn "Cached JAR checksum mismatch — rebuilding $sample"
+                rm -f "$jar_file" "${jar_file}.sha256"
+                build_sample "$sample" "$packaging" "$jar_file"
+            else
+                ok "Using cached $sample v$VERSION (verified)"
+            fi
+        else
+            ok "Using cached $sample v$VERSION"
+        fi
+    fi
+
+    # Run
+    printf "\n"
+    # An ambient LLM_BASE_URL from the operator's shell profile applies to every key
+    # the caller did not override, and it outranks LLM_MODE by design. So
+    # `--env LLM_MODE=local` with an inherited remote base URL runs against that
+    # remote provider — burning quota and reporting a model-not-found error that
+    # looks like a broken sample. Say so rather than let it fail confusingly.
+    case " $env_exports " in
+        *" LLM_MODE=local "*)
+            case " $env_exports " in
+                *" LLM_BASE_URL="*) ;;   # caller pinned it — nothing to warn about
+                *)
+                    if [ -n "${LLM_BASE_URL:-}" ] && \
+                       ! printf '%s' "$LLM_BASE_URL" | grep -qE 'localhost|127\.0\.0\.1|\[::1\]'; then
+                        warn "LLM_MODE=local but an inherited LLM_BASE_URL=$LLM_BASE_URL points off-host;"
+                        warn "it outranks the mode. Pass --env LLM_BASE_URL=http://localhost:11434/v1 to stay local."
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
+
+    info "Starting $sample on port $port..."
+    info "Open ${BOLD}http://localhost:$port${RESET} in your browser"
+    printf "${DIM}Press Ctrl+C to stop${RESET}\n\n"
+
+    if [ "$packaging" = "quarkus" ]; then
+        # Quarkus: jar_file is a marker containing the quarkus-app path
+        quarkus_dir=$(cat "$jar_file")
+        # shellcheck disable=SC2086
+        exec env $env_exports java $JAVA_OPTS $env_args -jar "$quarkus_dir/quarkus-run.jar" $extra_args
+    else
+        # shellcheck disable=SC2086
+        exec env $env_exports java $JAVA_OPTS $env_args -jar "$jar_file" $extra_args
+    fi
+}
+
+# Strip every <dependency>...</dependency> block whose <artifactId> matches
+# any artifactId declared in cli/runtime-overlays.json. Used by
+# `--runtime <X> --force` to wipe pre-pinned adapter deps from a scaffolded
+# sample's pom before injecting the chosen overlay — guarantees the resolver
+# picks the requested runtime instead of whichever adapter the sample had
+# pinned (priority-100 ties are otherwise resolved by ServiceLoader iteration
+# order, which is jar-order on the classpath and not user-controllable).
+#
+# Atmosphere's own `atmosphere-ai` is NOT in any overlay's deps list, so the
+# foundational dep stays in place.
+#
+# Usage: strip_competing_adapters <pom-path> <overlays-json>
+strip_competing_adapters() {
+    pom="$1"
+    overlays_json="$2"
+    # BSD awk on macOS chokes on multi-line -v values, so write the
+    # artifactId list to a temp file and stream it via getline.
+    artifacts_file=$(mktemp)
+    printf '%s' "$overlays_json" | jq -r '.overlays | to_entries[] | .value.deps[]?.artifactId' | sort -u > "$artifacts_file"
+    if [ ! -s "$artifacts_file" ]; then
+        rm -f "$artifacts_file"
+        return 0
+    fi
+
+    tmp_pom="${pom}.stripped"
+    awk -v artifacts_file="$artifacts_file" '
+        BEGIN {
+            while ((getline line < artifacts_file) > 0) {
+                if (line != "") strip[line] = 1
+            }
+            close(artifacts_file)
+            in_dep = 0
+            buf = ""
+            skip = 0
+        }
+        /<dependency>/ && in_dep == 0 {
+            in_dep = 1
+            buf = $0
+            skip = 0
+            next
+        }
+        in_dep == 1 {
+            buf = buf "\n" $0
+            for (a in strip) {
+                if (index($0, "<artifactId>" a "</artifactId>")) {
+                    skip = 1
+                }
+            }
+            if (/<\/dependency>/) {
+                if (!skip) print buf
+                buf = ""
+                in_dep = 0
+                skip = 0
+            }
+            next
+        }
+        { print }
+    ' "$pom" > "$tmp_pom" && mv "$tmp_pom" "$pom"
+    rm -f "$artifacts_file"
+}
+
+# ── Runtime overlay (--runtime) ─────────────────────────────────────────────
+# Apply a runtime overlay (cli/runtime-overlays.json) to a scaffolded sample's
+# pom.xml. Appends <dependency> blocks before </dependencies> and an optional
+# <repository> before </repositories> (creating the section if absent). Prints
+# any "note" the overlay carries (e.g., Embabel's release-repository requirement).
+#
+# When force=true, strips every adapter dep declared in
+# cli/runtime-overlays.json before injecting — this turns `--runtime <X>` into
+# a deterministic swap on samples that pre-pin a different provider.
+#
+# Validate a runtime name against cli/runtime-overlays.json without touching a
+# pom. `cmd_new` calls this before the network clone so a typo fails fast
+# instead of leaving a half-created project directory behind — and wedging the
+# project name, since the retry then trips the "already exists" guard.
+#
+# Usage: validate_runtime_name <runtime-name>
+validate_runtime_name() {
+    _vrn_runtime="$1"
+    [ -z "$_vrn_runtime" ] && return 0
+    has_jq || die "--runtime requires jq. Install with: brew install jq"
+    _vrn_overlays=$(get_runtime_overlays_json)
+    printf '%s' "$_vrn_overlays" | jq -e ".overlays[\"$_vrn_runtime\"]" >/dev/null 2>&1 || {
+        _vrn_names=$(printf '%s' "$_vrn_overlays" | jq -r '.overlays | keys | join(", ")')
+        die "Unknown runtime: $_vrn_runtime (available: $_vrn_names)"
+    }
+}
+
+# Usage: apply_runtime_overlay <runtime-name> <pom-path> [force]
+apply_runtime_overlay() {
+    runtime="$1"
+    pom="$2"
+    force="${3:-false}"
+    [ -z "$runtime" ] && return 0
+    [ ! -f "$pom" ] && die "pom.xml not found: $pom"
+
+    has_jq || die "--runtime requires jq. Install with: brew install jq"
+
+    overlays=$(get_runtime_overlays_json)
+    overlay=$(printf '%s' "$overlays" | jq -e ".overlays[\"$runtime\"]" 2>/dev/null) || {
+        names=$(printf '%s' "$overlays" | jq -r '.overlays | keys | join(", ")')
+        die "Unknown runtime: $runtime (available: $names)"
+    }
+
+    # `--force` strips every adapter dep before we inject — even for builtin,
+    # which has no overlay deps but should still wipe pre-pinned adapters so
+    # the resolver lands on Built-in instead of whatever the sample shipped.
+    if [ "$force" = "true" ]; then
+        strip_competing_adapters "$pom" "$overlays"
+        info "Stripped pre-pinned adapter deps (--force)"
+    fi
+
+    # Built-in is the default — no overlay deps to inject (force already wiped
+    # any pre-pinned adapters above, so we can return cleanly).
+    dep_count=$(printf '%s' "$overlay" | jq '.deps | length')
+    if [ "$dep_count" -eq 0 ]; then
+        info "Runtime '$runtime' uses Atmosphere's built-in adapter — no extra deps required"
+        return 0
+    fi
+
+    # Build the <dependency> XML block in a temp file. BSD awk on macOS rejects
+    # multi-line -v values, so we read the block via getline rather than passing
+    # it through a variable.
+    dep_block=$(mktemp)
+    printf '%s' "$overlay" | jq -r '
+        .deps[] |
+        "        <dependency>\n" +
+        "            <groupId>\(.groupId)</groupId>\n" +
+        "            <artifactId>\(.artifactId)</artifactId>" +
+        (if .version then "\n            <version>\(.version)</version>" else "" end) +
+        "\n        </dependency>"
+    ' > "$dep_block"
+
+    # Inject before </dependencies>. Use awk so we only patch the FIRST occurrence
+    # outside <dependencyManagement> (the project's main <dependencies>).
+    tmp_pom="${pom}.tmp"
+    awk -v block_file="$dep_block" '
+        BEGIN { injected = 0; in_mgmt = 0 }
+        /<dependencyManagement>/ { in_mgmt = 1 }
+        /<\/dependencyManagement>/ { in_mgmt = 0 }
+        !injected && !in_mgmt && /<\/dependencies>/ {
+            print "        <!-- Injected by atmosphere CLI runtime overlay -->"
+            while ((getline line < block_file) > 0) print line
+            close(block_file)
+            injected = 1
+        }
+        { print }
+    ' "$pom" > "$tmp_pom" && mv "$tmp_pom" "$pom"
+    rm -f "$dep_block"
+
+    # Optional repository (Embabel). Same getline trick to avoid BSD awk's
+    # multi-line -v limitation.
+    repo_id=$(printf '%s' "$overlay" | jq -r '.repository.id // empty')
+    if [ -n "$repo_id" ]; then
+        repo_url=$(printf '%s' "$overlay" | jq -r '.repository.url')
+        repo_block=$(mktemp)
+        if grep -q "<repositories>" "$pom"; then
+            cat > "$repo_block" <<EOF
+        <repository>
+            <id>$repo_id</id>
+            <url>$repo_url</url>
+            <releases><enabled>true</enabled></releases>
+            <snapshots><enabled>false</enabled></snapshots>
+        </repository>
+EOF
+            awk -v block_file="$repo_block" '
+                BEGIN { injected = 0 }
+                !injected && /<\/repositories>/ {
+                    while ((getline line < block_file) > 0) print line
+                    close(block_file)
+                    injected = 1
+                }
+                { print }
+            ' "$pom" > "$tmp_pom" && mv "$tmp_pom" "$pom"
+        else
+            cat > "$repo_block" <<EOF
+    <repositories>
+        <repository>
+            <id>$repo_id</id>
+            <url>$repo_url</url>
+            <releases><enabled>true</enabled></releases>
+            <snapshots><enabled>false</enabled></snapshots>
+        </repository>
+    </repositories>
+EOF
+            awk -v block_file="$repo_block" '
+                BEGIN { injected = 0 }
+                !injected && /<\/project>/ {
+                    while ((getline line < block_file) > 0) print line
+                    close(block_file)
+                    injected = 1
+                }
+                { print }
+            ' "$pom" > "$tmp_pom" && mv "$tmp_pom" "$pom"
+        fi
+        rm -f "$repo_block"
+    fi
+
+    desc=$(printf '%s' "$overlay" | jq -r '.description')
+    note=$(printf '%s' "$overlay" | jq -r '.note // empty')
+    ok "Applied runtime overlay '$runtime' — $desc"
+    if [ -n "$note" ]; then
+        warn "$note"
+    fi
+    return 0
+}
+
+# ── Routing block (--routing) ───────────────────────────────────────────────
+# AI templates whose scaffold ships a src/main/resources/application.yml.
+# Built from VERIFIED on-disk presence (not assumption): each entry below has a
+# .yml (not .properties / .yaml). The non-yml AI templates (mcp-server and
+# guarded-agent ship application.properties; agent/dentist ships
+# application.yaml) and the plain `chat` template are intentionally excluded —
+# `--routing` injects YAML, so it only applies where there's a .yml to extend.
+ROUTING_AI_TEMPLATES="ai-chat ai-tools rag multi-agent classroom ms-governance coding-agent assistant browser-agent"
+
+# Return 0 if $1 is one of the routing-eligible AI templates, 1 otherwise.
+is_routing_template() {
+    _t="$1"
+    for _rt in $ROUTING_AI_TEMPLATES; do
+        [ "$_t" = "$_rt" ] && return 0
+    done
+    return 1
+}
+
+# Append a COMMENTED, ready-to-uncomment atmosphere.ai.routing.* block to a
+# scaffolded project's application.yml. Off by default: callers only invoke this
+# when `--routing` is set. The emitted tree mirrors modules/ai/README.md (§
+# Routing) verbatim — atmosphere → ai → routing → {enabled, default-model,
+# content-rules[].{keywords, model, base-url, api-key}} — so uncommenting it
+# binds correctly. Because the block is commented, the scaffold is byte-identical
+# unless `--routing` is passed.
+#
+#   - Non-AI / non-yml template  → exit 1 (message contains 'requires an AI template')
+#   - 'routing:' already present → warn + no-op (exit 0, idempotent)
+#   - no application.yml on disk → warn + return 0 (don't break scaffolding)
+#
+# Usage: inject_routing_block <template> <scaffold-dir>
+inject_routing_block() {
+    _tmpl="$1"
+    _dir="$2"
+
+    if ! is_routing_template "$_tmpl"; then
+        die "--routing requires an AI template that ships an application.yml (one of: $ROUTING_AI_TEMPLATES); template '$_tmpl' is not eligible."
+    fi
+
+    _yml="$_dir/src/main/resources/application.yml"
+    if [ ! -f "$_yml" ]; then
+        warn "--routing: no application.yml found at src/main/resources/ — skipping routing block."
+        return 0
+    fi
+
+    if grep -q '^[[:space:]#]*routing:' "$_yml" 2>/dev/null; then
+        warn "--routing: a 'routing:' block already exists in application.yml — leaving it untouched."
+        return 0
+    fi
+
+    # Heredoc keeps the block readable and the indentation explicit. The tree is
+    # rooted at a fresh (commented) `atmosphere:` so it binds standalone when
+    # uncommented, regardless of whether the file already has an atmosphere.ai
+    # node — see modules/ai/README.md (§ Routing) for the live example. A blank
+    # separator line precedes the block so it never fuses onto a prior key.
+    {
+        printf '\n'
+        cat <<'ROUTING_BLOCK'
+# Opt-in model routing (see modules/ai/README.md). Uncomment + set keys to enable.
+# atmosphere:
+#   ai:
+#     routing:
+#       enabled: false
+#       default-model: ${LLM_MODEL:gemini-2.5-flash}
+#       content-rules:
+#         - keywords: [code, refactor, stack trace]
+#           model: gpt-4o
+#           base-url: https://api.openai.com/v1
+#           api-key: ${OPENAI_API_KEY}
+ROUTING_BLOCK
+    } >> "$_yml"
+    info "--routing: appended a commented atmosphere.ai.routing block to application.yml (uncomment to enable)."
+    return 0
+}
+
+cmd_new() {
+    [ -z "$1" ] && die "Usage: atmosphere new <project-name> [--template <template>] [--runtime <runtime> [--force]] [--routing] [--skill-file <path>]"
+    # The project name is positional and consumed before the option loop below, so without this
+    # guard a flag typed in the name slot becomes the directory name: `atmosphere new
+    # --list-templates` used to scaffold a real ./--list-templates/ directory. That flag is a
+    # genuine one on the npx shim (create-atmosphere-app --list-templates), so it is a realistic
+    # thing to type here.
+    case "$1" in
+        -*) die "Invalid project name '$1' — it looks like an option. Usage: atmosphere new <project-name> [--template <template>]. To list templates: npx create-atmosphere-app --list-templates" ;;
+    esac
+    project_name="$1"; shift
+
+    template="chat"
+    skill_file=""
+    runtime=""
+    force="false"
+    routing="false"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --template|-t)
+                shift; [ -z "$1" ] && die "--template requires a value"
+                template="$1"; shift ;;
+            --skill-file|-s)
+                shift; [ -z "$1" ] && die "--skill-file requires a value"
+                skill_file="$1"; shift ;;
+            --runtime|-r)
+                shift; [ -z "$1" ] && die "--runtime requires a value"
+                runtime="$1"; shift ;;
+            --force|-f)
+                force="true"; shift ;;
+            --routing)
+                routing="true"; shift ;;
+            --group|-g)
+                warn "--group is no longer supported. Samples ship with their own groupId;"
+                warn "rename the groupId in pom.xml and the src/main/java package by hand after scaffolding."
+                shift; [ $# -gt 0 ] && shift ;;
+            -*)               die "Unknown option: $1" ;;
+            *)                die "Unknown argument: $1" ;;
+        esac
+    done
+
+    # --force only makes sense with --runtime: it controls whether the overlay
+    # strips pre-pinned adapter deps. Reject the bare flag explicitly so
+    # `atmosphere new foo --force` doesn't silently no-op.
+    if [ "$force" = "true" ] && [ -z "$runtime" ]; then
+        die "--force requires --runtime <name> (it strips other adapters before injecting the chosen one)"
+    fi
+
+    # --skill-file implies an agent template
+    if [ -n "$skill_file" ]; then
+        [ ! -f "$skill_file" ] && die "Skill file not found: $skill_file"
+        template="agent"
+    fi
+
+    # Prevent silent overwrite of existing directories
+    if [ -d "$project_name" ]; then
+        die "Directory '$project_name' already exists. Remove it first or choose a different name."
+    fi
+
+    # Map template name → source sample. Every entry here must exist in
+    # cli/samples.json; `atmosphere new` is a thin wrapper around the same
+    # sparse-clone path used by `atmosphere install`.
+    case "$template" in
+        chat)          source_sample="spring-boot-chat" ;;
+        one-dep-agent) source_sample="spring-boot-one-dep-agent" ;;
+        ai-chat)       source_sample="spring-boot-ai-chat" ;;
+        ai-tools)      source_sample="spring-boot-ai-tools" ;;
+        mcp-server)    source_sample="spring-boot-mcp-server" ;;
+        rag)           source_sample="spring-boot-rag-chat" ;;
+        agent)         source_sample="spring-boot-dentist-agent" ;;
+        multi-agent)   source_sample="spring-boot-multi-agent-startup-team" ;;
+        classroom)     source_sample="spring-boot-ai-classroom" ;;
+        ms-governance) source_sample="spring-boot-ms-governance-chat" ;;
+        coding-agent)  source_sample="spring-boot-coding-agent" ;;
+        guarded-agent) source_sample="spring-boot-guarded-email-agent" ;;
+        assistant)     source_sample="spring-boot-personal-assistant" ;;
+        browser-agent) source_sample="spring-boot-browser-agent" ;;
+        classic-rooms) source_sample="spring-boot-team-rooms" ;;
+        *)             die "Unknown template: $template (chat, one-dep-agent, ai-chat, ai-tools, mcp-server, rag, agent, multi-agent, classroom, ms-governance, coding-agent, guarded-agent, assistant, browser-agent, classic-rooms)" ;;
+    esac
+
+    # --routing is only meaningful for AI templates that ship an application.yml.
+    # Validate BEFORE the network clone so a bad combo (e.g. `--routing
+    # --template chat`) fails fast instead of cloning then erroring.
+    if [ "$routing" = "true" ] && ! is_routing_template "$template"; then
+        die "--routing requires an AI template that ships an application.yml (one of: $ROUTING_AI_TEMPLATES); template '$template' is not eligible."
+    fi
+
+    # Same discipline for --runtime: reject an unknown adapter name BEFORE the
+    # clone. Validating it inside apply_runtime_overlay (i.e. after the clone)
+    # leaves the half-created project on disk when the name is a typo.
+    validate_runtime_name "$runtime"
+
+    json=$(get_samples_json)
+    info "Scaffolding '$project_name' from sample '$source_sample'..."
+    install_source "$source_sample" "$json" "$project_name" quiet
+
+    # Copy skill file into the project
+    if [ -n "$skill_file" ]; then
+        mkdir -p "$project_name/src/main/resources/prompts"
+        cp "$skill_file" "$project_name/src/main/resources/prompts/skill.md"
+        info "Copied skill file to src/main/resources/prompts/skill.md"
+    fi
+
+    # Apply runtime overlay if requested. The AgentRuntime SPI picks the
+    # highest-priority runtime present on the classpath, so injecting the
+    # overlay's deps into a transparent template (e.g. ai-chat) is enough
+    # to swap providers without code changes. With --force, pre-pinned
+    # adapter deps are stripped first so the swap is deterministic on
+    # samples that already ship a different provider.
+    if [ -n "$runtime" ]; then
+        apply_runtime_overlay "$runtime" "$project_name/pom.xml" "$force"
+    fi
+
+    # Inject the opt-in (commented) routing block when requested. Eligibility was
+    # already validated above; here we only locate the .yml and append. Without
+    # --routing this is never called, so the scaffold is byte-identical.
+    if [ "$routing" = "true" ]; then
+        inject_routing_block "$template" "$project_name"
+    fi
+
+    ok "Project created: $project_name/"
+    printf "\n  cd %s\n  ./mvnw spring-boot:run\n\n" "$project_name"
+}
+
+# ── Import ─────────────────────────────────────────────────────────────────
+
+SKILLS_REGISTRY_URL="https://raw.githubusercontent.com/Atmosphere/atmosphere-skills/main/registry.json"
+SKILLS_BASE_URL="https://raw.githubusercontent.com/Atmosphere/atmosphere-skills/main"
+
+PLUGINS_DIR="${ATMOSPHERE_PLUGINS_DIR:-$HOME/.atmosphere/plugins}"
+
+# Trusted skill sources — URLs from these GitHub orgs/repos are allowed without --trust flag
+TRUSTED_SOURCES="
+github.com/Atmosphere/
+github.com/anthropics/skills
+github.com/sickn33/antigravity-awesome-skills
+github.com/K-Dense-AI/
+github.com/agentskills/
+raw.githubusercontent.com/Atmosphere/
+raw.githubusercontent.com/anthropics/
+raw.githubusercontent.com/sickn33/antigravity-awesome-skills
+raw.githubusercontent.com/K-Dense-AI/
+raw.githubusercontent.com/agentskills/
+"
+
+# Check if a URL is from a trusted source
+is_trusted_source() {
+    local url="$1"
+    local _ts
+    for _ts in $TRUSTED_SOURCES; do
+        [ -z "$_ts" ] && continue
+        if printf '%s' "$url" | grep -q "$_ts"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Delegate to a target plugin for project scaffolding.
+# Plugins are shell scripts at ~/.atmosphere/plugins/import-<target>.sh
+# Contract: plugin receives (skill_file, project_name, skill_name, skill_desc, headless)
+run_import_plugin() {
+    local target="$1" skill_file="$2" project_name="$3" skill_name="$4" skill_desc="$5" headless="$6"
+    local plugin_script="$PLUGINS_DIR/import-${target}.sh"
+    if [ ! -f "$plugin_script" ]; then
+        die "Import plugin '$target' not found at $plugin_script"
+    fi
+    if [ ! -x "$plugin_script" ]; then
+        chmod +x "$plugin_script"
+    fi
+    info "Delegating to '$target' plugin..."
+    "$plugin_script" "$skill_file" "$project_name" "$skill_name" "$skill_desc" "$headless"
+}
+
+cmd_import() {
+    local headless=false
+    local target=""
+    local project_name_arg=""
+    local trust=false
+    local source=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --headless) headless=true; shift ;;
+            --target|-t) shift; [ -z "$1" ] && die "--target requires a value"; target="$1"; shift ;;
+            --name) shift; [ -z "$1" ] && die "--name requires a value"; project_name_arg="$1"; shift ;;
+            --trust) trust=true; shift ;;
+            --help|-h) echo "Usage: atmosphere import [--trust] [--headless] [--name <project>] [--target <plugin>] <url-or-skill-id>"; return 0 ;;
+            -*) die "Unknown option: $1" ;;
+            *) [ -z "$source" ] && source="$1" || true; shift ;;
+        esac
+    done
+
+    [ -z "$source" ] && die "Usage: atmosphere import [--trust] [--headless] [--name <project>] <url-or-skill-id>"
+
+    local project_name="${project_name_arg:-}"
+    local skill_content=""
+    local skill_name=""
+    local skill_desc=""
+
+    # Detect source type
+    if [ -f "$source" ]; then
+        # Local file
+        info "Reading skill from $source..."
+        skill_content=$(cat "$source")
+    elif echo "$source" | grep -qE '^https?://'; then
+        # [P2] Normalize GitHub URLs: blob/... → raw content
+        if echo "$source" | grep -qE 'github\.com/[^/]+/[^/]+/blob/'; then
+            source=$(echo "$source" | sed 's|github\.com/\([^/]*/[^/]*\)/blob/|raw.githubusercontent.com/\1/|')
+            info "Normalized GitHub URL to raw content"
+        elif echo "$source" | grep -qE 'gist\.github\.com/'; then
+            source=$(echo "$source" | sed 's|gist\.github\.com/|gist.githubusercontent.com/|')
+            # Gist raw URLs need /raw appended
+            echo "$source" | grep -q '/raw' || source="${source}/raw"
+        fi
+
+        # Check trust for remote URLs
+        if [ "$trust" = false ] && ! is_trusted_source "$source"; then
+            warn "Untrusted source: $source"
+            warn "Add --trust to import from untrusted sources"
+            die "Use: atmosphere import --trust $source"
+        fi
+
+        # URL — download directly
+        info "Downloading skill from $source..."
+        ensure_cache_dir
+        local tmp_file="$CACHE_DIR/imported-skill.md"
+        download "$source" "$tmp_file"
+        skill_content=$(cat "$tmp_file")
+    else
+        # Treat as skill ID from registry
+        info "Looking up skill '$source' in registry..."
+        ensure_cache_dir
+        download "$SKILLS_REGISTRY_URL" "$CACHE_DIR/skills-registry.json"
+
+        if has_jq; then
+            local skill_path
+            skill_path=$(jq -r ".skills[] | select(.id == \"$source\") | .path" "$CACHE_DIR/skills-registry.json")
+            [ -z "$skill_path" ] || [ "$skill_path" = "null" ] && die "Skill not found: $source"
+
+            local skill_url="$SKILLS_BASE_URL/$skill_path"
+            info "Downloading $skill_url..."
+            local tmp_file="$CACHE_DIR/imported-skill.md"
+            download "$skill_url" "$tmp_file"
+            skill_content=$(cat "$tmp_file")
+        else
+            die "jq is required for registry lookups. Install with: brew install jq"
+        fi
+    fi
+
+    # Parse YAML frontmatter
+    if printf '%s\n' "$skill_content" | head -1 | grep -q '^---$'; then
+        skill_name=$(printf '%s\n' "$skill_content" | sed -n '/^---$/,/^---$/p' | grep '^name:' | sed 's/name: *//;s/"//g' | head -1)
+        skill_desc=$(printf '%s\n' "$skill_content" | sed -n '/^---$/,/^---$/p' | grep '^description:' | sed 's/description: *//;s/"//g' | head -1)
+    fi
+
+    # Fallback: extract from first heading
+    if [ -z "$skill_name" ]; then
+        skill_name=$(printf '%s\n' "$skill_content" | grep '^# ' | head -1 | sed 's/^# //' | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+    fi
+    [ -z "$skill_name" ] && skill_name="imported-agent"
+    [ -z "$skill_desc" ] && skill_desc="Imported agent skill"
+
+    # [P0] Sanitize skill_name: only allow [a-z0-9-], strip everything else
+    skill_name=$(echo "$skill_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//')
+    [ -z "$skill_name" ] && skill_name="imported-agent"
+
+    # [P0] Sanitize skill_desc: escape quotes and backslashes for Java string literal
+    skill_desc=$(printf '%s' "$skill_desc" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g' | cut -c1-200)
+
+    # [P1] Project name: sanitize to prevent path traversal
+    [ -z "$project_name" ] && project_name="$skill_name"
+    project_name=$(printf '%s' "$project_name" | sed 's|[/\\.]||g' | sed 's/[^a-zA-Z0-9_-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//')
+    [ -z "$project_name" ] && project_name="imported-agent"
+
+    ok "Parsed skill: $skill_name"
+    printf "  ${DIM}Description:${RESET} %s\n" "$skill_desc"
+
+    # Delegate to plugin if --target specified
+    if [ -n "$target" ]; then
+        # Save skill content to a temp file for the plugin
+        local plugin_skill_file
+        plugin_skill_file=$(mktemp)
+        printf '%s\n' "$skill_content" > "$plugin_skill_file"
+        run_import_plugin "$target" "$plugin_skill_file" "$project_name" "$skill_name" "$skill_desc" "$headless"
+        rm -f "$plugin_skill_file"
+        return $?
+    fi
+
+    # Default: scaffold standalone Atmosphere project
+    info "Scaffolding project '$project_name'..."
+    local project_dir="$project_name"
+
+    # [P1] Verify project_dir is a simple name (no path separators)
+    case "$project_dir" in
+        */*|*\\*) die "Invalid project name: $project_dir" ;;
+    esac
+
+    if [ -d "$project_dir" ]; then
+        die "Directory '$project_dir' already exists"
+    fi
+
+    # Place skill file at both paths:
+    # - META-INF/skills/{name}/SKILL.md for auto-discovery (4.0.26+)
+    # - prompts/skill.md for explicit skillFile reference (4.0.25 compat)
+    mkdir -p "$project_dir/src/main/resources/META-INF/skills/$skill_name"
+    printf '%s\n' "$skill_content" > "$project_dir/src/main/resources/META-INF/skills/$skill_name/SKILL.md"
+    mkdir -p "$project_dir/src/main/resources/prompts"
+    printf '%s\n' "$skill_content" > "$project_dir/src/main/resources/prompts/skill.md"
+
+    # Generate class name: "frontend-design" → "FrontendDesign"
+    # [P1] Prepend 'X' if name starts with a digit (invalid Java identifier)
+    local agent_class=$(echo "$skill_name" | sed 's/[^a-zA-Z0-9]/ /g' | awk '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) substr($i,2)}1' | tr -d ' ')
+    case "$agent_class" in [0-9]*) agent_class="Agent${agent_class}" ;; esac
+    local safe_pkg=$(echo "$skill_name" | tr '-' '_' | sed 's/[^a-z0-9_]//g')
+    case "$safe_pkg" in [0-9]*) safe_pkg="agent_${safe_pkg}" ;; esac
+    local package_name="com.example.${safe_pkg}"
+    local package_dir=$(echo "$package_name" | tr '.' '/')
+
+    mkdir -p "$project_dir/src/main/java/$package_dir"
+
+    # Extract @AiTool stubs from ## Tools section
+    ensure_cache_dir
+    local tool_stubs=""
+    local tool_imports=""
+    local tools_section
+    tools_section=$(printf '%s\n' "$skill_content" | sed -n '/^## Tools/,/^## /p' | grep '^\- ' | sed 's/^- //')
+
+    if [ -n "$tools_section" ]; then
+        tool_imports="
+import org.atmosphere.ai.annotation.AiTool;
+import org.atmosphere.ai.annotation.Param;"
+
+        ensure_cache_dir
+        local stubs_file
+        if [ -w "$CACHE_DIR" ]; then
+            stubs_file="$CACHE_DIR/import-stubs-$$"
+        else
+            stubs_file="${TMPDIR:-/tmp}/atmosphere-import-stubs-$$"
+        fi
+        : > "$stubs_file"
+        local tool_count=0
+
+        printf '%s\n' "$tools_section" | while IFS= read -r tool_line; do
+            # Parse "tool_name: description" or "tool_name — description" or just "tool name"
+            tool_name=""
+            tool_desc=""
+            if printf '%s' "$tool_line" | grep -q ':'; then
+                tool_name=$(printf '%s' "$tool_line" | cut -d: -f1 | tr -d ' ' | tr '[:upper:]' '[:lower:]')
+                tool_desc=$(printf '%s' "$tool_line" | cut -d: -f2- | sed 's/^ *//')
+            elif printf '%s' "$tool_line" | grep -q '—'; then
+                tool_name=$(printf '%s' "$tool_line" | cut -d'—' -f1 | tr -d ' ' | tr '[:upper:]' '[:lower:]')
+                tool_desc=$(printf '%s' "$tool_line" | cut -d'—' -f2- | sed 's/^ *//')
+            else
+                tool_name=$(printf '%s' "$tool_line" | tr '[:upper:]' '[:lower:]' | tr ' ' '_' | sed 's/[^a-z0-9_]//g')
+                tool_desc="$tool_line"
+            fi
+
+            # Sanitize tool_name: only [a-z0-9_], strip markdown emphasis
+            tool_name=$(printf '%s' "$tool_name" | sed 's/[*`]//g' | sed 's/[^a-z0-9_]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
+            [ -z "$tool_name" ] && continue
+
+            # Sanitize tool_desc: escape backslashes and quotes for Java string
+            tool_desc=$(printf '%s' "$tool_desc" | sed 's/[*`]//g' | sed 's/\\/\\\\/g' | sed 's/"/\\"/g' | cut -c1-150)
+
+            # Convert to Java method name: "get_weather" → "getWeather"
+            method_name=$(printf '%s' "$tool_name" | awk -F_ '{for(i=1;i<=NF;i++){if(i==1)printf "%s",$i;else printf "%s",toupper(substr($i,1,1))substr($i,2)}print ""}')
+
+            cat >> "$stubs_file" <<STUBEOF
+
+    @AiTool(name = "${tool_name}", description = "${tool_desc}")
+    public String ${method_name}(@Param("input") String input) {
+        // TODO: implement
+        return "${tool_name} result for: " + input;
+    }
+STUBEOF
+        done
+
+        if [ -s "$stubs_file" ]; then
+            tool_stubs=$(cat "$stubs_file")
+            tool_count=$(grep -c '@AiTool' "$stubs_file")
+        fi
+        rm -f "$stubs_file"
+
+        info "Generated $tool_count @AiTool stubs from ## Tools section"
+    fi
+
+    if [ "$headless" = true ]; then
+        # Headless agent — A2A/MCP only, no WebSocket UI
+        local skill_imports="
+import org.atmosphere.a2a.annotation.AgentSkill;
+import org.atmosphere.a2a.annotation.AgentSkillHandler;
+import org.atmosphere.a2a.annotation.AgentSkillParam;
+import org.atmosphere.a2a.types.Artifact;
+import org.atmosphere.a2a.runtime.TaskContext;"
+
+        cat > "$project_dir/src/main/java/$package_dir/${agent_class}Agent.java" <<JAVAEOF
+package $package_name;
+
+import org.atmosphere.agent.annotation.Agent;${skill_imports}${tool_imports}
+
+@Agent(name = "$skill_name", headless = true,
+       description = "$skill_desc")
+public class ${agent_class}Agent {
+
+    @AgentSkill(id = "execute", name = "Execute", description = "$skill_desc")
+    @AgentSkillHandler
+    public void execute(TaskContext task, @AgentSkillParam(name = "input") String input) {
+        // TODO: implement skill logic
+        task.addArtifact(Artifact.text("Result for: " + input));
+        task.complete("Done");
+    }${tool_stubs}
+}
+JAVAEOF
+        info "Generated headless @Agent (A2A/MCP only)"
+    else
+        # Full-stack agent — WebSocket UI + all protocols
+        cat > "$project_dir/src/main/java/$package_dir/${agent_class}Agent.java" <<JAVAEOF
+package $package_name;
+
+import org.atmosphere.agent.annotation.Agent;
+import org.atmosphere.ai.StreamingSession;
+import org.atmosphere.ai.annotation.Prompt;${tool_imports}
+
+@Agent(name = "$skill_name",
+       description = "$skill_desc")
+public class ${agent_class}Agent {
+
+    @Prompt
+    public void onMessage(String message, StreamingSession session) {
+        session.stream(message);
+    }${tool_stubs}
+}
+JAVAEOF
+    fi
+
+    cat > "$project_dir/src/main/java/$package_dir/Application.java" <<JAVAEOF
+package $package_name;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class Application {
+    public static void main(String[] args) {
+        SpringApplication.run(Application.class, args);
+    }
+}
+JAVAEOF
+
+    cat > "$project_dir/src/main/resources/application.yml" <<YMLEOF
+atmosphere:
+  ai:
+    api-key: \${LLM_API_KEY:\${GEMINI_API_KEY:}}
+    model: \${LLM_MODEL:gemini-2.5-flash}
+  packages: ${package_name}
+YMLEOF
+
+    cat > "$project_dir/pom.xml" <<POMEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>4.0.3</version>
+    </parent>
+
+    <groupId>com.example</groupId>
+    <artifactId>$project_name</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+
+    <properties>
+        <java.version>21</java.version>
+        <atmosphere.version>${VERSION}</atmosphere.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-spring-boot-starter</artifactId>
+            <version>\${atmosphere.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-agent</artifactId>
+            <version>\${atmosphere.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-ai</artifactId>
+            <version>\${atmosphere.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-a2a</artifactId>
+            <version>\${atmosphere.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-mcp</artifactId>
+            <version>\${atmosphere.version}</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+POMEOF
+
+    ok "Project scaffolded at ./$project_dir"
+    printf "\n"
+    printf "  ${BOLD}Run it:${RESET}\n"
+    printf "  cd %s && LLM_API_KEY=your-key ./mvnw spring-boot:run\n" "$project_dir"
+    printf "\n"
+    printf "  ${BOLD}Files:${RESET}\n"
+    printf "  %s/src/main/resources/prompts/skill.md  ${DIM}(skill file)${RESET}\n" "$project_dir"
+    printf "  %s/src/main/java/%s/${agent_class}Agent.java  ${DIM}(agent class)${RESET}\n" "$project_dir" "$package_dir"
+    printf "\n"
+}
+
+# ── Compose (multi-agent project generator) ────────────────────────────────
+
+# Print the directory holding ComposeGenerator.java *and* its templates/.
+#
+# ComposeGenerator reads -Djbang.source to find templates/ and otherwise walks
+# the CWD for generator/templates. jbang does not set jbang.source (verified
+# against jbang 0.137.0), and neither cli/install.sh nor the Homebrew formula
+# installs generator/templates, so `atmosphere compose` died with
+# "Cannot find generator templates" for every user who was not standing inside
+# a checkout of this repo. Materialise the generator from the pinned source ref
+# and hand jbang an explicit -Djbang.source.
+resolve_compose_generator() {
+    _rcg_script_dir="$(cd "$(dirname "$0")" && pwd)"
+    if [ -f "$_rcg_script_dir/../generator/ComposeGenerator.java" ] \
+       && [ -d "$_rcg_script_dir/../generator/templates/compose" ]; then
+        (cd "$_rcg_script_dir/../generator" && pwd)
+        return 0
+    fi
+
+    # The generator also reads its *parent* directory: mvnw + .mvn/wrapper are
+    # copied into the generated project, and the reactor root pom.xml supplies
+    # <spring-boot.version>. Stage those alongside generator/ so a cached copy
+    # produces byte-identical output to an in-repo run.
+    _rcg_root="$CACHE_DIR/generator-src-$SOURCE_REF"
+    if [ -f "$_rcg_root/generator/ComposeGenerator.java" ] \
+       && [ -d "$_rcg_root/generator/templates/compose" ]; then
+        printf '%s\n' "$_rcg_root/generator"
+        return 0
+    fi
+
+    ensure_cache_dir
+    _rcg_tarball=$(download_source_tarball)
+    _rcg_prefix=$(tar tzf "$_rcg_tarball" | head -1 | cut -d'/' -f1)
+    _rcg_stage=$(mktemp -d)
+    tar xzf "$_rcg_tarball" -C "$_rcg_stage" --strip-components=1 \
+        "$_rcg_prefix/generator" \
+        "$_rcg_prefix/mvnw" \
+        "$_rcg_prefix/mvnw.cmd" \
+        "$_rcg_prefix/.mvn/wrapper" \
+        "$_rcg_prefix/pom.xml" \
+        "$_rcg_prefix/modules/spring-boot-starter/pom.xml" 2>/dev/null || {
+        rm -rf "$_rcg_stage"
+        die "Could not extract the compose generator from the $SOURCE_REF source archive."
+    }
+    if [ ! -d "$_rcg_stage/generator/templates/compose" ]; then
+        rm -rf "$_rcg_stage"
+        die "The $SOURCE_REF source archive has no generator/templates/compose directory."
+    fi
+    chmod +x "$_rcg_stage/mvnw" 2>/dev/null || true
+    rm -rf "$_rcg_root"
+    mv "$_rcg_stage" "$_rcg_root"
+    printf '%s\n' "$_rcg_root/generator"
+}
+
+cmd_compose() {
+    local compose_name=""
+    local compose_group="com.example"
+    local compose_protocol=""
+    local compose_transport=""
+    local compose_frontend=""
+    local compose_ai=""
+    local compose_deploy=""
+    local compose_skills=""
+    local compose_output=""
+    local skill_args=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --help|-h)
+                cat <<COMPOSEEOF
+${BOLD}Usage:${RESET} atmosphere compose [options] [skill-files...]
+
+Generate a multi-agent Atmosphere project from skill files.
+
+${BOLD}Options:${RESET}
+  --name, -n <name>         Project name
+  --group, -g <id>          Group ID (default: com.example)
+  --protocol <a2a|local>    Agent communication protocol
+  --transport <websocket|sse> Client transport
+  --frontend <react|none>   Frontend type
+  --ai <builtin|langchain4j|spring-ai|adk> AI framework
+  --deploy <docker-compose|single-jar> Deployment mode
+  --skills <paths>          Comma-separated skill file paths
+  --output, -o <dir>        Output directory
+
+${BOLD}Examples:${RESET}
+  atmosphere compose skills/research/ skills/writer/
+  atmosphere compose --name my-fleet --protocol a2a research.md writer.md
+  atmosphere compose --skills skills/coordinator.md,skills/analyst.md
+
+COMPOSEEOF
+                return 0
+                ;;
+            --name|-n)    shift; compose_name="$1"; shift ;;
+            --group|-g)   shift; compose_group="$1"; shift ;;
+            --protocol)   shift; compose_protocol="$1"; shift ;;
+            --transport)  shift; compose_transport="$1"; shift ;;
+            --frontend)   shift; compose_frontend="$1"; shift ;;
+            --ai)         shift; compose_ai="$1"; shift ;;
+            --deploy)     shift; compose_deploy="$1"; shift ;;
+            --skills)     shift; compose_skills="$1"; shift ;;
+            --output|-o)  shift; compose_output="$1"; shift ;;
+            -*)           die "Unknown option: $1" ;;
+            *)
+                # Positional: skill file, directory, URL, or registry ID
+                local src="$1"; shift
+
+                if [ -d "$src" ]; then
+                    # Directory: look for nested */SKILL.md first, then flat *.md
+                    local found_nested=false
+                    for nested in "$src"/*/SKILL.md; do
+                        [ -f "$nested" ] && { skill_args="$skill_args $nested"; found_nested=true; }
+                    done
+                    if [ "$found_nested" = false ]; then
+                        for flat in "$src"/*.md; do
+                            [ -f "$flat" ] && skill_args="$skill_args $flat"
+                        done
+                    fi
+                elif [ -f "$src" ]; then
+                    skill_args="$skill_args $src"
+                elif echo "$src" | grep -qE '^https?://'; then
+                    # URL: download to temp, normalize GitHub URLs
+                    if echo "$src" | grep -qE 'github\.com/[^/]+/[^/]+/blob/'; then
+                        src=$(echo "$src" | sed 's|github\.com/\([^/]*/[^/]*\)/blob/|raw.githubusercontent.com/\1/|')
+                    fi
+                    ensure_cache_dir
+                    local tmp_skill="$CACHE_DIR/compose-skill-$(printf '%s' "$src" | sha256sum_portable /dev/stdin 2>/dev/null | cut -c1-8).md"
+                    download "$src" "$tmp_skill"
+                    skill_args="$skill_args $tmp_skill"
+                else
+                    # Treat as registry skill ID
+                    info "Looking up skill '$src' in registry..."
+                    ensure_cache_dir
+                    download "$SKILLS_REGISTRY_URL" "$CACHE_DIR/skills-registry.json"
+                    if has_jq; then
+                        local skill_path
+                        skill_path=$(jq -r ".skills[] | select(.id == \"$src\") | .path" "$CACHE_DIR/skills-registry.json")
+                        [ -z "$skill_path" ] || [ "$skill_path" = "null" ] && die "Skill not found: $src"
+                        local skill_url="$SKILLS_BASE_URL/$skill_path"
+                        local tmp_skill="$CACHE_DIR/compose-skill-$src.md"
+                        download "$skill_url" "$tmp_skill"
+                        skill_args="$skill_args $tmp_skill"
+                    else
+                        die "jq is required for registry lookups. Install with: brew install jq"
+                    fi
+                fi
+                ;;
+        esac
+    done
+
+    # The generator prompts for any option not supplied on the command line. With no
+    # TTY (CI, a script, `atmosphere compose ... | tee`) that prompt blocks forever on
+    # stdin, which reads as a hang rather than a question. Supply the generator's own
+    # documented defaults for the interactive-only options so a non-interactive run
+    # completes instead of stalling. An explicit flag always wins; an interactive run
+    # is unchanged and still asks.
+    if [ ! -t 0 ]; then
+        [ -z "$compose_protocol" ]  && compose_protocol="a2a"
+        [ -z "$compose_transport" ] && compose_transport="websocket"
+        [ -z "$compose_frontend" ]  && compose_frontend="none"
+        [ -z "$compose_ai" ]        && compose_ai="builtin"
+        [ -z "$compose_deploy" ]    && compose_deploy="single-jar"
+    fi
+
+    # Build jbang args
+    local jbang_args=""
+    [ -n "$compose_name" ]      && jbang_args="$jbang_args --name $compose_name"
+    [ -n "$compose_group" ]     && jbang_args="$jbang_args --group $compose_group"
+    [ -n "$compose_protocol" ]  && jbang_args="$jbang_args --protocol $compose_protocol"
+    [ -n "$compose_transport" ] && jbang_args="$jbang_args --transport $compose_transport"
+    [ -n "$compose_frontend" ]  && jbang_args="$jbang_args --frontend $compose_frontend"
+    [ -n "$compose_ai" ]        && jbang_args="$jbang_args --ai $compose_ai"
+    [ -n "$compose_deploy" ]    && jbang_args="$jbang_args --deploy $compose_deploy"
+    [ -n "$compose_skills" ]    && jbang_args="$jbang_args --skills $compose_skills"
+    [ -n "$compose_output" ]    && jbang_args="$jbang_args --output $compose_output"
+
+    # Pass the CLI version so the generator uses the same Atmosphere version as the framework
+    jbang_args="$jbang_args --atmosphere-version $VERSION"
+
+    need_cmd jbang
+
+    local generator_dir
+    generator_dir=$(resolve_compose_generator)
+    local generator_script="$generator_dir/ComposeGenerator.java"
+
+    info "Generating multi-agent project..."
+    # -Djbang.source is what tells ComposeGenerator where its templates live;
+    # without it the generator walks the CWD and only works inside a checkout.
+    # shellcheck disable=SC2086
+    jbang "-Djbang.source=$generator_script" "$generator_script" $jbang_args $skill_args
+}
+
+cmd_skills() {
+    local subcmd="${1:-list}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        list|ls)
+            info "Fetching skill registry..."
+            ensure_cache_dir
+            download "$SKILLS_REGISTRY_URL" "$CACHE_DIR/skills-registry.json"
+
+            if has_jq; then
+                printf "\n${BOLD}Available Skills${RESET}\n\n"
+                printf "  ${DIM}%-20s %-12s %s${RESET}\n" "ID" "CATEGORY" "DESCRIPTION"
+                printf "  ${DIM}%-20s %-12s %s${RESET}\n" "──────────────────" "──────────" "───────────────────────────────────────"
+                jq -r '.skills[] | "  \(.id)\t\(.category)\t\(.description)"' "$CACHE_DIR/skills-registry.json" | \
+                    while IFS=$'\t' read -r id cat desc; do
+                        printf "  ${GREEN}%-20s${RESET} %-12s %s\n" "$id" "$cat" "$desc"
+                    done
+                printf "\n  Run a skill: ${BOLD}atmosphere skills run <id>${RESET}\n\n"
+            else
+                die "jq is required. Install with: brew install jq"
+            fi
+            ;;
+        run)
+            [ -z "$1" ] && die "Usage: atmosphere skills run <skill-id>"
+            cmd_import "$1"
+            local skill_id="$1"
+            # Project dir is the sanitized skill ID
+            local run_dir=$(printf '%s' "$skill_id" | sed 's/[^a-zA-Z0-9_-]/-/g' | sed 's/--*/-/g')
+            if [ -d "$run_dir" ]; then
+                info "Building and running $run_dir..."
+                cd "$run_dir"
+                # [P1] Generate Maven wrapper if absent
+                if [ ! -f "./mvnw" ]; then
+                    if command -v mvn >/dev/null 2>&1; then
+                        info "Generating Maven wrapper..."
+                        mvn -N wrapper:wrapper -q 2>/dev/null || true
+                    fi
+                fi
+                if [ -f "./mvnw" ]; then
+                    ./mvnw spring-boot:run
+                elif command -v mvn >/dev/null 2>&1; then
+                    mvn spring-boot:run
+                else
+                    die "Neither ./mvnw nor mvn found. Install Maven: brew install maven"
+                fi
+            fi
+            ;;
+        search)
+            [ -z "$1" ] && die "Usage: atmosphere skills search <query>"
+            ensure_cache_dir
+            download "$SKILLS_REGISTRY_URL" "$CACHE_DIR/skills-registry.json"
+            if has_jq; then
+                local query="$1"
+                printf "\n${BOLD}Search results for '${query}'${RESET}\n\n"
+                jq -r --arg q "$query" '.skills[] | select((.description | ascii_downcase | contains($q | ascii_downcase)) or (.id | contains($q)) or ((.tags // [])[] | contains($q))) | "  \(.id)\t\(.category)\t\(.description)"' "$CACHE_DIR/skills-registry.json" | \
+                    while IFS=$'\t' read -r id cat desc; do
+                        printf "  ${GREEN}%-20s${RESET} %-12s %s\n" "$id" "$cat" "$desc"
+                    done
+                printf "\n"
+            else
+                die "jq is required. Install with: brew install jq"
+            fi
+            ;;
+        *)
+            die "Unknown skills subcommand: $subcmd. Use: list, run, search"
+            ;;
+    esac
+}
+
+# ── Plugins ─────────────────────────────────────────────────────────────────
+
+cmd_plugins() {
+    local subcmd="${1:-list}"
+    case "$subcmd" in
+        list|ls)
+            printf "\n${BOLD}Installed Import Plugins${RESET}\n"
+            printf "  ${DIM}Location: %s${RESET}\n\n" "$PLUGINS_DIR"
+            if [ -d "$PLUGINS_DIR" ] && ls "$PLUGINS_DIR"/import-*.sh >/dev/null 2>&1; then
+                for plugin in "$PLUGINS_DIR"/import-*.sh; do
+                    local name=$(basename "$plugin" | sed 's/^import-//;s/\.sh$//')
+                    printf "  ${GREEN}%-15s${RESET} %s\n" "$name" "$plugin"
+                done
+            else
+                printf "  ${DIM}(none installed)${RESET}\n"
+            fi
+            printf "\n  Use with: ${BOLD}atmosphere import --target <name> <skill>${RESET}\n"
+            printf "  Install:  Copy a plugin script to %s/\n\n" "$PLUGINS_DIR"
+            ;;
+        *)
+            die "Unknown plugins subcommand: $subcmd. Use: list"
+            ;;
+    esac
+}
+
+# ── checkpoint ──────────────────────────────────────────────────────────────
+# Inspect and operate on the CheckpointStore of a running agent application
+# (sample or user app) that exposes the /api/checkpoints REST surface from
+# atmosphere-checkpoint. Default base URL: http://localhost:8095
+cmd_checkpoint() {
+    local base="${ATMOSPHERE_CHECKPOINT_URL:-http://localhost:8095}"
+    local subcmd="${1:-list}"
+    shift || true
+
+    # Parse --base-url flag (overrides env var). Rotate the positional
+    # parameters instead of flattening them into one string: `rest="$rest $1"`
+    # followed by an unquoted `set -- $rest` re-splits on IFS, so
+    # `--by 'alice smith'` reached the wire as `by=alice` and the durable
+    # approval record named the wrong operator — with exit status 0.
+    local remaining=$#
+    while [ "$remaining" -gt 0 ]; do
+        case "$1" in
+            --base-url)
+                [ -z "$2" ] && die "--base-url requires a value"
+                base="$2"; shift 2; remaining=$((remaining - 2)) ;;
+            --base-url=*)
+                base="${1#--base-url=}"
+                [ -z "$base" ] && die "--base-url requires a value"
+                shift; remaining=$((remaining - 1)) ;;
+            *)
+                set -- "$@" "$1"; shift; remaining=$((remaining - 1)) ;;
+        esac
+    done
+
+    # Curl with sane defaults: fail on HTTP errors, silent, show errors.
+    ac_curl() { curl -sSf "$@"; }
+
+    case "$subcmd" in
+        list|ls)
+            local qs=""
+            local coordination="" agent="" limit=""
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --coordination) coordination="$2"; shift 2 ;;
+                    --agent)        agent="$2";        shift 2 ;;
+                    --limit)        limit="$2";        shift 2 ;;
+                    # Reject unknown options instead of dropping them. Silently ignoring
+                    # `--url` (the plausible mistype for `--base-url`) made the command query
+                    # the default host and fail with a confusing connection error against a
+                    # port the user never asked for.
+                    -*) die "Unknown option for 'checkpoint list': $1 (did you mean --base-url?)" ;;
+                    *) shift ;;
+                esac
+            done
+            [ -n "$coordination" ] && qs="${qs}&coordination=$(urlencode "$coordination")"
+            [ -n "$agent" ]        && qs="${qs}&agent=$(urlencode "$agent")"
+            [ -n "$limit" ]        && qs="${qs}&limit=$(urlencode "$limit")"
+            qs="${qs#&}"
+            local url="${base}/api/checkpoints${qs:+?$qs}"
+            info "GET $url"
+            ac_curl "$url" || die "Failed to list checkpoints at $url"
+            printf "\n"
+            ;;
+        show)
+            local id="$1"
+            [ -z "$id" ] && die "Usage: atmosphere checkpoint show <id>"
+            ac_curl "${base}/api/checkpoints/$(urlencode "$id")" \
+                || die "Checkpoint $id not found"
+            printf "\n"
+            ;;
+        fork)
+            local id="$1"; shift || true
+            [ -z "$id" ] && die "Usage: atmosphere checkpoint fork <id> [--state ...]"
+            local state=""
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --state) state="$2"; shift 2 ;;
+                    *) shift ;;
+                esac
+            done
+            local url="${base}/api/checkpoints/$(urlencode "$id")/fork${state:+?state=$(urlencode "$state")}"
+            ac_curl -X POST "$url" \
+                || die "Failed to fork $id"
+            printf "\n"
+            ;;
+        approve)
+            local id="$1"; shift || true
+            [ -z "$id" ] && die "Usage: atmosphere checkpoint approve <id> [--by NAME]"
+            local by="operator"
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --by) by="$2"; shift 2 ;;
+                    *) shift ;;
+                esac
+            done
+            ac_curl -X POST "${base}/api/checkpoints/$(urlencode "$id")/approve?by=$(urlencode "$by")" \
+                || die "Failed to approve $id"
+            printf "\n"
+            ;;
+        delete|rm)
+            local id="$1"
+            [ -z "$id" ] && die "Usage: atmosphere checkpoint delete <id>"
+            ac_curl -X DELETE -o /dev/null -w "%{http_code}\n" \
+                "${base}/api/checkpoints/$(urlencode "$id")" \
+                || die "Failed to delete $id"
+            ;;
+        help|--help|-h|"")
+            cat <<EOF
+
+${BOLD}Atmosphere Checkpoint CLI${RESET}
+
+Inspect and operate on a running agent's CheckpointStore via its
+/api/checkpoints REST endpoint (provided by atmosphere-checkpoint).
+
+${BOLD}Usage${RESET}
+  atmosphere checkpoint <subcommand> [options]
+
+${BOLD}Subcommands${RESET}
+  list                         List snapshots (filter by --coordination/--agent)
+  show <id>                    Show a single snapshot
+  fork <id> [--state S]        Fork from a snapshot with new state
+  approve <id> [--by NAME]     Approve a snapshot (appends a child snapshot)
+  delete <id>                  Delete a snapshot
+
+${BOLD}Global options${RESET}
+  --base-url URL               Base URL of the running agent (default: \$ATMOSPHERE_CHECKPOINT_URL or http://localhost:8095)
+
+${BOLD}Examples${RESET}
+  atmosphere checkpoint list --coordination dispatch
+  atmosphere checkpoint show abc-123
+  atmosphere checkpoint approve abc-123 --by alice
+  atmosphere checkpoint fork abc-123 --state reverted
+  ATMOSPHERE_CHECKPOINT_URL=http://prod:8080 atmosphere checkpoint list
+
+EOF
+            ;;
+        *)
+            die "Unknown checkpoint subcommand: $subcmd. Run 'atmosphere checkpoint help'."
+            ;;
+    esac
+}
+
+# ── Dispatch ────────────────────────────────────────────────────────────────
+
+case "${1:-help}" in
+    version|--version|-v) cmd_version ;;
+    help|--help|-h)       cmd_help ;;
+    install)              shift; cmd_install "$@" ;;
+    list|ls)              shift; cmd_list "$@" ;;
+    run)                  shift; cmd_run "$@" ;;
+    new|init|create)      shift; cmd_new "$@" ;;
+    info|show)            shift; cmd_info "$@" ;;
+    import)               shift; cmd_import "$@" ;;
+    compose)              shift; cmd_compose "$@" ;;
+    skills)               shift; cmd_skills "$@" ;;
+    plugins)              shift; cmd_plugins "$@" ;;
+    checkpoint)           shift; cmd_checkpoint "$@" ;;
+    *)                    die "Unknown command: $1. Run 'atmosphere help' for usage." ;;
+esac

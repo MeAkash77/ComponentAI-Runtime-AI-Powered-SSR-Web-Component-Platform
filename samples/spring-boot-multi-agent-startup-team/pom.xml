@@ -1,0 +1,327 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.atmosphere</groupId>
+        <artifactId>atmosphere-project</artifactId>
+        <version>4.0.72-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <groupId>org.atmosphere.samples</groupId>
+    <artifactId>atmosphere-spring-boot-multi-agent-startup-team</artifactId>
+    <name>atmosphere-spring-boot-multi-agent-startup-team</name>
+    <description>True multi-agent: 5 independent A2A agents collaborate via Agent Cards and JSON-RPC</description>
+
+    <properties>
+        <!-- Self-contained netty pin: covers samples scaffolded standalone against
+             a released parent POM that may not yet declare netty.version. -->
+        <netty.version>4.2.17.Final</netty.version>
+        <maven.deploy.skip>true</maven.deploy.skip>
+        <atmosphere.starter>atmosphere-spring-boot-starter</atmosphere.starter>
+        <checkstyle.skip>true</checkstyle.skip>
+        <pmd.skip>true</pmd.skip>
+    </properties>
+
+    <repositories>
+        <repository>
+            <id>embabel-releases</id>
+            <url>https://repo.embabel.com/artifactory/libs-release</url>
+        </repository>
+        <repository>
+            <id>embabel-snapshots</id>
+            <url>https://repo.embabel.com/artifactory/libs-snapshot</url>
+            <snapshots>
+                <enabled>true</enabled>
+            </snapshots>
+        </repository>
+    </repositories>
+
+    <dependencyManagement>
+        <dependencies>
+<!-- netty-bom imported BEFORE spring-boot-dependencies so its
+                 first-wins rule pulls patched netty 4.x for this sample,
+                 overriding Spring Boot's transitively-pinned vulnerable line. -->
+            <dependency>
+                <groupId>io.netty</groupId>
+                <artifactId>netty-bom</artifactId>
+                <version>${netty.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <!-- tools.jackson pinned one patch above Spring Boot 4.1.0's
+                 managed 3.1.4: 3.1.5 closes GHSA-5gvw-p9qm-jgwh
+                 (jackson-databind DoS). Imported BEFORE spring-boot-dependencies
+                 so Maven's first-declared-wins rule takes the patched line. -->
+            <dependency>
+                <groupId>tools.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>3.1.5</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-dependencies</artifactId>
+                <version>${spring-boot.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <!-- Koog 1.0.0 ABI requires Kotlin 2.x stdlib (kotlin.time.Clock)
+                 and kotlinx-serialization 1.10.0 (the typeParametersSerializers
+                 method shape changed). Spring Boot 3.5's BOM pins both at older
+                 versions, so we override here so the SB3-profile Koog wiring
+                 below can actually issue LLM calls without ABI errors. -->
+            <dependency>
+                <groupId>org.jetbrains.kotlin</groupId>
+                <artifactId>kotlin-stdlib</artifactId>
+                <version>2.3.10</version>
+            </dependency>
+            <dependency>
+                <groupId>org.jetbrains.kotlin</groupId>
+                <artifactId>kotlin-reflect</artifactId>
+                <version>2.3.10</version>
+            </dependency>
+            <dependency>
+                <groupId>org.jetbrains.kotlinx</groupId>
+                <artifactId>kotlinx-serialization-core-jvm</artifactId>
+                <version>1.11.0</version>
+            </dependency>
+            <dependency>
+                <groupId>org.jetbrains.kotlinx</groupId>
+                <artifactId>kotlinx-serialization-json-jvm</artifactId>
+                <version>1.10.0</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <!-- Atmosphere core -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>${atmosphere.starter}</artifactId>
+        </dependency>
+
+        <!-- @Coordinator for the CEO (fleet management + WebSocket UI) -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-coordinator</artifactId>
+        </dependency>
+
+        <!-- Durable checkpoints (SQLite-backed) -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-checkpoint</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.xerial</groupId>
+            <artifactId>sqlite-jdbc</artifactId>
+            <version>3.53.2.0</version>
+        </dependency>
+
+        <!-- @Agent for specialist agents -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-agent</artifactId>
+        </dependency>
+
+        <!-- @A2aServer for the 4 specialist agents -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-a2a</artifactId>
+        </dependency>
+
+        <!-- AI backend -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-ai</artifactId>
+        </dependency>
+
+        <!-- Plan-and-verify: static verification of the team's plan + HITL gate -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-verifier</artifactId>
+        </dependency>
+
+        <!-- SMT backend (SMTInterpol, pure-JVM) — discharges the commit_budget <= runway invariant -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-verifier-smt</artifactId>
+        </dependency>
+
+        <!-- Stateful Interactions API (background runs, durable steps[]) -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-interactions</artifactId>
+        </dependency>
+
+        <!-- Google ADK runtime (uncomment for Gemini-only use)
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-adk</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.google.adk</groupId>
+            <artifactId>google-adk</artifactId>
+            <version>${google-adk.version}</version>
+        </dependency>
+        -->
+
+        <!-- Spring AI runtime (uncomment to switch execution engine)
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-spring-ai</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-client-chat</artifactId>
+            <version>${spring-ai.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-openai</artifactId>
+            <version>${spring-ai.version}</version>
+        </dependency>
+        -->
+
+        <!-- Embabel runtime (uncomment to switch execution engine)
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-embabel</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.embabel.agent</groupId>
+            <artifactId>embabel-agent-starter-platform</artifactId>
+            <version>${embabel.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.embabel.agent</groupId>
+            <artifactId>embabel-agent-starter-gemini</artifactId>
+            <version>${embabel.version}</version>
+        </dependency>
+        -->
+
+        <!-- LangChain4j runtime (uncomment to switch execution engine)
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-langchain4j</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>dev.langchain4j</groupId>
+            <artifactId>langchain4j-core</artifactId>
+            <version>${langchain4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>dev.langchain4j</groupId>
+            <artifactId>langchain4j-open-ai</artifactId>
+            <version>${langchain4j.version}</version>
+        </dependency>
+        -->
+
+        <!-- JetBrains Koog runtime. AtmosphereKoogAutoConfiguration wires a
+             PromptExecutor from OPENAI_API_KEY / LLM_API_KEY using Koog 1.0's
+             OpenAILLMClient factory — koog-spring-boot-starter is no longer
+             pulled in: it lives on Koog's beta track (1.0.0-beta-preview7),
+             whose transitive 1.0.0-preview7 modules conflict with stable
+             1.0.0. dependencyManagement above pins kotlin-stdlib 2.3.10. -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-koog</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>ai.koog</groupId>
+            <artifactId>koog-agents-jvm</artifactId>
+            <version>${koog.version}</version>
+        </dependency>
+
+        <!-- MCP (required by atmosphere-agent for auto-bridging) -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-mcp</artifactId>
+        </dependency>
+
+        <!-- Admin control plane dashboard -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-admin</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-skills</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- Observability: actuator + micrometer for admin metrics tab -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>jakarta.inject</groupId>
+            <artifactId>jakarta.inject-api</artifactId>
+        </dependency>
+
+        <!-- WebTransport over HTTP/3 sidecar -->
+        <dependency>
+            <groupId>io.projectreactor.netty</groupId>
+            <artifactId>reactor-netty-http</artifactId>
+        </dependency>
+
+        <!-- Parent POM restricts logback to test scope; override for runtime logging -->
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-core</artifactId>
+            <version>${logback-version}</version>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>${logback-version}</version>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- Test scope — for the governance e2e that exercises goals 1-4 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <version>${spring-boot.version}</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+    <profiles>
+        <profile>
+            <id>spring-boot3</id>
+            <properties>
+                <spring-boot.version>3.5.15</spring-boot.version>
+                <netty.version>4.1.137.Final</netty.version>
+                <atmosphere.starter>atmosphere-spring-boot3-starter</atmosphere.starter>
+            </properties>
+        </profile>
+    </profiles>
+</project>

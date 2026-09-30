@@ -1,0 +1,266 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.atmosphere</groupId>
+        <artifactId>atmosphere-project</artifactId>
+        <version>4.0.72-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <groupId>org.atmosphere.samples</groupId>
+    <artifactId>atmosphere-quarkus-ai-chat</artifactId>
+    <packaging>jar</packaging>
+    <name>atmosphere-quarkus-ai-chat</name>
+    <description>Atmosphere AI chat on Quarkus, backed by Quarkus LangChain4j via the atmosphere-quarkus-langchain4j bridge.</description>
+
+    <properties>
+        <maven.deploy.skip>true</maven.deploy.skip>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- Netty BOM pinned to 4.1.138.Final, the version Quarkus 3.39.5
+                 ships (verified against quarkus-bom-3.39.5.pom, whose only
+                 io.netty 4.x pin is 4.1.138.Final). Imported BEFORE
+                 quarkus-bom and retained as an explicit sample-scope floor
+                 closing CVE-2026-42577 (handler-proxy header injection),
+                 CVE-2026-42578 (chunked-extension request smuggling),
+                 CVE-2026-41417 (TE smuggling), and the netty-codec /
+                 codec-http / codec-http2 / codec-dns / codec-haproxy
+                 GHSA family patched in 4.1.136. -->
+            <dependency>
+                <groupId>io.netty</groupId>
+                <artifactId>netty-bom</artifactId>
+                <version>4.1.138.Final</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <!-- brotli4j pinned to 1.23.0, the version Quarkus 3.36.x ships (still 1.23.0 in 3.39.5)
+                 (up from 1.16.0 in 3.35.x). 1.23.0 is the release Netty
+                 4.1.133's BrotliDecoder.decompress was compiled against — it
+                 calls DecoderJNI$Wrapper.pull(int), absent from 1.16.0's
+                 no-arg pull(), so 4.1.133 paired with an older brotli4j breaks
+                 native-image build with "unresolved method during parsing".
+                 Pinning every brotli4j artifact to 1.23.0 keeps the
+                 native-image graph closed regardless of transitive drift. -->
+            <dependency>
+                <groupId>com.aayushatharva.brotli4j</groupId>
+                <artifactId>brotli4j</artifactId>
+                <version>1.23.0</version>
+            </dependency>
+            <dependency>
+                <groupId>com.aayushatharva.brotli4j</groupId>
+                <artifactId>service</artifactId>
+                <version>1.23.0</version>
+            </dependency>
+            <dependency>
+                <groupId>com.aayushatharva.brotli4j</groupId>
+                <artifactId>native-linux-x86_64</artifactId>
+                <version>1.23.0</version>
+            </dependency>
+            <dependency>
+                <groupId>com.aayushatharva.brotli4j</groupId>
+                <artifactId>native-linux-aarch64</artifactId>
+                <version>1.23.0</version>
+            </dependency>
+            <dependency>
+                <groupId>com.aayushatharva.brotli4j</groupId>
+                <artifactId>native-osx-x86_64</artifactId>
+                <version>1.23.0</version>
+            </dependency>
+            <dependency>
+                <groupId>com.aayushatharva.brotli4j</groupId>
+                <artifactId>native-osx-aarch64</artifactId>
+                <version>1.23.0</version>
+            </dependency>
+            <dependency>
+                <groupId>com.aayushatharva.brotli4j</groupId>
+                <artifactId>native-windows-x86_64</artifactId>
+                <version>1.23.0</version>
+            </dependency>
+            <dependency>
+                <groupId>io.quarkus</groupId>
+                <artifactId>quarkus-bom</artifactId>
+                <version>${quarkus.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <!-- The root POM manages opentelemetry-api at
+                 ${opentelemetry-api.version} (a direct dependencyManagement
+                 entry, which beats the imported quarkus-bom), while
+                 opentelemetry-common / -context would still come from the
+                 Quarkus BOM. quarkus-micrometer-registry-prometheus' OTel
+                 exemplar sampler is compiled against the OTel shape Quarkus
+                 ships, and the api jar reaches into -common
+                 (io.opentelemetry.common.impl.ApiUsageLogger since 1.62), so
+                 an api / -common split throws NoClassDefFoundError at
+                 startup. Pin the trio together at the Quarkus 3.39.5 baseline
+                 (verified against quarkus-bom-3.39.5.pom: api, common and
+                 context are all 1.62.0). Do NOT bump one independently —
+                 dependabot #2694 bumped api alone against a pinned -common
+                 and broke this sample.
+
+                 1.62.0 carries the fix for GHSA-rcgg-9c38-7xpx /
+                 CVE-2026-45292 (medium, unbounded memory in W3C Baggage
+                 Propagation), which the previous 1.60.1 pin (Quarkus 3.35.x /
+                 3.36.x baseline) could not pick up. Move the trio when the
+                 Quarkus BOM moves. -->
+            <dependency>
+                <groupId>io.opentelemetry</groupId>
+                <artifactId>opentelemetry-api</artifactId>
+                <version>1.62.0</version>
+            </dependency>
+            <dependency>
+                <groupId>io.opentelemetry</groupId>
+                <artifactId>opentelemetry-common</artifactId>
+                <version>1.62.0</version>
+            </dependency>
+            <dependency>
+                <groupId>io.opentelemetry</groupId>
+                <artifactId>opentelemetry-context</artifactId>
+                <version>1.62.0</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <!-- Atmosphere core Quarkus extension (servlet + WebSocket plumbing) -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-quarkus-extension</artifactId>
+        </dependency>
+
+        <!-- AI module brings the @AiEndpoint pipeline. The Quarkus extension's
+             scan picks up @AiEndpoint via the optional-AI-annotation slot. -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-ai</artifactId>
+        </dependency>
+
+        <!-- @Agent annotation (MultiModalAgent). The Quarkus extension's
+             build-time scan registers @Agent classes via AgentProcessor (same
+             optional-annotation slot as @AiEndpoint), so the sample declares
+             atmosphere-agent explicitly. MCP/A2A protocol modules stay optional;
+             this vision-only agent needs neither. -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-agent</artifactId>
+        </dependency>
+
+        <!-- Admin console (mounted at /atmosphere/console/) — same UI as
+             spring-boot-ai-chat so the chat round-trip can be driven from
+             the browser. -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-quarkus-admin-extension</artifactId>
+        </dependency>
+
+        <!-- atmosphere-langchain4j provides the LangChain4jAgentRuntime SPI; the
+             quarkus-langchain4j bridge wires Quarkus L4j's StreamingChatModel into it. -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-quarkus-langchain4j</artifactId>
+        </dependency>
+
+        <!-- Atmosphere gRPC transport (Quarkus extension). Adds a Netty-backed
+             gRPC server on port 19090 alongside the WebSocket / SSE / Long-Polling
+             surfaces already exposed via Undertow. Any client subscribing to the
+             same Broadcaster topic (e.g. "/atmosphere/ai-chat") receives the
+             AI tokens broadcast by the @Prompt method — proving transport
+             parity between WebSocket and gRPC subscribers.
+
+             Enabled via quarkus.atmosphere.grpc.enabled=true in
+             application.properties; see this sample's README "gRPC subscriber"
+             section for a grpcurl walkthrough. -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-quarkus-grpc</artifactId>
+        </dependency>
+
+        <!-- Quarkus LangChain4j OpenAI-compatible model — Atmosphere reads
+             quarkus.langchain4j.openai.* config and exposes ChatModel /
+             StreamingChatModel CDI beans. Compatible with Gemini's
+             /v1beta/openai/ endpoint. -->
+        <dependency>
+            <groupId>io.quarkiverse.langchain4j</groupId>
+            <artifactId>quarkus-langchain4j-openai</artifactId>
+            <version>${quarkus-langchain4j.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-undertow</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-websockets</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-jackson</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-rest-jackson</artifactId>
+        </dependency>
+
+        <!-- Observability stack — the Atmosphere Quarkus deployment processor
+             registers AtmosphereHealthCheck / AtmosphereMetricsProducer /
+             AtmosphereTracingProducer / AtmosphereGovernanceMetricsProducer
+             when these extensions are on the classpath. Mirrors the
+             atmosphere-spring-boot-ai-chat dependency set so dashboards and
+             health probes are platform-portable. -->
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-smallrye-health</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-micrometer-registry-prometheus</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-opentelemetry</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>io.quarkus</groupId>
+                <artifactId>quarkus-maven-plugin</artifactId>
+                <version>${quarkus.version}</version>
+                <extensions>true</extensions>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>build</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <profile>
+            <id>native</id>
+            <activation>
+                <property>
+                    <name>native</name>
+                </property>
+            </activation>
+            <properties>
+                <quarkus.native.enabled>true</quarkus.native.enabled>
+                <quarkus.package.jar.enabled>false</quarkus.package.jar.enabled>
+            </properties>
+        </profile>
+    </profiles>
+</project>

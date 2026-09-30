@@ -1,0 +1,171 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.config.managed;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.lang.reflect.Method;
+import java.util.List;
+
+/**
+ * Invoke a method based on {@link Encoder} and {@link Decoder}
+ *
+ * @author Jeanfrancois Arcand
+ */
+public class Invoker {
+
+    private final static Logger logger = LoggerFactory.getLogger(Invoker.class);
+
+    public static Object decode(List<Decoder<?, ?>> decoders, Object instanceType) {
+
+        Object decodedObject = matchDecoder(instanceType, decoders);
+        if (instanceType == null) {
+            logger.trace("No Encoder matching {}", decoders);
+        }
+        return decodedObject;
+    }
+
+    public static Object invokeMethod(Method method, Object objectToInvoke, Object... parameters) {
+        Object objectToEncode = null;
+        boolean hasMatch = false;
+        try {
+            objectToEncode = method.invoke(objectToInvoke, method.getParameterTypes().length == 0 ? new Object[]{} : parameters);
+            hasMatch = true;
+        } catch (IllegalAccessException | IllegalArgumentException e) {
+            logger.trace("", e);
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            var cause = e.getCause();
+            if (cause instanceof Error err) {
+                throw err;
+            }
+            logger.error("Handler method threw exception", cause != null ? cause : e);
+        } catch (Error e) {
+            throw e;
+        } catch (Throwable e) {
+            logger.error("Unexpected error invoking method", e);
+        }
+
+        if (!hasMatch) {
+            logger.trace("No Method's Arguments {} matching {}", method.getName(), objectToInvoke);
+        }
+        return objectToEncode;
+    }
+
+    public static Object encode(List<Encoder<?, ?>> encoders, Object objectToEncode) {
+        Object encodedObject = matchEncoder(objectToEncode, encoders);
+        if (encodedObject == null) {
+            logger.trace("No Encoder matching {}", objectToEncode);
+        }
+        return encodedObject;
+    }
+
+    public static Object all(
+            List<Encoder<?, ?>> encoders,
+            List<Decoder<?, ?>> decoders,
+            Object instanceType,
+            Object objectToInvoke,
+            Method method) {
+
+        Object decodedObject = decode(decoders, instanceType);
+        if (instanceType == null) {
+            logger.trace("No Encoder matching {}", instanceType);
+        }
+        decodedObject = decodedObject == null ? instanceType : decodedObject;
+
+        logger.trace("{} .on {}", method.getName(), decodedObject);
+        Object objectToEncode = invokeMethod(method, objectToInvoke, decodedObject);
+
+        Object encodedObject = null;
+        if (objectToEncode != null) {
+            encodedObject = encode(encoders, objectToEncode);
+        }
+        return encodedObject == null ? objectToEncode : encodedObject;
+    }
+
+    /** One-shot latches so registration-conflict and decode-failure warnings cannot spam the hot path. */
+    private static final java.util.concurrent.atomic.AtomicBoolean DECODER_CONFLICT_WARNED =
+            new java.util.concurrent.atomic.AtomicBoolean();
+    private static final java.util.concurrent.atomic.AtomicBoolean ENCODER_CONFLICT_WARNED =
+            new java.util.concurrent.atomic.AtomicBoolean();
+    private static final java.util.concurrent.atomic.AtomicBoolean DECODE_FAILURE_WARNED =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
+    /** Test isolation for the one-shot warnings. */
+    static void resetWarningsForTests() {
+        DECODER_CONFLICT_WARNED.set(false);
+        ENCODER_CONFLICT_WARNED.set(false);
+        DECODE_FAILURE_WARNED.set(false);
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public static Object matchDecoder(Object instanceType, List<Decoder<?, ?>> decoders) {
+        Object decodedObject = decoders.isEmpty() ? instanceType : null;
+        Decoder previousMatch = null;
+        for (Decoder d : decoders) {
+            Class<?>[] typeArguments = TypeResolver.resolveArguments(d.getClass(), Decoder.class);
+            if (instanceType != null && typeArguments.length > 0 && typeArguments[0].isInstance(instanceType)) {
+                if (previousMatch != null && DECODER_CONFLICT_WARNED.compareAndSet(false, true)) {
+                    logger.warn("Multiple Decoders match {}: {} overrides {} — the last "
+                            + "registration wins, so behaviour depends on registration order. "
+                            + "Register one Decoder per type.", instanceType.getClass().getName(),
+                            d.getClass().getName(), previousMatch.getClass().getName());
+                }
+                previousMatch = d;
+                logger.trace("{} is trying to decode {}", d, instanceType);
+                try {
+                    decodedObject = d.decode(instanceType);
+                } catch (Exception e) {
+                    // A throwing Decoder is an application bug the developer
+                    // must see — the first occurrence warns, repeats stay at
+                    // DEBUG so a hot loop cannot flood the log.
+                    if (DECODE_FAILURE_WARNED.compareAndSet(false, true)) {
+                        logger.warn("Decoder {} threw decoding {} — the raw message is used "
+                                + "instead. Further decoder failures log at DEBUG.",
+                                d.getClass().getName(), instanceType.getClass().getName(), e);
+                    } else {
+                        logger.debug("Decoder {} threw decoding {}",
+                                d.getClass().getName(), instanceType.getClass().getName(), e);
+                    }
+                }
+            }
+        }
+        return decodedObject;
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public static Object matchEncoder(Object instanceType, List<Encoder<?, ?>> encoders) {
+        if (instanceType == null) return null;
+
+        Object encodedObject = encoders.isEmpty() ? instanceType : null;
+        Encoder previousMatch = null;
+        for (Encoder d : encoders) {
+            Class<?>[] typeArguments = TypeResolver.resolveArguments(d.getClass(), Encoder.class);
+            if (typeArguments.length > 0 && typeArguments[0].isInstance(instanceType)) {
+                if (previousMatch != null && ENCODER_CONFLICT_WARNED.compareAndSet(false, true)) {
+                    logger.warn("Multiple Encoders match {}: {} overrides {} — the last "
+                            + "registration wins, so behaviour depends on registration order. "
+                            + "Register one Encoder per type.", instanceType.getClass().getName(),
+                            d.getClass().getName(), previousMatch.getClass().getName());
+                }
+                previousMatch = d;
+                logger.trace("{} is trying to encode {}", d, instanceType);
+                encodedObject = d.encode(instanceType);
+            }
+        }
+        return encodedObject;
+    }
+}

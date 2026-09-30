@@ -1,0 +1,231 @@
+import { test, expect } from '@playwright/test';
+import { startSample, SAMPLES, type SampleServer } from './fixtures/sample-server';
+import { fetchWebTransportInfo, waitForConsoleMessage } from './helpers/webtransport-helper';
+
+/**
+ * WebTransport E2E tests — verifies the WebTransport discovery endpoint,
+ * transport negotiation, and app functionality across samples.
+ *
+ * Browser tests verify the app works with automatic transport negotiation
+ * (WebTransport when available, WebSocket fallback otherwise). The
+ * /api/webtransport-info endpoint is tested via HTTP (no browser needed).
+ *
+ * Raw HTTP/3 protocol tests are in webtransport-raw.spec.ts.
+ */
+
+/**
+ * Retry fetchWebTransportInfo until the endpoint responds.
+ * SmartLifecycle starts the HTTP/3 sidecar late, and on some environments
+ * the endpoint may not exist at all (netty-codec-http3 not on classpath).
+ */
+async function waitForWebTransportInfo(
+  baseUrl: string,
+  maxRetries = 10,
+): Promise<{ port: number; enabled: boolean; certificateHash?: string; configuredPort?: number } | null> {
+  for (let i = 0; i < maxRetries; i++) {
+    const info = await fetchWebTransportInfo(baseUrl);
+    if (info) return info;
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  return fetchWebTransportInfo(baseUrl);
+}
+
+/** Wait for Atmosphere to connect via any transport (webtransport or websocket). */
+function waitForConnection(page: import('@playwright/test').Page, timeoutMs = 20_000) {
+  return waitForConsoleMessage(page, /connection established/i, timeoutMs);
+}
+
+// ── Chat over WebTransport ────────────────────────────────────────────
+
+test.describe('Chat over WebTransport', () => {
+  let server: SampleServer;
+
+  test.beforeAll(async () => {
+    server = await startSample(SAMPLES['spring-boot-chat']);
+  });
+
+  test.afterAll(async () => {
+    await server?.stop();
+  });
+
+  test('WebTransport info endpoint returns port config', async () => {
+    const info = await waitForWebTransportInfo(server.baseUrl);
+    if (info == null) {
+      // netty-codec-http3 not on classpath — endpoint not registered, skip
+      test.skip();
+      return;
+    }
+    if (info.enabled) {
+      expect(info.port).toBe(4443);
+      expect(info.certificateHash).toBeDefined();
+    } else {
+      // Sidecar not running — verify configured port is reported
+      expect((info as any).configuredPort ?? info.port).toBe(4443);
+    }
+  });
+
+  test('@smoke chat connects and negotiates transport', async ({ page }) => {
+    const connected = waitForConnection(page);
+    await page.goto(server.baseUrl);
+    const msg = await connected;
+    // Atmosphere logs "WebTransport connection established" or "WebSocket connection established"
+    expect(msg.toLowerCase()).toContain('connection established');
+  });
+
+  test('chat message round-trip', async ({ page }) => {
+    const connected = waitForConnection(page);
+    await page.goto(server.baseUrl);
+    await connected;
+
+    // The sample now speaks the Room Protocol (console-room: lobby): the
+    // presence chip renders only after the server's join_ack, so it proves
+    // the frame made the full round-trip over the negotiated transport.
+    // Room broadcasts deliberately exclude the sender, so there is no
+    // sender-side echo bubble to assert anymore.
+    await expect(page.getByTestId('presence-count'))
+      .toHaveText(/\d+ online/, { timeout: 15_000 });
+
+    const input = page.getByTestId('chat-input');
+    await input.fill('Hello over HTTP/3!');
+    await page.getByTestId('chat-send').click();
+
+    await expect(page.getByText('Hello over HTTP/3!', { exact: true }))
+      .toBeVisible({ timeout: 10_000 });
+  });
+
+  test('no handshake errors persist after connection', async ({ page }) => {
+    const connected = waitForConnection(page);
+    await page.goto(server.baseUrl);
+    await connected;
+
+    // After connection is established, there should be no visible error banners
+    await page.waitForTimeout(2000);
+    const errorBanners = await page.locator('text=/Opening handshake failed/').count();
+    expect(errorBanners).toBe(0);
+  });
+});
+
+// ── AI Tools over WebTransport ────────────────────────────────────────
+
+test.describe('AI Tools over WebTransport', () => {
+  let server: SampleServer;
+
+  test.beforeAll(async () => {
+    test.setTimeout(120_000);
+    server = await startSample(SAMPLES['spring-boot-ai-tools']);
+  });
+
+  test.afterAll(async () => {
+    await server?.stop();
+  });
+
+  test('WebTransport info endpoint returns port config for ai-tools', async () => {
+    const info = await waitForWebTransportInfo(server.baseUrl);
+    if (info == null) {
+      test.skip();
+      return;
+    }
+    if (info.enabled) {
+      expect(info.port).toBe(4445);
+    } else {
+      expect((info as any).configuredPort ?? info.port).toBe(4445);
+    }
+  });
+
+  test('@smoke AI tools connects and negotiates transport', async ({ page }) => {
+    const connected = waitForConnection(page);
+    await page.goto(server.baseUrl);
+    const msg = await connected;
+    expect(msg.toLowerCase()).toContain('connection established');
+  });
+
+  test('AI tool call streams response', async ({ page }) => {
+    const connected = waitForConnection(page);
+    await page.goto(server.baseUrl);
+    await connected;
+
+    const input = page.getByTestId('chat-input');
+    await input.fill('What time is it?');
+    await page.getByTestId('chat-send').click();
+
+    // Wait for any response to appear in the chat
+    await expect(page.locator('body')).toContainText(/\d{1,2}:\d{2}|time|AM|PM/i, { timeout: 30_000 });
+  });
+
+  test('no handshake errors persist after connection', async ({ page }) => {
+    const connected = waitForConnection(page);
+    await page.goto(server.baseUrl);
+    await connected;
+
+    await page.waitForTimeout(2000);
+    const errorBanners = await page.locator('text=/Opening handshake failed/').count();
+    expect(errorBanners).toBe(0);
+  });
+});
+
+// ── Multi-Agent over WebTransport ─────────────────────────────────────
+
+test.describe('Multi-Agent Startup Team over WebTransport', () => {
+  let server: SampleServer;
+
+  test.beforeAll(async () => {
+    test.setTimeout(120_000);
+    server = await startSample(SAMPLES['spring-boot-multi-agent-startup-team']);
+  });
+
+  test.afterAll(async () => {
+    await server?.stop();
+  });
+
+  test('WebTransport info endpoint returns port config for multi-agent', async () => {
+    const info = await waitForWebTransportInfo(server.baseUrl);
+    if (info == null) {
+      test.skip();
+      return;
+    }
+    if (info.enabled) {
+      expect(info.port).toBe(4446);
+    } else {
+      expect((info as any).configuredPort ?? info.port).toBe(4446);
+    }
+  });
+
+  test('@smoke multi-agent connects and negotiates transport', async ({ page }) => {
+    const connected = waitForConnection(page);
+    await page.goto(server.baseUrl);
+    const msg = await connected;
+    expect(msg.toLowerCase()).toContain('connection established');
+  });
+
+  test('coordinator streams response', async ({ page }) => {
+    const connected = waitForConnection(page);
+    await page.goto(server.baseUrl);
+    await connected;
+
+    const input = page.locator('input[type="text"], textarea').first();
+    await input.fill('What are the top trends in AI?');
+    await input.press('Enter');
+
+    // Wait for agent collaboration or CEO synthesis
+    await expect(page.getByText(/Research Agent|CEO|Welcome to the A2A/i).first())
+      .toBeVisible({ timeout: 30_000 });
+  });
+
+  test('4 headless agents registered', () => {
+    const output = server.getOutput();
+    expect(output).toContain("Agent 'research-agent' registered");
+    expect(output).toContain("Agent 'strategy-agent' registered");
+    expect(output).toContain("Agent 'finance-agent' registered");
+    expect(output).toContain("Agent 'writer-agent' registered");
+  });
+
+  test('no handshake errors persist after connection', async ({ page }) => {
+    const connected = waitForConnection(page);
+    await page.goto(server.baseUrl);
+    await connected;
+
+    await page.waitForTimeout(2000);
+    const errorBanners = await page.locator('text=/Opening handshake failed/').count();
+    expect(errorBanners).toBe(0);
+  });
+});

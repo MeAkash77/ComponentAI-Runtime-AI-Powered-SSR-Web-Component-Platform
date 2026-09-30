@@ -1,0 +1,227 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.ai.langchain4j;
+
+import dev.langchain4j.agent.tool.ToolSpecification;
+import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.model.chat.StreamingChatModel;
+import dev.langchain4j.model.chat.request.ChatRequest;
+import dev.langchain4j.model.chat.response.ChatResponse;
+import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
+import org.atmosphere.ai.StreamingSession;
+import org.atmosphere.ai.approval.ApprovalStrategy;
+import org.atmosphere.ai.llm.ToolLoopGuard;
+import org.atmosphere.ai.llm.ToolLoopPolicy;
+import org.atmosphere.ai.tool.ToolDefinition;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Streaming response handler that supports tool calling with LangChain4j.
+ *
+ * <p>When the model responds with tool execution requests instead of text,
+ * this handler executes the tools and re-submits the conversation with the
+ * results, allowing the model to continue generating a text response.</p>
+ *
+ * <p>The tool execution loop continues until the model produces a text
+ * response (no more tool calls) or a maximum number of tool rounds is
+ * reached to prevent infinite loops.</p>
+ */
+class ToolAwareStreamingResponseHandler implements StreamingChatResponseHandler {
+
+    private static final Logger logger = LoggerFactory.getLogger(ToolAwareStreamingResponseHandler.class);
+
+    private final StreamingSession session;
+    private final StreamingChatModel model;
+    private final List<ChatMessage> conversationHistory;
+    private final List<ToolSpecification> toolSpecifications;
+    private final Map<String, ToolDefinition> toolMap;
+    private final ApprovalStrategy approvalStrategy;
+    private final List<org.atmosphere.ai.AgentLifecycleListener> listeners;
+    /**
+     * Soft-cancel flag polled by {@code onPartialResponse} every token and
+     * checked before starting a follow-up tool round. The
+     * {@link dev.langchain4j.model.chat.response.StreamingChatResponseHandler}
+     * API has no direct hook to abort the in-flight HTTP call, so cancellation
+     * takes effect at the next token boundary rather than immediately. The
+     * {@link ExecutionHandle} returned by
+     * {@code LangChain4jAgentRuntime#doExecuteWithHandle} holds a reference
+     * to the same {@code AtomicBoolean} and flips it on {@code cancel()},
+     * which avoids leaking completions into a session that the caller has
+     * already abandoned.
+     */
+    private final AtomicBoolean cancelled;
+    private final org.atmosphere.ai.approval.ToolApprovalPolicy approvalPolicy;
+    /**
+     * Per-request tool-loop policy. Bounds the model→tool→model rounds and
+     * decides the overflow behavior, matching the Built-in
+     * {@code OpenAiCompatibleClient}. Defaults to {@link ToolLoopPolicy#DEFAULT}
+     * (5 rounds, complete-without-tools) when the caller passes {@code null},
+     * preserving the pre-policy behavior bit-identically.
+     */
+    private final ToolLoopPolicy loopPolicy;
+    private int toolRound;
+
+    ToolAwareStreamingResponseHandler(
+            StreamingSession session,
+            StreamingChatModel model,
+            List<ChatMessage> conversationHistory,
+            List<ToolSpecification> toolSpecifications,
+            Map<String, ToolDefinition> toolMap,
+            ApprovalStrategy approvalStrategy,
+            List<org.atmosphere.ai.AgentLifecycleListener> listeners,
+            AtomicBoolean cancelled,
+            org.atmosphere.ai.approval.ToolApprovalPolicy approvalPolicy,
+            ToolLoopPolicy loopPolicy) {
+        this(session, model, conversationHistory, toolSpecifications, toolMap,
+                approvalStrategy, listeners, cancelled, 0, approvalPolicy, loopPolicy);
+    }
+
+    private ToolAwareStreamingResponseHandler(
+            StreamingSession session,
+            StreamingChatModel model,
+            List<ChatMessage> conversationHistory,
+            List<ToolSpecification> toolSpecifications,
+            Map<String, ToolDefinition> toolMap,
+            ApprovalStrategy approvalStrategy,
+            List<org.atmosphere.ai.AgentLifecycleListener> listeners,
+            AtomicBoolean cancelled,
+            int toolRound,
+            org.atmosphere.ai.approval.ToolApprovalPolicy approvalPolicy,
+            ToolLoopPolicy loopPolicy) {
+        this.session = session;
+        this.model = model;
+        this.conversationHistory = new ArrayList<>(conversationHistory);
+        this.toolSpecifications = toolSpecifications;
+        this.toolMap = toolMap;
+        this.approvalStrategy = approvalStrategy;
+        this.listeners = listeners != null ? listeners : List.of();
+        this.cancelled = cancelled != null ? cancelled : new AtomicBoolean();
+        this.toolRound = toolRound;
+        this.approvalPolicy = approvalPolicy;
+        this.loopPolicy = loopPolicy != null ? loopPolicy : ToolLoopPolicy.DEFAULT;
+    }
+
+    @Override
+    public void onPartialResponse(String partialResponse) {
+        if (cancelled.get() || session.isClosed()) {
+            return;
+        }
+        session.send(partialResponse);
+    }
+
+    @Override
+    public void onCompleteResponse(ChatResponse completeResponse) {
+        if (session.isClosed()) {
+            return;
+        }
+
+        // Report typed token usage if the model reported it. The default
+        // StreamingSession.usage() sink re-emits legacy ai.tokens.* metadata keys
+        // so existing Micrometer / budget consumers keep working unchanged.
+        var tokenUsage = completeResponse.tokenUsage();
+        if (tokenUsage != null) {
+            Long input = tokenUsage.inputTokenCount() != null
+                    ? tokenUsage.inputTokenCount().longValue() : null;
+            Long output = tokenUsage.outputTokenCount() != null
+                    ? tokenUsage.outputTokenCount().longValue() : null;
+            Long total = tokenUsage.totalTokenCount() != null
+                    ? tokenUsage.totalTokenCount().longValue() : null;
+            var usage = org.atmosphere.ai.TokenUsage.fromCounts(input, output, null, total);
+            if (usage.hasCounts()) {
+                session.usage(usage);
+            }
+        }
+
+        var aiMessage = completeResponse.aiMessage();
+        if (aiMessage == null) {
+            session.complete();
+            return;
+        }
+
+        // Check if the model wants to call tools
+        if (aiMessage.hasToolExecutionRequests() && !toolMap.isEmpty()) {
+            // Honor the per-request ToolLoopPolicy in-loop, exactly like the
+            // Built-in OpenAiCompatibleClient: FAIL surfaces the cap-hit via
+            // session.error(ToolLoopExhaustedException); COMPLETE_WITHOUT_TOOLS
+            // flushes the last assistant text and completes (the pre-policy
+            // behavior when DEFAULT is in effect). The shared checkRoundCap
+            // owns the byte-identical FAIL dispatch.
+            switch (ToolLoopGuard.checkRoundCap(toolRound, loopPolicy, session, "LangChain4j")) {
+                case CONTINUE -> { /* below the cap — dispatch the tools below */ }
+                case FAILED -> {
+                    // checkRoundCap already fired session.error(...).
+                    return;
+                }
+                case COMPLETE_WITHOUT_TOOLS -> {
+                    if (aiMessage.text() != null) {
+                        session.complete(aiMessage.text());
+                    } else {
+                        session.complete();
+                    }
+                    return;
+                }
+            }
+
+            logger.debug("Tool round {}: executing {} tool calls",
+                    toolRound + 1, aiMessage.toolExecutionRequests().size());
+
+            // Execute the requested tools (HITL gate honored via approvalStrategy).
+            // Lifecycle listeners fire per-tool inside the bridge.
+            var toolResults = LangChain4jToolBridge.executeToolCalls(
+                    aiMessage, toolMap, session, approvalStrategy, listeners, approvalPolicy);
+
+            // Build updated conversation with tool results
+            var updatedMessages = new ArrayList<>(conversationHistory);
+            updatedMessages.add(aiMessage);
+            updatedMessages.addAll(toolResults);
+
+            // Re-submit to the model with tool results
+            var followUpRequest = ChatRequest.builder()
+                    .messages(updatedMessages)
+                    .toolSpecifications(toolSpecifications)
+                    .build();
+
+            if (cancelled.get()) {
+                return;
+            }
+            var nextHandler = new ToolAwareStreamingResponseHandler(
+                    session, model, updatedMessages, toolSpecifications, toolMap,
+                    approvalStrategy, listeners, cancelled, toolRound + 1, approvalPolicy,
+                    loopPolicy);
+            model.chat(followUpRequest, nextHandler);
+        } else {
+            // No tool calls — deliver the final text response
+            if (aiMessage.text() != null) {
+                session.complete(aiMessage.text());
+            } else {
+                session.complete();
+            }
+        }
+    }
+
+    @Override
+    public void onError(Throwable error) {
+        if (!session.isClosed()) {
+            session.error(error);
+        }
+    }
+}

@@ -1,0 +1,1132 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.ai.koog
+
+import ai.koog.agents.core.agent.AIAgent
+import ai.koog.agents.core.agent.GraphAIAgent
+import ai.koog.agents.core.agent.config.AIAgentConfig
+import ai.koog.agents.core.planner.AIAgentPlanner
+import ai.koog.agents.core.planner.AIAgentPlannerStrategy
+import ai.koog.agents.core.planner.PlannerAIAgent
+import ai.koog.agents.ext.agent.chatAgentStrategy
+import ai.koog.agents.features.eventHandler.feature.EventHandler
+import ai.koog.agents.features.eventHandler.feature.EventHandlerConfig
+import ai.koog.agents.features.eventHandler.feature.handleEvents
+import ai.koog.prompt.Prompt
+import ai.koog.prompt.dsl.prompt
+import ai.koog.prompt.executor.clients.bedrock.BedrockCacheControl
+import ai.koog.prompt.executor.model.PromptExecutor
+import ai.koog.prompt.llm.LLModel
+import ai.koog.prompt.llm.LLMProvider
+import ai.koog.prompt.params.LLMParams
+import ai.koog.prompt.message.AttachmentContent
+import ai.koog.prompt.message.AttachmentSource
+import ai.koog.prompt.message.CacheControl
+import ai.koog.prompt.message.MessagePart
+import ai.koog.prompt.streaming.StreamFrame
+import org.atmosphere.ai.llm.CacheHint
+import java.util.Base64
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.runBlocking
+import org.atmosphere.ai.AiCapability
+import org.atmosphere.ai.AiConfig
+import org.atmosphere.ai.AiEvent
+import org.atmosphere.ai.AgentExecutionContext
+import org.atmosphere.ai.AgentRuntime
+import org.atmosphere.ai.ExecutionHandle
+import org.atmosphere.ai.StreamingSession
+import org.atmosphere.ai.TokenUsage
+import org.slf4j.LoggerFactory
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * [AgentRuntime] implementation backed by JetBrains Koog.
+ *
+ * Supports tool calling (with automatic tool loop), RAG context injection,
+ * structured output via JSON schema, and conversation memory.
+ */
+class KoogAgentRuntime : AgentRuntime {
+
+    companion object {
+        private val logger = LoggerFactory.getLogger(KoogAgentRuntime::class.java)
+
+        @Volatile
+        private var promptExecutor: PromptExecutor? = null
+
+        @Volatile
+        private var defaultModel: LLModel = LLModel(LLMProvider.OpenAI, "gpt-4o")
+
+        @JvmStatic
+        fun setPromptExecutor(executor: PromptExecutor) {
+            promptExecutor = executor
+        }
+
+        @JvmStatic
+        fun setDefaultModel(model: LLModel) {
+            defaultModel = model
+        }
+
+        /**
+         * Gate for installing the [KoogPlanBridge] plan-observation feature
+         * on a planner dispatch. Mirrors the posture of the other native
+         * plan bridges (Embabel, Spring AI Alibaba): under
+         * [org.atmosphere.ai.plan.PlanningMode.BUILTIN] the operator asked
+         * for the portable `write_todos` floor only, and when the floor's
+         * tool is already on the request (the endpoint registered it because
+         * this runtime does not statically declare
+         * [AiCapability.PLANNING]), the floor owns the plan surface — two
+         * plan sources on one console surface would conflict (no duplicate
+         * plan surfaces). The planner itself still executes either way;
+         * only the observation mirror is gated.
+         */
+        internal fun shouldObservePlan(context: AgentExecutionContext): Boolean {
+            if (org.atmosphere.ai.AiConfig.resolvePlanningMode()
+                == org.atmosphere.ai.plan.PlanningMode.BUILTIN
+            ) {
+                return false
+            }
+            for (tool in context.tools()) {
+                if (org.atmosphere.ai.plan.PlanningTools.WRITE_TODOS == tool.name()) {
+                    return false
+                }
+            }
+            return true
+        }
+
+        /**
+         * Plan goal label for [KoogPlanBridge] frames: the Koog planner
+         * surface has no goal concept in 1.0 GA, so the user's message
+         * (bounded to 120 chars) stands in behind the [KoogPlanBridge.KOOG_MARKER]
+         * marker — consoles see what the plan works toward and that the
+         * plan is planner-maintained, not a model todo list.
+         */
+        internal fun planGoal(message: String?): String {
+            val trimmed = message?.trim().orEmpty()
+            if (trimmed.isEmpty()) {
+                return KoogPlanBridge.KOOG_MARKER
+            }
+            val label = if (trimmed.length > 120) trimmed.take(117) + "..." else trimmed
+            return "${KoogPlanBridge.KOOG_MARKER}: $label"
+        }
+    }
+
+    override fun name(): String = "koog"
+
+    override fun isAvailable(): Boolean {
+        return try {
+            Class.forName("ai.koog.agents.core.agent.AIAgent")
+            true
+        } catch (e: ClassNotFoundException) {
+            false
+        }
+    }
+
+    override fun priority(): Int = 100
+
+    override fun configure(settings: AiConfig.LlmSettings) {
+        if (promptExecutor != null) {
+            return
+        }
+        logger.info(
+            "Koog adapter active but requires a PromptExecutor bean. " +
+                "Ensure koog-spring-boot-starter is on the classpath or " +
+                "call KoogAgentRuntime.setPromptExecutor() manually."
+        )
+    }
+
+    override fun execute(context: AgentExecutionContext, session: StreamingSession) {
+        // Admit through the process-wide AiGateway before issuing the native
+        // Koog dispatch — uniform per-user rate limiting and credential
+        // resolution across all twelve contract-tested runtimes (Correctness Invariant #3).
+        org.atmosphere.ai.AbstractAgentRuntime.admitThroughGateway(name(), context)
+        // Install the cross-runtime ToolLoopGuard so attaching a ToolLoopPolicy
+        // produces the same wire-level cap as on AbstractAgentRuntime-based
+        // runtimes (Mode Parity). Koog also honours the policy natively via
+        // AIAgent.maxIterations × 2 inside executeWithAgent; the guard is the
+        // belt for the suspenders, ensuring the cap holds even if the native
+        // path is bypassed (e.g. executeWithExecutor).
+        val effective = org.atmosphere.ai.llm.ToolLoopGuard.installIfPresent(name(), context, session)
+        executeWithOuterRetry(effective, session)
+    }
+
+    /**
+     * Outer retry wrapper honouring [AgentExecutionContext.retryPolicy] on
+     * pre-stream transient failures. Matches the base-class semantics in
+     * [org.atmosphere.ai.AbstractAgentRuntime.executeWithOuterRetry]:
+     *
+     *   1. No retry when the policy is the inherit sentinel
+     *      ([org.atmosphere.ai.RetryPolicy.DEFAULT]) or `maxRetries <= 0`
+     *   2. Retry only when [StreamingSession.hasErrored] is still false —
+     *      once the bridge has called `session.error(...)`, the caller has
+     *      observed terminal state and retry is unsafe
+     *   3. Honour the policy's [org.atmosphere.ai.RetryPolicy.delayForAttempt]
+     *      exponential backoff between attempts
+     *
+     * Koog does not extend [org.atmosphere.ai.AbstractAgentRuntime] (it
+     * implements [AgentRuntime] directly to avoid the Java base's type
+     * parameter on the native client), so we duplicate the retry loop
+     * here instead of inheriting. Kept in sync with the Java version so
+     * the `PER_REQUEST_RETRY` capability declaration is honest across
+     * both implementation families.
+     */
+    private fun executeWithOuterRetry(context: AgentExecutionContext, session: StreamingSession) {
+        val policy = context.retryPolicy()
+        if (policy == null || policy.isInheritSentinel || policy.maxRetries() <= 0) {
+            executeInternal(context, session, AtomicBoolean())
+            return
+        }
+        var attempt = 0
+        while (true) {
+            try {
+                executeInternal(context, session, AtomicBoolean())
+                return
+            } catch (e: RuntimeException) {
+                if (attempt >= policy.maxRetries() || session.hasErrored()) {
+                    throw e
+                }
+                val delay = policy.delayForAttempt(attempt)
+                attempt++
+                logger.info("koog outer-retry attempt {}/{} after {}ms (cause: {})",
+                    attempt, policy.maxRetries(), delay.toMillis(), e.message)
+                if (!delay.isZero && !delay.isNegative) {
+                    try {
+                        Thread.sleep(delay.toMillis())
+                    } catch (ie: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        throw e
+                    }
+                }
+            }
+        }
+    }
+
+    override fun executeWithHandle(
+        context: AgentExecutionContext, session: StreamingSession
+    ): ExecutionHandle {
+        // Gateway admission on the handle-based path too — rate-limit and
+        // credential choke-point parity across every dispatch mode
+        // (Correctness Invariant #7 — mode parity). Prior to this fix the
+        // cancel-capable path skipped the gateway.
+        org.atmosphere.ai.AbstractAgentRuntime.admitThroughGateway(name(), context)
+        // Install ToolLoopGuard before dispatching — same install pattern as
+        // #execute so the cap behaviour matches across both entry points.
+        val effective = org.atmosphere.ai.llm.ToolLoopGuard.installIfPresent(name(), context, session)
+        val cancelled = AtomicBoolean()
+        val done = CompletableFuture<Void>()
+        val activeJob = java.util.concurrent.atomic.AtomicReference<kotlinx.coroutines.Job?>()
+        val activeThread = java.util.concurrent.atomic.AtomicReference<Thread?>()
+        Thread.startVirtualThread {
+            activeThread.set(Thread.currentThread())
+            try {
+                executeInternal(effective, session, cancelled, activeJob)
+                done.complete(null)
+            } catch (ce: java.util.concurrent.CancellationException) {
+                // Native Job.cancel propagated out. Treat as clean termination
+                // so whenDone() resolves instead of hanging.
+                if (!session.isClosed) session.complete()
+                done.complete(null)
+            } catch (e: Throwable) {
+                // Classified through the shared taxonomy so retry, metrics,
+                // and routing see a typed failure; no-signal errors pass
+                // through unchanged.
+                if (!session.isClosed) {
+                    session.error(org.atmosphere.ai.ProviderErrorClassifier.wrap(e))
+                }
+                done.completeExceptionally(e)
+            } finally {
+                activeThread.set(null)
+            }
+        }
+        return object : ExecutionHandle {
+            override fun cancel() {
+                if (!cancelled.compareAndSet(false, true)) return
+                // 1. Cancel the coroutine Job so any suspension points inside
+                //    runBlocking unwind with CancellationException.
+                activeJob.get()?.cancel()
+                // 2. Interrupt the virtual thread as a belt-and-suspenders
+                //    fallback. runBlocking cannot interrupt a native blocking
+                //    socket read held by Koog's HttpClient; Thread.interrupt
+                //    flips the VT's interrupt status so NIO channels and
+                //    InterruptibleChannel-based I/O unwind.
+                activeThread.get()?.interrupt()
+                // 3. Resolve whenDone() immediately even if the VT is stuck in
+                //    non-interruptible native code. CompletableFuture semantics
+                //    drop the real completion harmlessly if the VT later catches
+                //    up, so this is the safest backstop against a hung cancel.
+                done.complete(null)
+            }
+            override fun isDone(): Boolean = done.isDone
+            override fun whenDone(): CompletableFuture<Void> = done
+        }
+    }
+
+    private fun executeInternal(
+        context: AgentExecutionContext,
+        session: StreamingSession,
+        cancelled: AtomicBoolean,
+        activeJob: java.util.concurrent.atomic.AtomicReference<kotlinx.coroutines.Job?> =
+            java.util.concurrent.atomic.AtomicReference()
+    ) {
+        val executor = promptExecutor
+            ?: throw IllegalStateException(
+                "KoogAgentRuntime: PromptExecutor not configured. " +
+                    "Call KoogAgentRuntime.setPromptExecutor() or use Spring auto-configuration."
+            )
+
+        session.progress("Connecting to koog...")
+
+        val model = if (context.model() != null && context.model() != defaultModel.id) {
+            LLModel(defaultModel.provider, context.model(),
+                defaultModel.capabilities, defaultModel.contextLength, defaultModel.maxOutputTokens)
+        } else {
+            defaultModel
+        }
+
+        // Mode-parity gap: Koog's AIAgent.run(String) tool-loop path accepts a
+        // plain text user message, so multi-modal parts (Content.Image /
+        // Content.Audio) cannot reach the tool-calling executor. When a
+        // caller provides BOTH tools and multi-modal parts, the tool-calling
+        // path wins — we log at WARN so the drop is visible in operator logs
+        // rather than silently truncating the prompt (Correctness Invariant
+        // #7, Mode Parity). Callers that need multi-modal + tools
+        // simultaneously should pick a runtime that supports both (Built-in,
+        // Spring AI, LC4j, or ADK).
+        if (context.tools().isNotEmpty() && context.parts().any { it !is org.atmosphere.ai.Content.Text }) {
+            logger.warn(
+                "Koog bridge cannot combine tool-calling and multi-modal input in " +
+                    "a single request; dropping {} non-text parts. Use the no-tools " +
+                    "path or a different runtime (built-in/spring-ai/langchain4j/adk) " +
+                    "for multi-modal + tools.",
+                context.parts().count { it !is org.atmosphere.ai.Content.Text }
+            )
+        }
+
+        // Planner dispatch wins over the default paths: when the caller
+        // attached a Koog AIAgentPlanner via KoogPlanner.attach(...), the
+        // request runs through a PlannerAIAgent (plan → execute one step →
+        // evaluate → replan). Koog 1.0 GA ships only the abstract planner
+        // surface, so this branch only ever fires with a caller-supplied
+        // planner — there is no framework default to fall back to.
+        val planner = KoogPlanner.from(context)
+        if (planner != null) {
+            executeWithPlannerAgent(executor, model, planner, context, session, cancelled, activeJob)
+        } else if (context.tools().isNotEmpty()) {
+            executeWithAgent(executor, model, context, session, cancelled, activeJob)
+        } else {
+            executeWithExecutor(executor, model, context, session, cancelled, activeJob)
+        }
+    }
+
+    /**
+     * Translate Atmosphere's [org.atmosphere.ai.Content] parts into Koog's
+     * [MessagePart.ContentPart] hierarchy for multi-modal user-message
+     * assembly. Image and Audio parts use [AttachmentContent.Binary.Base64]
+     * wrapped in [AttachmentSource] (Koog 1.0's preferred on-the-wire shape
+     * for binary attachments); File parts are not translated because Koog's
+     * chat models do not accept generic file input on the user-message
+     * surface — that maps to the tool-calling path instead, which we
+     * degrade gracefully in [executeInternal].
+     */
+    private fun atmosphereContentsToKoogParts(
+        parts: List<org.atmosphere.ai.Content>
+    ): List<MessagePart.ContentPart> {
+        if (parts.isEmpty()) return emptyList()
+        val result = mutableListOf<MessagePart.ContentPart>()
+        for (part in parts) {
+            when (part) {
+                is org.atmosphere.ai.Content.Text -> result.add(MessagePart.Text(part.text()))
+                is org.atmosphere.ai.Content.Image -> {
+                    val base64 = Base64.getEncoder().encodeToString(part.data())
+                    val content = AttachmentContent.Binary.Base64(base64)
+                    val format = part.mimeType().substringAfter("/", "png")
+                    val source = AttachmentSource.Image(content, format, part.mimeType(), "image.$format")
+                    result.add(MessagePart.Attachment(source))
+                }
+                is org.atmosphere.ai.Content.Audio -> {
+                    val base64 = Base64.getEncoder().encodeToString(part.data())
+                    val content = AttachmentContent.Binary.Base64(base64)
+                    val format = part.mimeType().substringAfter("/", "wav")
+                    val source = AttachmentSource.Audio(content, format, part.mimeType(), "audio.$format")
+                    result.add(MessagePart.Attachment(source))
+                }
+                is org.atmosphere.ai.Content.File -> {
+                    // Koog's chat surface does not accept generic file input —
+                    // the ContentPart hierarchy only models Text/Image/Audio.
+                    // Log at WARN (not DEBUG) so operators see the silent loss
+                    // and know to route File attachments through ADK or
+                    // Built-in instead. Matches the mode-parity-drop WARN
+                    // fired by executeInternal when tools + multi-modal are
+                    // combined on the Koog path.
+                    logger.warn(
+                        "Koog bridge dropping unsupported Content.File part: {} ({} bytes, {}). " +
+                            "Koog's chat surface does not accept generic file input; " +
+                            "route File attachments through adk or built-in for Gemini/OpenAI " +
+                            "multi-modal support.",
+                        part.fileName(), part.data().size, part.mimeType()
+                    )
+                }
+            }
+        }
+        return result
+    }
+
+    /**
+     * Uses Koog's [AIAgent] with [chatAgentStrategy] for full agent orchestration.
+     * The agent handles the tool calling loop automatically; we bridge events
+     * to the [StreamingSession] via event handlers.
+     */
+    private fun executeWithAgent(
+        executor: PromptExecutor, model: LLModel,
+        context: AgentExecutionContext, session: StreamingSession,
+        cancelled: AtomicBoolean,
+        activeJob: java.util.concurrent.atomic.AtomicReference<kotlinx.coroutines.Job?> =
+            java.util.concurrent.atomic.AtomicReference()
+    ) {
+        val toolRegistry = AtmosphereToolBridge.buildRegistry(
+            context.tools(), session, context.approvalStrategy(), context.listeners(),
+            context.approvalPolicy()
+        )
+        val systemPrompt = buildSystemPrompt(context)
+
+        // Per-request tool-loop iteration cap: if the caller attached a
+        // ToolLoopPolicy via ToolLoopPolicies.attach(...), use it as Koog's
+        // AIAgent.maxIterations. Default policy = 5 model→tool rounds,
+        // doubled to 10 because Koog's iteration count covers both LLM
+        // rounds and tool execution steps (one round = one llm call + one
+        // tool dispatch). Koog throws on overflow; executeInternal's
+        // try/catch surfaces it via session.error, matching the policy's
+        // OnMaxIterations.FAIL semantics for callers that opt in.
+        val toolLoopPolicy = org.atmosphere.ai.llm.ToolLoopPolicies.fromOrDefault(context)
+        val maxIterations = toolLoopPolicy.maxIterations() * 2
+
+        // Per-request strategy override: when the caller attached a custom
+        // AIAgentGraphStrategy via KoogStrategy.attach(...), wire it into the
+        // AIAgent factory's strategy slot. Without this branch the helper
+        // would be silently ignored — Koog's default factory uses
+        // chatAgentStrategy() implicitly when the strategy parameter is
+        // omitted. The else branch preserves the pre-bridge behavior
+        // bit-identical for callers who do not opt in.
+        val customStrategy = KoogStrategy.from(context)
+        // Lifecycle hook bridge args — listeners + model name threaded into
+        // wireFeatureHandlers so onLLMCallStarting/Completed/Failed translate
+        // to AgentLifecycleListener.fireModelStart/End/Error.
+        val lifecycleListeners = context.listeners()
+        val lifecycleModelName = context.model() ?: name()
+
+        // Framework-level generation override: the AIAgent factory threads
+        // its temperature parameter onto the agent prompt's LLMParams
+        // (createAgentConfig), so the AiConfig knob reaches the tool-calling
+        // path exactly like the executor path (Correctness Invariant #7 —
+        // Mode Parity). null = unset = byte-identical dispatch.
+        val temperature = generationTemperature()
+        val agent = if (customStrategy != null) {
+            AIAgent(
+                promptExecutor = executor,
+                llmModel = model,
+                strategy = customStrategy,
+                toolRegistry = toolRegistry,
+                systemPrompt = systemPrompt,
+                temperature = temperature,
+                maxIterations = maxIterations
+            ) {
+                wireFeatureHandlers(cancelled, session, lifecycleListeners, lifecycleModelName)
+            }
+        } else {
+            AIAgent(
+                promptExecutor = executor,
+                llmModel = model,
+                systemPrompt = systemPrompt,
+                temperature = temperature,
+                toolRegistry = toolRegistry,
+                maxIterations = maxIterations
+            ) {
+                wireFeatureHandlers(cancelled, session, lifecycleListeners, lifecycleModelName)
+            }
+        }
+
+        try {
+            runBlocking {
+                activeJob.set(coroutineContext[kotlinx.coroutines.Job])
+                val result = agent.run(context.message())
+                if (result.isNotBlank()) {
+                    logger.debug("Agent completed with result length: {}", result.length)
+                }
+                agent.close()
+            }
+            if (!session.isClosed) session.complete()
+        } catch (ce: java.util.concurrent.CancellationException) {
+            // Caller-initiated cancel (executeWithHandle) or coroutine unwinding.
+            // Complete cleanly so the outer VT wrapper can resolve done() without
+            // re-reporting the cancel as an error.
+            if (cancelled.get()) {
+                logger.debug("Koog agent cancelled by caller")
+                if (!session.isClosed) session.complete()
+            } else {
+                logger.warn("Koog agent cancelled unexpectedly", ce)
+                if (!session.isClosed) session.error(ce)
+            }
+            throw ce
+        } catch (e: Exception) {
+            // Mirror the Spring AI / LC4j posture: any exception escaping
+            // agent.run() (LLM call failure, tool failure, bridge failure)
+            // surfaces as an onModelError lifecycle event so audit appenders
+            // and AiEventForwardingListener see the failure even when the
+            // session.error path is the primary signal. Koog's
+            // EventHandlerConfig has no onLLMCallFailed callback, so the
+            // catch block is the bridge point.
+            org.atmosphere.ai.AgentLifecycleListener.fireModelError(
+                lifecycleListeners, lifecycleModelName, e
+            )
+            logger.error("Koog agent execution failed", e)
+            // Classified through the shared taxonomy so retry, metrics, and
+            // routing see a typed failure; no-signal errors pass through.
+            if (!session.isClosed) {
+                session.error(org.atmosphere.ai.ProviderErrorClassifier.wrap(e))
+            }
+        }
+    }
+
+    /**
+     * Planner-agent dispatch for requests carrying a caller-supplied
+     * [AIAgentPlanner] (attached via [KoogPlanner.attach]). Builds a
+     * per-request [PlannerAIAgent] around the planner and the same
+     * tool-registry / system-prompt / iteration-cap assembly the
+     * [executeWithAgent] path uses (Correctness Invariant #7 — Mode
+     * Parity), then:
+     *
+     *  - installs the standard Atmosphere event handlers (LLM streaming
+     *    frames, tool events, token usage, lifecycle spans) through the
+     *    [EventHandler] feature — Koog registers its common pipeline
+     *    handlers on the planner pipeline, so streaming/TOKEN_USAGE
+     *    behavior matches the graph-agent path;
+     *  - installs [KoogPlanBridge] when [shouldObservePlan] allows it,
+     *    mirroring every plan the planner maintains into
+     *    [AiEvent.PlanUpdate] frames keyed with the same
+     *    [org.atmosphere.ai.tool.ToolScopes] resolution the built-in
+     *    `write_todos` floor uses;
+     *  - emits the planner's final output as a terminal
+     *    [AiEvent.TextComplete] (planner LLM calls stream through the
+     *    event handlers, but the planner's own String output has no
+     *    streaming source).
+     *
+     * Cancellation, terminal-path and error semantics are byte-for-byte the
+     * [executeWithAgent] posture: cooperative Job cancel completes cleanly,
+     * unexpected cancellation and failures surface via `session.error`
+     * after firing the model-error lifecycle event.
+     */
+    private fun executeWithPlannerAgent(
+        executor: PromptExecutor, model: LLModel,
+        planner: AIAgentPlanner<String, String, *, *>,
+        context: AgentExecutionContext, session: StreamingSession,
+        cancelled: AtomicBoolean,
+        activeJob: java.util.concurrent.atomic.AtomicReference<kotlinx.coroutines.Job?> =
+            java.util.concurrent.atomic.AtomicReference()
+    ) {
+        // Same boundary honesty as the tool-loop path: the planner runs on
+        // the user's plain text message, so multi-modal parts cannot reach
+        // it — log the drop instead of silently truncating (Invariant #7).
+        if (context.parts().any { it !is org.atmosphere.ai.Content.Text }) {
+            logger.warn(
+                "Koog planner dispatch accepts a plain text input; dropping {} non-text " +
+                    "parts. Use a non-planner dispatch or a different runtime for " +
+                    "multi-modal input.",
+                context.parts().count { it !is org.atmosphere.ai.Content.Text }
+            )
+        }
+        val toolRegistry = AtmosphereToolBridge.buildRegistry(
+            context.tools(), session, context.approvalStrategy(), context.listeners(),
+            context.approvalPolicy()
+        )
+        val systemPrompt = buildSystemPrompt(context)
+        // Iteration cap parity with executeWithAgent: the planner loop
+        // increments the agent iteration counter once per plan→step→evaluate
+        // round, and Koog throws AIAgentMaxNumberOfIterationsReachedException
+        // on overflow — surfaced via session.error by the catch arm below.
+        val toolLoopPolicy = org.atmosphere.ai.llm.ToolLoopPolicies.fromOrDefault(context)
+        val maxIterations = toolLoopPolicy.maxIterations() * 2
+
+        val lifecycleListeners = context.listeners()
+        val lifecycleModelName = context.model() ?: name()
+        val observePlan = shouldObservePlan(context)
+        val injectables = session.injectables()
+        val streamingSession = session
+        val planGoalLabel = planGoal(context.message())
+        val planConversationId = org.atmosphere.ai.tool.ToolScopes.conversationId(injectables)
+        val planAgentId = org.atmosphere.ai.tool.ToolScopes.agentId(injectables, context.agentId())
+        val planStoreInScope = injectables[org.atmosphere.ai.plan.AgentPlanStore::class.java]
+            as? org.atmosphere.ai.plan.AgentPlanStore
+
+        val agent = PlannerAIAgent(
+            promptExecutor = executor,
+            agentConfig = AIAgentConfig(
+                // Framework-level generation override on the planner prompt's
+                // LLMParams — same temperature knob as the agent and executor
+                // paths (Correctness Invariant #7 — Mode Parity).
+                prompt = prompt("atmosphere-planner",
+                    LLMParams(temperature = generationTemperature())) {
+                    if (systemPrompt.isNotBlank()) {
+                        system(systemPrompt)
+                    }
+                },
+                model = model,
+                maxAgentIterations = maxIterations
+            ),
+            strategy = AIAgentPlannerStrategy("atmosphere-planner", planner),
+            toolRegistry = toolRegistry
+        ) {
+            install(EventHandler.Feature) {
+                wireAtmosphereEventHandlers(cancelled, streamingSession,
+                    lifecycleListeners, lifecycleModelName)
+            }
+            if (observePlan) {
+                install(KoogPlanBridge.Feature) {
+                    // `this.` — the outer dispatch's `session` parameter
+                    // lexically shadows the Config receiver's property.
+                    this.session = streamingSession
+                    this.goal = planGoalLabel
+                    this.conversationId = planConversationId
+                    this.agentId = planAgentId
+                    this.planStore = planStoreInScope
+                }
+            }
+        }
+
+        try {
+            runBlocking {
+                activeJob.set(coroutineContext[kotlinx.coroutines.Job])
+                val result = agent.run(context.message())
+                if (!cancelled.get() && !session.isClosed && result.isNotBlank()) {
+                    session.emit(AiEvent.TextComplete(result))
+                }
+                agent.close()
+            }
+            if (!session.isClosed) session.complete()
+        } catch (ce: java.util.concurrent.CancellationException) {
+            if (cancelled.get()) {
+                logger.debug("Koog planner agent cancelled by caller")
+                if (!session.isClosed) session.complete()
+            } else {
+                logger.warn("Koog planner agent cancelled unexpectedly", ce)
+                if (!session.isClosed) session.error(ce)
+            }
+            throw ce
+        } catch (e: Exception) {
+            org.atmosphere.ai.AgentLifecycleListener.fireModelError(
+                lifecycleListeners, lifecycleModelName, e
+            )
+            logger.error("Koog planner agent execution failed", e)
+            if (!session.isClosed) {
+                session.error(org.atmosphere.ai.ProviderErrorClassifier.wrap(e))
+            }
+        }
+    }
+
+    /**
+     * Direct executor path for simple prompts without tools.
+     * Streams frames in real-time via [PromptExecutor.executeStreaming].
+     */
+    private fun executeWithExecutor(
+        executor: PromptExecutor, model: LLModel,
+        context: AgentExecutionContext, session: StreamingSession,
+        cancelled: AtomicBoolean,
+        activeJob: java.util.concurrent.atomic.AtomicReference<kotlinx.coroutines.Job?> =
+            java.util.concurrent.atomic.AtomicReference()
+    ) {
+        val koogPrompt = buildPrompt(context)
+
+        try {
+            runBlocking {
+                activeJob.set(coroutineContext[kotlinx.coroutines.Job])
+                executor.executeStreaming(koogPrompt, model).collect { frame ->
+                    if (cancelled.get() || session.isClosed) return@collect
+                    when (frame) {
+                        is StreamFrame.TextDelta -> session.emit(AiEvent.TextDelta(frame.text))
+                        is StreamFrame.TextComplete -> session.emit(AiEvent.TextComplete(frame.text))
+                        is StreamFrame.ReasoningDelta -> {
+                            val text = frame.text
+                            if (text != null) session.emit(AiEvent.Progress(text, null))
+                        }
+                        is StreamFrame.ReasoningComplete -> {}
+                        is StreamFrame.ToolCallDelta -> {}
+                        is StreamFrame.ToolCallComplete -> {}
+                        is StreamFrame.End -> {}
+                    }
+                }
+            }
+            if (!session.isClosed) session.complete()
+        } catch (ce: java.util.concurrent.CancellationException) {
+            if (cancelled.get()) {
+                logger.debug("Koog streaming cancelled by caller")
+                if (!session.isClosed) session.complete()
+            } else {
+                logger.warn("Koog streaming cancelled unexpectedly", ce)
+                if (!session.isClosed) session.error(ce)
+            }
+            throw ce
+        } catch (e: Exception) {
+            logger.error("Koog streaming failed", e)
+            if (!session.isClosed) {
+                session.error(org.atmosphere.ai.ProviderErrorClassifier.wrap(e))
+            }
+        }
+    }
+
+    /**
+     * Builds the Koog prompt from the execution context, including:
+     * - System prompt (with RAG context appended if available)
+     * - Structured output JSON schema instructions
+     * - Conversation history
+     * - Current user message
+     */
+    /**
+     * Provider-native structured output for the no-tool executor path: when the
+     * pipeline opts in (response type declared and NativeStructuredOutputMode !=
+     * DISABLED), carry the generated JSON Schema on the prompt's [LLMParams.schema]
+     * so Koog's streaming executor forwards it to the provider's native
+     * structured-output field — preserving streaming (unlike the non-streaming
+     * executeStructured API). A malformed schema is skipped (logged) so it can
+     * never break dispatch; a provider rejection trips the
+     * NativeStructuredOutputMode.AUTO graceful fall-back.
+     */
+    private fun nativeStructuredParams(context: AgentExecutionContext): LLMParams {
+        // Framework-level generation override: Koog's provider-agnostic
+        // LLMParams carries temperature, so the AiConfig knob rides every
+        // executor dispatch — structured and plain alike (Correctness
+        // Invariant #7 — Mode Parity). topP/stop have no field on the base
+        // LLMParams (only provider-specific subclasses like OpenAIChatParams
+        // carry them) and maxTokens stays ceded to Koog's model-level
+        // configuration; see modules/ai/README.md § Generation parameters.
+        val temperature = generationTemperature()
+        if (context.responseType() == null ||
+            !org.atmosphere.ai.NativeStructuredOutput.shouldApply(context)
+        ) {
+            return LLMParams(temperature = temperature)
+        }
+        val schemaJson = org.atmosphere.ai.NativeStructuredOutput.schema(context)
+            ?: return LLMParams(temperature = temperature)
+        return try {
+            val jsonObject = kotlinx.serialization.json.Json.Default
+                .parseToJsonElement(schemaJson) as kotlinx.serialization.json.JsonObject
+            LLMParams(
+                temperature = temperature,
+                schema = LLMParams.Schema.JSON.Standard("structured_output", jsonObject)
+            )
+        } catch (e: Exception) {
+            logger.debug("Skipping Koog native schema — not parseable", e)
+            LLMParams(temperature = temperature)
+        }
+    }
+
+    /**
+     * The framework-resolved [org.atmosphere.ai.GenerationParams.temperature]
+     * override, or `null` (unset — byte-identical wire output) when no
+     * [AiConfig] has been resolved or the knob is not set.
+     */
+    private fun generationTemperature(): Double? =
+        AiConfig.get()?.generation()?.temperature()
+
+    private fun buildPrompt(context: AgentExecutionContext): Prompt {
+        return prompt("atmosphere", nativeStructuredParams(context)) {
+            // System prompt with optional RAG context
+            val systemParts = mutableListOf<String>()
+            if (context.systemPrompt() != null) {
+                systemParts.add(context.systemPrompt())
+            }
+
+            // RAG: retrieve relevant documents and inject into system prompt
+            if (context.contextProviders().isNotEmpty()) {
+                val ragContext = StringBuilder()
+                for (provider in context.contextProviders()) {
+                    if (!provider.isAvailable) continue
+                    val query = org.atmosphere.ai.ContextProvider.normalizeQuery(
+                        provider.transformQuery(context.message())
+                    )
+                    if (!org.atmosphere.ai.ContextProvider.shouldRetrieve(query)) continue
+                    val docs = provider.retrieve(query, 5)
+                    val filtered = provider.filter(query, docs)
+                    val reranked = provider.rerank(query, filtered)
+                    val finalDocs = provider.postProcess(query, reranked)
+                    for (doc in finalDocs) {
+                        ragContext.append("\n---\n").append(doc.content())
+                        ragContext.append("\n")
+                            .append(org.atmosphere.ai.ContextProvider.formatCitation(doc))
+                    }
+                }
+                if (ragContext.isNotEmpty()) {
+                    systemParts.add(
+                        "Use the following retrieved context to inform your answer:" +
+                            ragContext.toString()
+                    )
+                }
+            }
+
+            // Structured output: append JSON schema instructions
+            if (context.responseType() != null) {
+                systemParts.add(
+                    "Respond with valid JSON conforming to the schema for: ${context.responseType().simpleName}. " +
+                        "Do not include any text outside the JSON object."
+                )
+            }
+
+            if (systemParts.isNotEmpty()) {
+                system(systemParts.joinToString("\n\n"))
+            }
+
+            // Conversation history
+            for (msg in context.history()) {
+                when (msg.role()) {
+                    "user" -> user(msg.content())
+                    "assistant" -> assistant(msg.content())
+                    "system" -> system(msg.content())
+                    else -> user(msg.content())
+                }
+            }
+
+            // Multi-modal + prompt-caching dispatch.
+            //
+            // Koog 1.0's MessagePart hierarchy splits user-turn content into
+            // Text and Attachment parts. CacheControl is per-MessagePart, so
+            // we apply it to the leading Text — semantically equivalent to
+            // the old whole-turn cacheControl while letting individual
+            // attachments stay uncached. BedrockCacheControl is the only
+            // concrete impl in Koog 1.0 stable, so this remains honest on
+            // Bedrock-backed models and silently ignored elsewhere (same
+            // "honored on one path, no-op elsewhere" shape Spring AI /
+            // LangChain4j take for OpenAI prompt_cache_key).
+            val koogParts = atmosphereContentsToKoogParts(context.parts())
+            val cacheControl = resolveBedrockCacheControl(context)
+
+            if (koogParts.isEmpty()) {
+                if (cacheControl == null) user(context.message())
+                else user(context.message(), cacheControl)
+            } else {
+                val allParts = mutableListOf<MessagePart.RequestPart>(
+                    MessagePart.Text(context.message(), cacheControl)
+                )
+                allParts.addAll(koogParts)
+                user(allParts)
+            }
+        }
+    }
+
+    /**
+     * Translate an Atmosphere [CacheHint] into one of Koog 1.0's
+     * [BedrockCacheControl] variants. Returns {@code null} when caching is
+     * disabled or the hint cannot be honored — callers take the no-cache
+     * branch of [buildPrompt].
+     *
+     * Policy mapping (Bedrock ships only two TTL buckets):
+     *   - [CacheHint.CachePolicy.CONSERVATIVE] → [BedrockCacheControl.FiveMinutes]
+     *   - [CacheHint.CachePolicy.AGGRESSIVE]   → [BedrockCacheControl.OneHour]
+     *
+     * When the caller supplies an explicit TTL hint we pick the closest
+     * Bedrock bucket (<=5 min → FiveMinutes, otherwise OneHour) so TTL
+     * requests survive the translation to Bedrock's fixed-bucket model.
+     */
+    private fun resolveBedrockCacheControl(context: AgentExecutionContext): CacheControl? {
+        val hint = CacheHint.from(context)
+        if (!hint.enabled()) return null
+        val ttl = hint.ttl().orElse(null)
+        return when {
+            ttl != null && ttl.toMinutes() <= 5 -> BedrockCacheControl.FiveMinutes
+            ttl != null                         -> BedrockCacheControl.OneHour
+            hint.policy() == CacheHint.CachePolicy.AGGRESSIVE -> BedrockCacheControl.OneHour
+            else                                -> BedrockCacheControl.FiveMinutes
+        }
+    }
+
+    /**
+     * Build the system prompt string from context (for the AIAgent path).
+     */
+    private fun buildSystemPrompt(context: AgentExecutionContext): String {
+        val parts = mutableListOf<String>()
+        if (context.systemPrompt() != null) parts.add(context.systemPrompt())
+
+        if (context.contextProviders().isNotEmpty()) {
+            val ragContext = StringBuilder()
+            for (provider in context.contextProviders()) {
+                if (!provider.isAvailable) continue
+                val query = org.atmosphere.ai.ContextProvider.normalizeQuery(
+                    provider.transformQuery(context.message())
+                )
+                if (!org.atmosphere.ai.ContextProvider.shouldRetrieve(query)) continue
+                val docs = provider.retrieve(query, 5)
+                val filtered = provider.filter(query, docs)
+                val reranked = provider.rerank(query, filtered)
+                val finalDocs = provider.postProcess(query, reranked)
+                for (doc in finalDocs) {
+                    ragContext.append("\n---\n").append(doc.content())
+                    ragContext.append("\n")
+                        .append(org.atmosphere.ai.ContextProvider.formatCitation(doc))
+                }
+            }
+            if (ragContext.isNotEmpty()) {
+                parts.add("Use the following retrieved context to inform your answer:$ragContext")
+            }
+        }
+
+        if (context.responseType() != null) {
+            parts.add("Respond with valid JSON conforming to the schema for: ${context.responseType().simpleName}.")
+        }
+
+        return parts.joinToString("\n\n")
+    }
+
+    override fun capabilities(): Set<AiCapability> = setOf(
+        AiCapability.TEXT_STREAMING,
+        AiCapability.TOOL_CALLING,
+        AiCapability.STRUCTURED_OUTPUT,
+        // NATIVE_STRUCTURED_OUTPUT: the no-tool executor path carries the generated
+        // JSON Schema on the prompt's LLMParams.schema, which Koog's streaming
+        // executor forwards to the provider's native structured-output field
+        // (preserving streaming, unlike the non-streaming executeStructured API);
+        // AUTO mode falls back to prompt injection on a provider rejection.
+        AiCapability.NATIVE_STRUCTURED_OUTPUT,
+        AiCapability.AGENT_ORCHESTRATION,
+        AiCapability.CONVERSATION_MEMORY,
+        AiCapability.SYSTEM_PROMPT,
+        // TOOL_APPROVAL is honest: AtmosphereToolBridge wraps every
+        // Atmosphere ToolDefinition in a Koog-native tool whose suspend body
+        // captures the session + strategy and calls
+        // ToolExecutionHelper.executeWithApproval, so @RequiresApproval
+        // gates fire uniformly with the other runtimes.
+        AiCapability.TOOL_APPROVAL,
+        // TOKEN_USAGE: the Koog LLM-call-completed event exposes usage
+        // totals; wireFeatureHandlers converts them to TokenUsage and
+        // emits them via session.usage().
+        AiCapability.TOKEN_USAGE,
+        // MODEL_ENUMERATION: this runtime overrides models() to return the
+        // provider's configured/discovered model list, surfaced by the admin
+        // runtime-info endpoint — so it genuinely backs the capability.
+        AiCapability.MODEL_ENUMERATION,
+        // VISION / AUDIO / MULTI_MODAL are honest on the no-tools path:
+        // atmosphereContentsToKoogParts translates Content.Image /
+        // Content.Audio into Koog's native ContentPart.Image /
+        // ContentPart.Audio with AttachmentContent.Binary.Base64, and the
+        // buildPrompt DSL attaches them to the user message via
+        // user(String, List<ContentPart>). When tools AND multi-modal parts
+        // are present simultaneously, Koog's AIAgent.run(String) tool-loop
+        // surface only accepts a plain text message — executeInternal logs
+        // a WARN and the tool-calling path wins, degrading gracefully.
+        AiCapability.VISION,
+        AiCapability.AUDIO,
+        AiCapability.MULTI_MODAL,
+        // PROMPT_CACHING is honest on Bedrock-backed Koog models:
+        // resolveBedrockCacheControl maps Atmosphere's portable CacheHint to
+        // one of Koog 1.0's BedrockCacheControl buckets and attaches it to the
+        // outgoing Message.User via the parts-list + cacheControl
+        // PromptBuilder overload. Non-Bedrock providers silently drop it — same shape
+        // Spring AI / LangChain4j take for OpenAI prompt_cache_key.
+        AiCapability.PROMPT_CACHING,
+        // CANCELLATION: executeWithHandle returns an ExecutionHandle whose
+        // cancel() calls Job.cancel() (cooperative coroutine unwind),
+        // Thread.interrupt() (release native blocking reads via NIO interrupt),
+        // and resolves the done-future with synthetic completion — terminal-path
+        // closure per Correctness Invariant #2. See KoogAgentRuntime.kt:158-208.
+        AiCapability.CANCELLATION,
+        // PER_REQUEST_RETRY: honored via executeWithOuterRetry which
+        // wraps executeInternal in a retry loop respecting
+        // context.retryPolicy(). Pre-stream transient failures are
+        // retried up to maxRetries on top of Koog's native HTTP retry.
+        AiCapability.PER_REQUEST_RETRY,
+        // BUDGET_ENFORCEMENT: framework-level circuit breaker via the
+        // AiPipeline BudgetCapturingSession decorator — honest because
+        // wireFeatureHandlers emits typed TokenUsage through session.usage(),
+        // the signal BudgetCapturingSession taps for token / step abort.
+        // Wall-clock limits trip universally.
+        AiCapability.BUDGET_ENFORCEMENT,
+        // CONFIDENCE_SCORES: framework-level — AiPipeline's
+        // ConfidenceCapturingSession parses the model-reported
+        // confidence field on stream completion. Honest because Koog
+        // honors SYSTEM_PROMPT and streams response text via
+        // StreamFrame.Append → session.send().
+        AiCapability.CONFIDENCE_SCORES,
+        // PASSIVATION: AgentPassivation snapshots context.history() into
+        // a CheckpointStore. Honest because Koog's buildPrompt DSL threads
+        // history into the Message list on every dispatch.
+        AiCapability.PASSIVATION
+        // Deliberately NOT declared: PLANNING. Koog 1.0.0 GA (agents-core)
+        // ships only the ABSTRACT planner surface — AIAgentPlanner /
+        // PlannerAIAgent plus the plan lifecycle events; the concrete
+        // planners (SimpleLLMPlanner, GOAPPlanner) are beta-only in the
+        // separate agents-planner artifact, which is not a dependency. The
+        // adapter therefore has no native plan machinery to attach on its
+        // default dispatch: a planner exists only when the caller supplies
+        // one per request via KoogPlanner.attach(...). PlanningPreset
+        // consumes this flag at endpoint registration, and AUTO mode
+        // suppresses the built-in write_todos floor when it is declared —
+        // a static declaration would leave every planner-less Koog dispatch
+        // (the default) with no plan surface at all (Correctness Invariant
+        // #5, Runtime Truth: "declare ONLY when the adapter's dispatch path
+        // actually attaches the native plan machinery"). Planner-attached
+        // requests still get the native observation surface: KoogPlanBridge
+        // mirrors the plan lifecycle into AiEvent.PlanUpdate frames, gated
+        // by shouldObservePlan against the floor (no duplicate plan
+        // surfaces). Pinned end-to-end by KoogPlanBridgeTest.
+    )
+
+    override fun models(): List<String> {
+        // Koog's LLModel carries an id; report the default plus any
+        // override. context.model() takes precedence at dispatch time.
+        return listOf(defaultModel.id)
+    }
+}
+
+/**
+ * Install the standard Atmosphere event handlers on a Koog
+ * [GraphAIAgent.FeatureContext]. Extracted as a top-level extension so the
+ * default-strategy path and the per-request custom-strategy path share one
+ * source of truth — without it the handler block would have to be duplicated
+ * verbatim inside both branches of the `if (customStrategy != null)` choice
+ * in [KoogAgentRuntime.executeWithAgent], where any future event-handler
+ * change would have to be applied twice and would silently drift.
+ */
+private fun GraphAIAgent.FeatureContext.wireFeatureHandlers(
+    cancelled: AtomicBoolean,
+    session: StreamingSession,
+    listeners: List<org.atmosphere.ai.AgentLifecycleListener> = emptyList(),
+    modelName: String = "koog"
+) {
+    handleEvents {
+        wireAtmosphereEventHandlers(cancelled, session, listeners, modelName)
+    }
+}
+
+/**
+ * The shared [EventHandlerConfig] body behind [wireFeatureHandlers]: the
+ * graph-agent path reaches it through Koog's `handleEvents` sugar and the
+ * planner path ([KoogAgentRuntime.executeWithPlannerAgent]) installs the
+ * same [EventHandler] feature on the planner pipeline directly — one source
+ * of truth for both dispatch families (Correctness Invariant #7).
+ *
+ * Translates Koog's [StreamFrame] / tool / LLM-call events into Atmosphere
+ * [AiEvent] frames on the supplied [StreamingSession]. Honors the
+ * [cancelled] flag at every emission boundary so a caller-initiated cancel
+ * stops emitting promptly.
+ */
+private fun EventHandlerConfig.wireAtmosphereEventHandlers(
+    cancelled: AtomicBoolean,
+    session: StreamingSession,
+    listeners: List<org.atmosphere.ai.AgentLifecycleListener> = emptyList(),
+    modelName: String = "koog"
+) {
+    // Per-LLM-call observation span for fireModelStart/End duration computation.
+    // Koog's AIAgent runs may issue multiple LLM calls (tool loop), so we open a
+    // fresh scope per call rather than once per agent.run(). AtomicReference is
+    // safe for the single-writer / single-reader pattern Koog uses
+    // (onLLMCallStarting opens + writes; onLLMCallCompleted reads + completes on
+    // the same dispatcher).
+    val callScope =
+        java.util.concurrent.atomic.AtomicReference<org.atmosphere.ai.ModelCallScope?>()
+    onLLMStreamingFrameReceived { ctx ->
+        if (cancelled.get() || session.isClosed) return@onLLMStreamingFrameReceived
+        when (val frame = ctx.streamFrame) {
+            is StreamFrame.TextDelta -> session.emit(AiEvent.TextDelta(frame.text))
+            is StreamFrame.TextComplete -> session.emit(AiEvent.TextComplete(frame.text))
+            is StreamFrame.ReasoningDelta -> {
+                val text = frame.text
+                if (text != null) session.emit(AiEvent.Progress(text, null))
+            }
+            else -> {}
+        }
+    }
+    onToolCallStarting { ctx ->
+        session.emit(AiEvent.ToolStart(ctx.toolName, unwrapJsonObject(ctx.toolArgs)))
+    }
+    onToolCallCompleted { ctx ->
+        session.emit(AiEvent.ToolResult(ctx.toolName, ctx.toolResult?.toString()))
+    }
+    onToolCallFailed { ctx ->
+        session.emit(AiEvent.ToolError(ctx.toolName, ctx.error?.message ?: "Tool failed"))
+    }
+    onLLMCallStarting { ctx ->
+        // Open the model-call span per LLM call. Koog's tool loop issues one
+        // ctx per dispatch, so callers see one start/end pair per round —
+        // matching the Built-in OpenAiCompatibleClient posture (one
+        // fireModelStart per HTTP attempt). ModelCallScope.open captures the
+        // start time and fires onModelStart in one step.
+        val messageCount = ctx.prompt.messages.size
+        val toolCount = ctx.tools.size
+        callScope.set(
+            org.atmosphere.ai.ModelCallScope.open(
+                listeners, modelName, messageCount, toolCount
+            )
+        )
+    }
+    onLLMCallCompleted { ctx ->
+        // Report typed token usage once per LLM call. The default
+        // StreamingSession.usage() sink re-emits legacy ai.tokens.* metadata keys
+        // so existing Micrometer / budget consumers keep working. Koog 1.0
+        // collapsed the per-call response list into a single (nullable)
+        // Message.Assistant on LLMCallCompletedContext — null on failure
+        // paths where the model never produced an Assistant message.
+        var atmoUsage: TokenUsage? = null
+        val meta = ctx.response?.metaInfo
+        if (meta != null) {
+            val input = meta.inputTokensCount?.toLong() ?: 0L
+            val output = meta.outputTokensCount?.toLong() ?: 0L
+            val total = meta.totalTokensCount?.toLong() ?: (input + output)
+            val usage = TokenUsage(input, output, 0L, total, null)
+            if (usage.hasCounts()) {
+                session.usage(usage)
+                atmoUsage = usage
+            }
+        }
+        // Complete the model-call span with the captured TokenUsage and
+        // wall-clock duration. If the start hook did not fire (defensive —
+        // shouldn't happen but Koog's event ordering is its own) the scope
+        // is null; fall back to firing onModelEnd directly with duration 0L
+        // so the end event still fires, matching the prior floor-at-0
+        // behavior bit-for-bit.
+        val scope = callScope.getAndSet(null)
+        if (scope != null) {
+            scope.complete(atmoUsage)
+        } else {
+            org.atmosphere.ai.AgentLifecycleListener.fireModelEnd(
+                listeners, modelName, atmoUsage, 0L
+            )
+        }
+    }
+}
+
+/**
+ * Unwrap Koog's [ai.koog.serialization.JSONObject] tool-args payload into a
+ * plain `Map<String, Any?>` for [AiEvent.ToolStart]. Without this, the bridge
+ * was emitting hardcoded `emptyMap()` for every tool start — downstream
+ * listeners that read `arguments` saw fake-empty args (Correctness Invariant
+ * #5 — Runtime Truth, applied at the event payload boundary). Numbers stay as
+ * `Long`/`Double` where the literal parses cleanly; everything else falls
+ * through to `String`.
+ */
+private fun unwrapJsonObject(json: ai.koog.serialization.JSONObject?): Map<String, Any?> {
+    if (json == null) return emptyMap()
+    return json.entries.mapValues { unwrapJsonElement(it.value) }
+}
+
+private fun unwrapJsonElement(elem: ai.koog.serialization.JSONElement?): Any? = when (elem) {
+    null, is ai.koog.serialization.JSONNull -> null
+    is ai.koog.serialization.JSONLiteral -> if (elem.isString) {
+        elem.content
+    } else {
+        elem.content.toLongOrNull()
+            ?: elem.content.toDoubleOrNull()
+            ?: elem.content.toBooleanStrictOrNull()
+            ?: elem.content
+    }
+    is ai.koog.serialization.JSONArray -> elem.elements.map { unwrapJsonElement(it) }
+    is ai.koog.serialization.JSONObject -> unwrapJsonObject(elem)
+}

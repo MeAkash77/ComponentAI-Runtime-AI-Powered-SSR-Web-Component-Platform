@@ -1,0 +1,1259 @@
+/*
+ * Copyright 2011-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { WebTransportTransport } from '../../src/transports/webtransport';
+import type { AtmosphereRequest, AtmosphereInterceptor, SubscriptionHandlers } from '../../src/types';
+import { OfflineQueue } from '../../src/queue/offline-queue';
+
+/**
+ * Creates a mock WritableStreamDefaultWriter.
+ */
+function createMockWriter() {
+  return {
+    write: vi.fn().mockResolvedValue(undefined),
+    close: vi.fn().mockResolvedValue(undefined),
+    abort: vi.fn().mockResolvedValue(undefined),
+    releaseLock: vi.fn(),
+    ready: Promise.resolve(undefined),
+    closed: new Promise<undefined>(() => {}),
+    desiredSize: 1,
+  };
+}
+
+/**
+ * Creates a mock ReadableStreamDefaultReader that can be fed data.
+ */
+function createMockReader() {
+  const readQueue: Array<{ value: Uint8Array; done: boolean }> = [];
+  let waitingResolve: ((result: { value: Uint8Array | undefined; done: boolean }) => void) | null = null;
+
+  const reader = {
+    read: vi.fn(() => {
+      if (readQueue.length > 0) {
+        return Promise.resolve(readQueue.shift()!);
+      }
+      return new Promise<{ value: Uint8Array | undefined; done: boolean }>((resolve) => {
+        waitingResolve = resolve;
+      });
+    }),
+    cancel: vi.fn().mockResolvedValue(undefined),
+    releaseLock: vi.fn(),
+    closed: new Promise<undefined>(() => {}),
+    // Test helper to push data into the read stream.
+    // Appends \n to match the server's newline-delimited framing.
+    pushData(data: string) {
+      const encoded = new TextEncoder().encode(data + '\n');
+      const result = { value: encoded, done: false };
+      if (waitingResolve) {
+        const resolve = waitingResolve;
+        waitingResolve = null;
+        resolve(result);
+      } else {
+        readQueue.push(result);
+      }
+    },
+    // Test helper to push raw bytes with no added framing (binary frames,
+    // partial deliveries).
+    pushBytes(bytes: Uint8Array) {
+      const result = { value: bytes, done: false };
+      if (waitingResolve) {
+        const resolve = waitingResolve;
+        waitingResolve = null;
+        resolve(result);
+      } else {
+        readQueue.push(result);
+      }
+    },
+    // Test helper to signal stream end
+    pushDone() {
+      const result = { value: undefined as Uint8Array | undefined, done: true };
+      if (waitingResolve) {
+        const resolve = waitingResolve;
+        waitingResolve = null;
+        resolve(result);
+      } else {
+        readQueue.push({ value: new Uint8Array(0), done: true });
+      }
+    },
+  };
+
+  return reader;
+}
+
+/**
+ * Helper to create a fresh mock WebTransport instance with the given writer and reader.
+ */
+function createMockTransportInstance(
+  mockReader: ReturnType<typeof createMockReader>,
+  mockWriter: ReturnType<typeof createMockWriter>,
+) {
+  return {
+    ready: Promise.resolve(),
+    closed: new Promise(() => {}), // Never resolves by default
+    close: vi.fn(),
+    createBidirectionalStream: vi.fn().mockResolvedValue({
+      readable: { getReader: () => mockReader },
+      writable: { getWriter: () => mockWriter },
+    }),
+    datagrams: {
+      readable: {} as ReadableStream,
+      writable: {} as WritableStream,
+    },
+    incomingBidirectionalStreams: {} as ReadableStream,
+  };
+}
+
+describe('WebTransportTransport', () => {
+  let transport: WebTransportTransport;
+  let mockHandlers: SubscriptionHandlers;
+  let mockWriter: ReturnType<typeof createMockWriter>;
+  let mockReader: ReturnType<typeof createMockReader>;
+  let mockTransportInstance: any;
+
+  beforeEach(() => {
+    mockHandlers = {
+      open: vi.fn(),
+      message: vi.fn(),
+      close: vi.fn(),
+      error: vi.fn(),
+      reconnect: vi.fn(),
+      reopen: vi.fn(),
+      failureToReconnect: vi.fn(),
+      clientTimeout: vi.fn(),
+    };
+
+    mockWriter = createMockWriter();
+    mockReader = createMockReader();
+
+    mockTransportInstance = createMockTransportInstance(mockReader, mockWriter);
+
+    (globalThis as any).WebTransport = vi.fn(function() { return mockTransportInstance; });
+
+    const request: AtmosphereRequest = {
+      url: 'https://localhost:8080/chat',
+      transport: 'webtransport',
+    };
+
+    transport = new WebTransportTransport(request, mockHandlers);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+    delete (globalThis as any).WebTransport;
+  });
+
+  describe('name', () => {
+    it('should return "webtransport"', () => {
+      expect(transport.name).toBe('webtransport');
+    });
+  });
+
+  describe('connect()', () => {
+    it('should create WebTransport with correct HTTPS URL', async () => {
+      await transport.connect();
+
+      expect((globalThis as any).WebTransport).toHaveBeenCalledWith(
+        expect.stringContaining('https://localhost:8080/chat'),
+        expect.any(Object),
+      );
+    });
+
+    it('should call open handler on successful connection', async () => {
+      await transport.connect();
+
+      expect(mockHandlers.open).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 200,
+          transport: 'webtransport',
+          state: 'open',
+        }),
+      );
+    });
+
+    it('should transition state to connected', async () => {
+      await transport.connect();
+      expect(transport.state).toBe('connected');
+    });
+
+    it('should reject when transport closes before ready', async () => {
+      mockTransportInstance.ready = new Promise(() => {}); // Never resolves
+      mockTransportInstance.closed = Promise.resolve({ closeCode: 0, reason: 'Failed' });
+
+      await expect(transport.connect()).rejects.toThrow(
+        'WebTransport connection closed before ready',
+      );
+      expect(mockHandlers.error).toHaveBeenCalled();
+    });
+
+    it('should create a bidirectional stream', async () => {
+      await transport.connect();
+      expect(mockTransportInstance.createBidirectionalStream).toHaveBeenCalled();
+    });
+
+    it('should reject connect when WebTransport constructor throws', async () => {
+      const constructorError = new Error('Invalid URL');
+      (globalThis as any).WebTransport = vi.fn(function() {
+        throw constructorError;
+      });
+
+      const request: AtmosphereRequest = {
+        url: 'https://localhost:8080/chat',
+        transport: 'webtransport',
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      await expect(transport.connect()).rejects.toThrow('Invalid URL');
+      expect(mockHandlers.error).toHaveBeenCalled();
+    });
+
+    it('should handle connect timeout via connectWithTimeout', async () => {
+      // Make ready never resolve so the connect hangs
+      mockTransportInstance.ready = new Promise(() => {});
+      mockTransportInstance.closed = new Promise(() => {});
+
+      const request: AtmosphereRequest = {
+        url: 'https://localhost:8080/chat',
+        transport: 'webtransport',
+        connectTimeout: 50,
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      await expect(transport.connectWithTimeout()).rejects.toThrow(
+        'Connect timeout after 50ms',
+      );
+    });
+
+    it('should set state to connecting during connect', async () => {
+      // Pause ready so we can inspect state mid-connect
+      let resolveReady!: () => void;
+      mockTransportInstance.ready = new Promise<void>((r) => {
+        resolveReady = r;
+      });
+
+      const connectPromise = transport.connect();
+
+      // State should be connecting while awaiting ready
+      expect(transport.state).toBe('connecting');
+
+      resolveReady();
+      await connectPromise;
+
+      expect(transport.state).toBe('connected');
+    });
+
+    it('should build URL with atmosphere protocol params when enableProtocol is true', async () => {
+      const request: AtmosphereRequest = {
+        url: 'https://example.com/chat',
+        transport: 'webtransport',
+        enableProtocol: true,
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      await transport.connect();
+
+      const calledUrl = (globalThis as any).WebTransport.mock.calls[0][0];
+      expect(calledUrl).toContain('X-atmo-protocol=true');
+      expect(calledUrl).toContain('X-Atmosphere-Transport=webtransport');
+      expect(calledUrl).toContain('X-Atmosphere-tracking-id=');
+      expect(calledUrl).toContain('X-Atmosphere-Framework=');
+    });
+  });
+
+  describe('send()', () => {
+    it('should write encoded string through stream writer', async () => {
+      await transport.connect();
+
+      transport.send('Hello World');
+
+      expect(mockWriter.write).toHaveBeenCalledWith(
+        new TextEncoder().encode('Hello World\n'),
+      );
+    });
+
+    // Regression (registre#15): an unframed ArrayBuffer landed in the
+    // server's newline-splitting UTF-8 text path and was silently
+    // corrupted. Binary sends carry the 0x00-marker length-prefixed frame.
+    it('should frame ArrayBuffer sends with the binary marker and length', async () => {
+      await transport.connect();
+
+      const payload = new Uint8Array([0x01, 0x0a, 0xff, 0x02]); // \n + non-UTF8
+      transport.send(payload.buffer as ArrayBuffer);
+
+      const written = mockWriter.write.mock.calls.at(-1)![0] as Uint8Array;
+      expect(written[0]).toBe(0x00);
+      expect(new DataView(written.buffer, written.byteOffset).getUint32(1)).toBe(4);
+      expect(Array.from(written.slice(5))).toEqual([0x01, 0x0a, 0xff, 0x02]);
+    });
+
+    it('should throw error if not connected', () => {
+      expect(() => transport.send('test')).toThrow('WebTransport is not connected');
+    });
+
+    // Regression (registre#15): inbound binary used to be UTF-8 decoded and
+    // newline-split. A framed binary message — even split across reads,
+    // with 0x0A and non-UTF-8 bytes inside — must reach the message
+    // handler as an untouched ArrayBuffer.
+    it('should deliver inbound binary frames byte-for-byte as ArrayBuffer', async () => {
+      await transport.connect();
+
+      const payload = new Uint8Array([0x0a, 0xff, 0x80, 0x00, 0x42]);
+      const framed = new Uint8Array(5 + payload.length);
+      framed[0] = 0x00;
+      new DataView(framed.buffer).setUint32(1, payload.length);
+      framed.set(payload, 5);
+      // Worst case: split mid-header and mid-payload.
+      mockReader.pushBytes(framed.slice(0, 3));
+      mockReader.pushBytes(framed.slice(3, 7));
+      mockReader.pushBytes(framed.slice(7));
+      await vi.waitFor(() => {
+        expect(mockHandlers.message).toHaveBeenCalled();
+      });
+
+      const response = (mockHandlers.message as any).mock.calls.at(-1)![0];
+      expect(response.responseBody).toBeInstanceOf(ArrayBuffer);
+      expect(Array.from(new Uint8Array(response.responseBody))).toEqual(
+        [0x0a, 0xff, 0x80, 0x00, 0x42],
+      );
+    });
+
+    it('should apply outgoing interceptors to sent messages', async () => {
+      const interceptor: AtmosphereInterceptor = {
+        name: 'test-outgoing',
+        onOutgoing: (data) => {
+          if (typeof data === 'string') {
+            return `[prefix]${data}`;
+          }
+          return data;
+        },
+      };
+
+      const request: AtmosphereRequest = {
+        url: 'https://localhost:8080/chat',
+        transport: 'webtransport',
+      };
+      transport = new WebTransportTransport(request, mockHandlers, [interceptor]);
+
+      await transport.connect();
+      transport.send('hello');
+
+      expect(mockWriter.write).toHaveBeenCalledWith(
+        new TextEncoder().encode('[prefix]hello\n'),
+      );
+    });
+
+    it('should handle empty string send', async () => {
+      await transport.connect();
+
+      transport.send('');
+
+      expect(mockWriter.write).toHaveBeenCalledWith(
+        new TextEncoder().encode('\n'),
+      );
+    });
+  });
+
+  describe('disconnect()', () => {
+    it('should close transport', async () => {
+      await transport.connect();
+      await transport.disconnect();
+
+      expect(mockTransportInstance.close).toHaveBeenCalledWith({
+        closeCode: 0,
+        reason: 'Client disconnect',
+      });
+    });
+
+    it('should close writer and cancel reader', async () => {
+      await transport.connect();
+      await transport.disconnect();
+
+      expect(mockWriter.close).toHaveBeenCalled();
+      expect(mockReader.cancel).toHaveBeenCalled();
+    });
+
+    it('should transition to disconnected state', async () => {
+      await transport.connect();
+      await transport.disconnect();
+
+      expect(transport.state).toBe('disconnected');
+    });
+
+    it('should handle disconnect when writer is already null', async () => {
+      await transport.connect();
+      await transport.disconnect();
+
+      // Second disconnect should not throw
+      await expect(transport.disconnect()).resolves.toBeUndefined();
+      expect(transport.state).toBe('disconnected');
+    });
+
+    it('should clear reconnect timer on disconnect', async () => {
+      const request: AtmosphereRequest = {
+        url: 'https://localhost:8080/chat',
+        transport: 'webtransport',
+        reconnect: true,
+        maxReconnectOnClose: 5,
+        reconnectInterval: 5000,
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      await transport.connect();
+      await new Promise((r) => setTimeout(r, 0));
+
+      // Trigger a close to schedule a reconnect
+      mockReader.pushDone();
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Reconnect should be scheduled
+      expect(mockHandlers.reconnect).toHaveBeenCalled();
+
+      // Disconnect should cancel the pending reconnect timer
+      await transport.disconnect();
+      expect(transport.state).toBe('disconnected');
+
+      // Wait long enough that a reconnect would have fired if not cancelled
+      await new Promise((r) => setTimeout(r, 100));
+
+      // WebTransport constructor should only have been called once (initial connect)
+      expect((globalThis as any).WebTransport).toHaveBeenCalledTimes(1);
+    });
+
+    it('should stop heartbeat on disconnect', async () => {
+      const request: AtmosphereRequest = {
+        url: 'https://localhost:8080/chat',
+        transport: 'webtransport',
+        enableProtocol: true,
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      await transport.connect();
+
+      // After disconnect, heartbeat should not fire
+      await transport.disconnect();
+
+      // If heartbeat were still running, it would try to send via a closed writer
+      // The fact that disconnect completes cleanly verifies heartbeat is stopped
+      expect(transport.state).toBe('disconnected');
+    });
+  });
+
+  describe('message handling', () => {
+    it('should notify message handler with received data', async () => {
+      await transport.connect();
+
+      // Allow the read loop to start
+      await new Promise((r) => setTimeout(r, 0));
+
+      mockReader.pushData('test message');
+
+      // Allow the read loop to process
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(mockHandlers.message).toHaveBeenCalledWith(
+        expect.objectContaining({
+          responseBody: 'test message',
+          transport: 'webtransport',
+          state: 'messageReceived',
+        }),
+      );
+    });
+
+    it('should process atmosphere protocol handshake on first message', async () => {
+      const request: AtmosphereRequest = {
+        url: 'https://localhost:8080/chat',
+        transport: 'webtransport',
+        enableProtocol: true,
+        messageDelimiter: '|',
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      await transport.connect();
+      await new Promise((r) => setTimeout(r, 0));
+
+      // Send handshake message: UUID|heartbeatInterval|heartbeatPadding|
+      mockReader.pushData('server-uuid-123|60000|X|');
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Handshake messages should not be delivered to the message handler
+      expect(mockHandlers.message).not.toHaveBeenCalled();
+
+      // But open should have been called (protocol handshake triggers open)
+      expect(mockHandlers.open).toHaveBeenCalled();
+    });
+
+    it('should filter heartbeat padding from messages', async () => {
+      await transport.connect();
+      await new Promise((r) => setTimeout(r, 0));
+
+      // Send the default heartbeat padding character 'X'
+      mockReader.pushData('X');
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Heartbeat padding should be filtered — no message delivered
+      expect(mockHandlers.message).not.toHaveBeenCalled();
+    });
+
+    it('should notify open after protocol handshake completes', async () => {
+      const request: AtmosphereRequest = {
+        url: 'https://localhost:8080/chat',
+        transport: 'webtransport',
+        enableProtocol: true,
+        messageDelimiter: '|',
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      // With enableProtocol, open should NOT be called during connect() itself
+      await transport.connect();
+
+      // With enableProtocol=true, handleOpen does not call notifyOpen.
+      // It waits for the protocol handshake message.
+      // Reset mock to verify the handshake triggers the open.
+      mockHandlers.open = vi.fn();
+
+      await new Promise((r) => setTimeout(r, 0));
+
+      // Send handshake
+      mockReader.pushData('uuid-456|30000|Y|');
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(mockHandlers.open).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 200,
+          transport: 'webtransport',
+          state: 'open',
+        }),
+      );
+    });
+
+    it('should apply incoming interceptors to received messages', async () => {
+      const interceptor: AtmosphereInterceptor = {
+        name: 'test-incoming',
+        onIncoming: (body) => `[received]${body}`,
+      };
+
+      const request: AtmosphereRequest = {
+        url: 'https://localhost:8080/chat',
+        transport: 'webtransport',
+      };
+      transport = new WebTransportTransport(request, mockHandlers, [interceptor]);
+
+      await transport.connect();
+      await new Promise((r) => setTimeout(r, 0));
+
+      mockReader.pushData('hello');
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(mockHandlers.message).toHaveBeenCalledWith(
+        expect.objectContaining({
+          responseBody: '[received]hello',
+        }),
+      );
+    });
+
+    it('should handle multiple messages delivered in sequence', async () => {
+      await transport.connect();
+      await new Promise((r) => setTimeout(r, 0));
+
+      mockReader.pushData('first');
+      await new Promise((r) => setTimeout(r, 10));
+
+      mockReader.pushData('second');
+      await new Promise((r) => setTimeout(r, 10));
+
+      mockReader.pushData('third');
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(mockHandlers.message).toHaveBeenCalledTimes(3);
+      expect(mockHandlers.message).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ responseBody: 'first' }),
+      );
+      expect(mockHandlers.message).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ responseBody: 'second' }),
+      );
+      expect(mockHandlers.message).toHaveBeenNthCalledWith(
+        3,
+        expect.objectContaining({ responseBody: 'third' }),
+      );
+    });
+  });
+
+  describe('reconnect on close', () => {
+    it('should schedule reconnect when stream ends', async () => {
+      const request: AtmosphereRequest = {
+        url: 'https://localhost:8080/chat',
+        transport: 'webtransport',
+        reconnect: true,
+        maxReconnectOnClose: 3,
+        reconnectInterval: 100,
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      await transport.connect();
+
+      // Allow the read loop to start
+      await new Promise((r) => setTimeout(r, 0));
+
+      // Signal stream end
+      mockReader.pushDone();
+
+      // Allow the read loop to process and schedule reconnect
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(mockHandlers.reconnect).toHaveBeenCalledWith(
+        request,
+        expect.objectContaining({
+          state: 'reconnecting',
+          transport: 'webtransport',
+        }),
+      );
+    });
+
+    it('should increment reconnectAttempts on each reconnect', async () => {
+      const request: AtmosphereRequest = {
+        url: 'https://localhost:8080/chat',
+        transport: 'webtransport',
+        reconnect: true,
+        maxReconnectOnClose: 5,
+        reconnectInterval: 10,
+      };
+
+      // Track how many times WebTransport is constructed
+      let constructCount = 0;
+      (globalThis as any).WebTransport = vi.fn(function() {
+        constructCount++;
+        const w = createMockWriter();
+        const r = createMockReader();
+        const inst = createMockTransportInstance(r, w);
+
+        // After ready, immediately signal stream end to trigger reconnect cascade
+        setTimeout(() => {
+          r.pushDone();
+        }, 5);
+
+        return inst;
+      });
+
+      transport = new WebTransportTransport(request, mockHandlers);
+      await transport.connect();
+
+      // Wait for multiple reconnect attempts
+      await new Promise((r) => setTimeout(r, 300));
+
+      // Should have attempted more than one connection
+      expect(constructCount).toBeGreaterThan(1);
+
+      // Each reconnect fires the reconnect handler
+      expect(mockHandlers.reconnect).toHaveBeenCalled();
+
+      // Clean up
+      await transport.disconnect();
+    });
+
+    it('should not reconnect after maxReconnectOnClose is zero', async () => {
+      const request: AtmosphereRequest = {
+        url: 'https://localhost:8080/chat',
+        transport: 'webtransport',
+        reconnect: true,
+        maxReconnectOnClose: 0,
+        reconnectInterval: 10,
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      await transport.connect();
+
+      // Wait deterministically for the readLoop to be parked at its first
+      // `await reader.read()` before pushing done. `setTimeout(0)` is not
+      // reliable on Node 22 CI runners — the readLoop microtask may not have
+      // reached its await point, so pushDone() enqueues rather than resolves and
+      // the loop never observes done in time (the timeout that failed the JS
+      // build of the 4.0.51 release). Same deterministic fix as the test below.
+      await vi.waitFor(() => {
+        expect(mockReader.read).toHaveBeenCalled();
+      }, { timeout: 5000 });
+
+      mockReader.pushDone();
+
+      // Wait for the async read loop to process done and call handleClose.
+      await vi.waitFor(() => {
+        expect(mockHandlers.failureToReconnect).toHaveBeenCalledWith(
+          request,
+          expect.objectContaining({
+            state: 'closed',
+            transport: 'webtransport',
+          }),
+        );
+      }, { timeout: 5000 });
+
+      // With maxReconnectOnClose=0, reconnectAttempts (0) < 0 is false,
+      // so reconnect should NOT be scheduled.
+      expect(mockHandlers.reconnect).not.toHaveBeenCalled();
+    });
+
+    it('keeps retrying failed reconnects until the quota, then signals failureToReconnect', async () => {
+      // Regression: a rejected reconnect connect() used to be swallowed —
+      // the chain died silently after one failed attempt, with no further
+      // retries and no failureToReconnect (a server restart regenerating the
+      // self-signed cert makes every WT handshake fail exactly this way).
+      const request: AtmosphereRequest = {
+        url: 'https://localhost:8080/chat',
+        transport: 'webtransport',
+        reconnect: true,
+        maxReconnectOnClose: 2,
+        reconnectInterval: 5,
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+      await transport.connect();
+
+      await vi.waitFor(() => {
+        expect(mockReader.read).toHaveBeenCalled();
+      }, { timeout: 5000 });
+
+      // Every later connection attempt fails its handshake: ready rejects
+      // and no close event ever fires.
+      (globalThis as any).WebTransport = vi.fn(function() {
+        const inst = createMockTransportInstance(createMockReader(), createMockWriter());
+        inst.ready = Promise.reject(new Error('Opening handshake failed'));
+        return inst;
+      });
+
+      mockReader.pushDone(); // stream end → close → reconnect chain
+
+      await vi.waitFor(() => {
+        expect(mockHandlers.failureToReconnect).toHaveBeenCalled();
+      }, { timeout: 5000 });
+
+      // The quota was consumed by real retries, not one silent death.
+      expect(mockHandlers.reconnect).toHaveBeenCalledTimes(2);
+    });
+
+    it('should not reconnect when reconnect is false', async () => {
+      const request: AtmosphereRequest = {
+        url: 'https://localhost:8080/chat',
+        transport: 'webtransport',
+        reconnect: false,
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      await transport.connect();
+
+      // Wait deterministically for the readLoop to be parked at its first
+      // `await reader.read()` before pushing done. `setTimeout(0)` is not
+      // reliable on Node 22 CI runners — the readLoop microtask may not
+      // have reached its await point, leaving pushDone to enqueue rather
+      // than resolve, and the loop never observes the done signal in time
+      // for vi.waitFor's window. (Flake: run 25744894544 on commit
+      // 8af88cb3e1 timed out at exactly 5003ms.)
+      await vi.waitFor(() => {
+        expect(mockReader.read).toHaveBeenCalled();
+      }, { timeout: 5000 });
+
+      mockReader.pushDone();
+
+      await vi.waitFor(() => {
+        expect(mockHandlers.close).toHaveBeenCalled();
+      }, { timeout: 5000 });
+
+      expect(mockHandlers.reconnect).not.toHaveBeenCalled();
+    });
+
+    it('should reset protocol on reconnect', async () => {
+      const request: AtmosphereRequest = {
+        url: 'https://localhost:8080/chat',
+        transport: 'webtransport',
+        reconnect: true,
+        maxReconnectOnClose: 3,
+        reconnectInterval: 10,
+        enableProtocol: true,
+        messageDelimiter: '|',
+      };
+
+      let connectCount = 0;
+      const capturedUrls: string[] = [];
+      (globalThis as any).WebTransport = vi.fn(function(url: string) {
+        capturedUrls.push(url);
+        connectCount++;
+        const w = createMockWriter();
+        const r = createMockReader();
+        const inst = createMockTransportInstance(r, w);
+
+        if (connectCount === 1) {
+          // First connect: send handshake then end stream
+          setTimeout(() => {
+            r.pushData('my-uuid|5000|X|');
+            setTimeout(() => r.pushDone(), 5);
+          }, 5);
+        } else {
+          // Second connect: just end stream — the URL should show protocol was reset
+          // because buildUrl uses uuid which gets reset if protocol resets
+          setTimeout(() => r.pushDone(), 5);
+        }
+
+        return inst;
+      });
+
+      transport = new WebTransportTransport(request, mockHandlers);
+      await transport.connect();
+
+      // Wait for reconnect to fire — 5s buffer for CI scheduling jitter.
+      await vi.waitFor(() => {
+        expect(connectCount).toBeGreaterThanOrEqual(2);
+      }, { timeout: 5000 });
+
+      await transport.disconnect();
+    });
+
+    it('should call reopen handler on reconnect success', async () => {
+      const request: AtmosphereRequest = {
+        url: 'https://localhost:8080/chat',
+        transport: 'webtransport',
+        reconnect: true,
+        maxReconnectOnClose: 3,
+        reconnectInterval: 10,
+      };
+
+      let connectCount = 0;
+      (globalThis as any).WebTransport = vi.fn(function() {
+        connectCount++;
+        const w = createMockWriter();
+        const r = createMockReader();
+        const inst = createMockTransportInstance(r, w);
+
+        if (connectCount === 1) {
+          // First connect succeeds then stream ends to trigger reconnect
+          setTimeout(() => r.pushDone(), 5);
+        }
+        // Second connect succeeds and stays open (reader blocks)
+
+        return inst;
+      });
+
+      transport = new WebTransportTransport(request, mockHandlers);
+      await transport.connect();
+
+      // First open should call open handler
+      expect(mockHandlers.open).toHaveBeenCalledTimes(1);
+
+      // Wait for reconnect to succeed — 5s buffer for CI scheduling jitter.
+      await vi.waitFor(() => {
+        expect(mockHandlers.reopen).toHaveBeenCalled();
+      }, { timeout: 5000 });
+
+      expect(mockHandlers.reopen).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 200,
+          transport: 'webtransport',
+          state: 'open',
+        }),
+      );
+
+      await transport.disconnect();
+    });
+  });
+
+  describe('state transitions', () => {
+    it('should start with disconnected state', () => {
+      expect(transport.state).toBe('disconnected');
+    });
+
+    it('should transition to connected after open', async () => {
+      await transport.connect();
+      expect(transport.state).toBe('connected');
+    });
+
+    it('should transition to disconnected after disconnect', async () => {
+      await transport.connect();
+      await transport.disconnect();
+      expect(transport.state).toBe('disconnected');
+    });
+
+    it('should be in disconnected state initially', () => {
+      const request: AtmosphereRequest = {
+        url: 'https://localhost:8080/chat',
+        transport: 'webtransport',
+      };
+      const fresh = new WebTransportTransport(request, mockHandlers);
+      expect(fresh.state).toBe('disconnected');
+    });
+
+    it('should transition through connecting -> connected -> closed', async () => {
+      // Capture states during lifecycle
+      const states: string[] = [];
+
+      let resolveReady!: () => void;
+      mockTransportInstance.ready = new Promise<void>((r) => {
+        resolveReady = r;
+      });
+
+      const connectPromise = transport.connect();
+      states.push(transport.state); // connecting
+
+      resolveReady();
+      await connectPromise;
+      states.push(transport.state); // connected
+
+      await transport.disconnect();
+      states.push(transport.state); // disconnected
+
+      expect(states).toEqual(['connecting', 'connected', 'disconnected']);
+    });
+
+    it('should suspend and resume', async () => {
+      await transport.connect();
+      expect(transport.state).toBe('connected');
+
+      transport.suspend();
+      expect(transport.state).toBe('suspended');
+
+      await transport.resume();
+      expect(transport.state).toBe('connected');
+    });
+
+    it('should not deliver messages while suspended', async () => {
+      await transport.connect();
+      await new Promise((r) => setTimeout(r, 0));
+
+      transport.suspend();
+
+      mockReader.pushData('should-be-ignored');
+      await new Promise((r) => setTimeout(r, 10));
+
+      // notifyMessage checks state === suspended and returns early
+      expect(mockHandlers.message).not.toHaveBeenCalled();
+
+      await transport.resume();
+    });
+  });
+
+  describe('URL building', () => {
+    it('should convert http to https', async () => {
+      const request: AtmosphereRequest = {
+        url: 'http://example.com/chat',
+        transport: 'webtransport',
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      await transport.connect();
+
+      expect((globalThis as any).WebTransport).toHaveBeenCalledWith(
+        expect.stringContaining('https://example.com/chat'),
+        expect.any(Object),
+      );
+    });
+
+    it('should keep https as https', async () => {
+      const request: AtmosphereRequest = {
+        url: 'https://example.com/chat',
+        transport: 'webtransport',
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      await transport.connect();
+
+      expect((globalThis as any).WebTransport).toHaveBeenCalledWith(
+        expect.stringContaining('https://example.com/chat'),
+        expect.any(Object),
+      );
+    });
+
+    it('should use https protocol for WebTransport URLs', async () => {
+      const request: AtmosphereRequest = {
+        url: 'http://example.com/chat',
+        transport: 'webtransport',
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      await transport.connect();
+
+      const calledUrl: string = (globalThis as any).WebTransport.mock.calls[0][0];
+      expect(calledUrl.startsWith('https://')).toBe(true);
+      expect(calledUrl).not.toContain('wss://');
+      expect(calledUrl).not.toContain('ws://');
+    });
+
+    it('should throw on relative URL in non-browser environment', () => {
+      // Ensure no window.location
+      const origWindow = globalThis.window;
+      // @ts-expect-error - removing window for test
+      delete globalThis.window;
+
+      const request: AtmosphereRequest = {
+        url: '/relative/chat',
+        transport: 'webtransport',
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      const connectPromise = transport.connect();
+
+      // Restore window before awaiting so afterEach cleanup works
+      globalThis.window = origWindow;
+
+      return expect(connectPromise).rejects.toThrow(
+        'In React Native or non-browser environments, request.url must be an absolute URL',
+      );
+    });
+
+    it('should handle absolute URLs in non-browser environment', async () => {
+      const origWindow = globalThis.window;
+      // @ts-expect-error - removing window for test
+      delete globalThis.window;
+
+      const request: AtmosphereRequest = {
+        url: 'https://example.com/chat',
+        transport: 'webtransport',
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      await transport.connect();
+
+      globalThis.window = origWindow;
+
+      expect((globalThis as any).WebTransport).toHaveBeenCalledWith(
+        expect.stringContaining('https://example.com/chat'),
+        expect.any(Object),
+      );
+    });
+
+    it('should preserve query parameters from original URL', async () => {
+      const request: AtmosphereRequest = {
+        url: 'https://example.com/chat?room=lobby&user=test',
+        transport: 'webtransport',
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      await transport.connect();
+
+      const calledUrl: string = (globalThis as any).WebTransport.mock.calls[0][0];
+      expect(calledUrl).toContain('room=lobby');
+      expect(calledUrl).toContain('user=test');
+    });
+
+    it('should include trackMessageLength param when enabled', async () => {
+      const request: AtmosphereRequest = {
+        url: 'https://example.com/chat',
+        transport: 'webtransport',
+        trackMessageLength: true,
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      await transport.connect();
+
+      const calledUrl: string = (globalThis as any).WebTransport.mock.calls[0][0];
+      expect(calledUrl).toContain('X-Atmosphere-TrackMessageSize=true');
+    });
+
+    it('should include auth token in URL when provided', async () => {
+      const request: AtmosphereRequest = {
+        url: 'https://example.com/chat',
+        transport: 'webtransport',
+        authToken: 'my-secret-token',
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      await transport.connect();
+
+      const calledUrl: string = (globalThis as any).WebTransport.mock.calls[0][0];
+      expect(calledUrl).toContain('X-Atmosphere-Auth=my-secret-token');
+    });
+
+    it('should include custom headers as query params', async () => {
+      const request: AtmosphereRequest = {
+        url: 'https://example.com/chat',
+        transport: 'webtransport',
+        headers: { 'X-Custom': 'value1', 'X-Other': 'value2' },
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      await transport.connect();
+
+      const calledUrl: string = (globalThis as any).WebTransport.mock.calls[0][0];
+      expect(calledUrl).toContain('X-Custom=value1');
+      expect(calledUrl).toContain('X-Other=value2');
+    });
+  });
+
+  describe('integration with BaseTransport', () => {
+    it('should report correct name', () => {
+      expect(transport.name).toBe('webtransport');
+    });
+
+    it('should drain offline queue on reconnect', async () => {
+      const request: AtmosphereRequest = {
+        url: 'https://localhost:8080/chat',
+        transport: 'webtransport',
+        reconnect: true,
+        maxReconnectOnClose: 3,
+        reconnectInterval: 10,
+      };
+
+      const queue = new OfflineQueue({ maxSize: 10, drainOnReconnect: true });
+
+      // Every connection's writer, in connect order. The first connection ends
+      // after 5ms to force a reconnect; later ones stay open. The assertion
+      // looks at every reconnected writer, so an extra reconnect on a slow
+      // runner cannot hide where the drained messages went.
+      const writers: ReturnType<typeof createMockWriter>[] = [];
+      (globalThis as any).WebTransport = vi.fn(function() {
+        const w = createMockWriter();
+        const r = createMockReader();
+        const inst = createMockTransportInstance(r, w);
+        writers.push(w);
+        if (writers.length === 1) {
+          setTimeout(() => r.pushDone(), 5);
+        }
+        return inst;
+      });
+
+      transport = new WebTransportTransport(request, mockHandlers);
+      transport.setOfflineQueue(queue);
+
+      await transport.connect();
+
+      // Enqueue after the first open — a queue pre-populated before connect
+      // now drains on first open instead (see base-transport.test.ts).
+      queue.enqueue('queued-msg-1');
+      queue.enqueue('queued-msg-2');
+
+      // Poll instead of a fixed sleep: the reconnect timing depends on the runner.
+      await vi.waitFor(() => {
+        expect(writers.length).toBeGreaterThan(1);
+        expect(queue.size).toBe(0);
+        const reconnectedWrites = writers.slice(1).reduce((n, w) => n + w.write.mock.calls.length, 0);
+        expect(reconnectedWrites).toBeGreaterThanOrEqual(2);
+      }, { timeout: 5000, interval: 20 });
+
+      // Nothing queued may have gone to the connection that was already closing.
+      expect(writers[0].write).not.toHaveBeenCalled();
+
+      await transport.disconnect();
+    });
+
+    it('should have hasOpened=false before first connect', () => {
+      expect(transport.hasOpened).toBe(false);
+    });
+
+    it('should have hasOpened=true after connect', async () => {
+      await transport.connect();
+      expect(transport.hasOpened).toBe(true);
+    });
+
+    it('should have uuid=0 before protocol handshake', () => {
+      expect(transport.uuid).toBe('0');
+    });
+  });
+
+  describe('error handling', () => {
+    it('should call error handler when createBidirectionalStream fails', async () => {
+      mockTransportInstance.createBidirectionalStream = vi.fn().mockRejectedValue(
+        new Error('Stream creation failed'),
+      );
+
+      await expect(transport.connect()).rejects.toThrow('Stream creation failed');
+      expect(mockHandlers.error).toHaveBeenCalled();
+    });
+
+    it('should call error handler when read loop throws', async () => {
+      // Create a reader that will throw on the first read
+      const errorReader = {
+        read: vi.fn()
+          .mockRejectedValueOnce(new Error('Read failed')),
+        cancel: vi.fn().mockResolvedValue(undefined),
+        releaseLock: vi.fn(),
+        closed: new Promise<undefined>(() => {}),
+      };
+
+      mockTransportInstance.createBidirectionalStream = vi.fn().mockResolvedValue({
+        readable: { getReader: () => errorReader },
+        writable: { getWriter: () => mockWriter },
+      });
+
+      await transport.connect();
+
+      // Allow the read loop to start and hit the error
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(mockHandlers.error).toHaveBeenCalled();
+    });
+
+    it('should set state to error on transport error', async () => {
+      mockTransportInstance.createBidirectionalStream = vi.fn().mockRejectedValue(
+        new Error('Failed'),
+      );
+
+      await expect(transport.connect()).rejects.toThrow();
+      expect(transport.state).toBe('error');
+    });
+  });
+
+  describe('trackMessageLength', () => {
+    it('should split length-delimited messages', async () => {
+      const request: AtmosphereRequest = {
+        url: 'https://localhost:8080/chat',
+        transport: 'webtransport',
+        trackMessageLength: true,
+        messageDelimiter: '|',
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      await transport.connect();
+      await new Promise((r) => setTimeout(r, 0));
+
+      // Wire format: LENGTH|PAYLOAD (e.g., "5|hello3|bye")
+      mockReader.pushData('5|hello3|bye');
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(mockHandlers.message).toHaveBeenCalledTimes(2);
+      expect(mockHandlers.message).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ responseBody: 'hello' }),
+      );
+      expect(mockHandlers.message).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ responseBody: 'bye' }),
+      );
+    });
+
+    it('should handle partial messages across chunks', async () => {
+      const request: AtmosphereRequest = {
+        url: 'https://localhost:8080/chat',
+        transport: 'webtransport',
+        trackMessageLength: true,
+        messageDelimiter: '|',
+      };
+      transport = new WebTransportTransport(request, mockHandlers);
+
+      await transport.connect();
+      await new Promise((r) => setTimeout(r, 0));
+
+      // First chunk: incomplete message (length says 10 but only 5 chars)
+      mockReader.pushData('10|hello');
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Should not deliver yet — message is incomplete
+      expect(mockHandlers.message).not.toHaveBeenCalled();
+
+      // Second chunk: rest of the message
+      mockReader.pushData('world');
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(mockHandlers.message).toHaveBeenCalledWith(
+        expect.objectContaining({ responseBody: 'helloworld' }),
+      );
+    });
+  });
+});

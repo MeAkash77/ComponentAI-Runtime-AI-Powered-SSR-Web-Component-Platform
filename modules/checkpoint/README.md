@@ -1,0 +1,316 @@
+# Atmosphere Checkpoint
+
+Durable agent execution for Atmosphere — a framework-neutral `CheckpointStore`
+SPI plus an in-memory implementation, with an opt-in decorator that turns
+the coordinator module's `CoordinationJournal` into a persistent execution
+log.
+
+This module exists because only one of Atmosphere's supported runtimes
+(Google ADK) ships native checkpoint/resume. `durable-sessions` covers
+transport-layer session state (rooms, broadcaster subscriptions) — it does
+not persist agent workflow state. This module fills that gap.
+
+## Maven Coordinates
+
+```xml
+<dependency>
+    <groupId>org.atmosphere</groupId>
+    <artifactId>atmosphere-checkpoint</artifactId>
+    <version>${project.version}</version>
+</dependency>
+```
+
+## Core API
+
+| Type | Purpose |
+|------|---------|
+| `CheckpointStore` | SPI: `save`, `load`, `fork`, `list`, `delete`, `deleteCoordination` |
+| `WorkflowSnapshot<S>` | Immutable record of workflow state + parent link + metadata |
+| `CheckpointId` | Opaque typed identifier (UUID-backed by default) |
+| `CheckpointQuery` | Filter for `list()` — by coordinationId, agentName, time range, limit |
+| `CheckpointEvent` | Sealed `Saved`/`Loaded`/`Forked`/`Deleted` lifecycle events |
+| `CheckpointListener` | Callback for lifecycle events |
+| `InMemoryCheckpointStore` | Default in-memory implementation, thread-safe, with eviction |
+| `SqliteCheckpointStore` | Durable single-file SQLite store — survives JVM restart, used by `spring-boot-checkpoint-agent` for the flagship HITL workflow demo |
+| `PostgresCheckpointStore` | JDBC store (ships as `atmosphere-checkpoint-postgres`); targets Postgres, works with any JSR-221 `DataSource`. Operator supplies the driver + pooling. |
+
+Application code owns the workflow state type `S` and its serialization.
+The in-memory store keeps the state as-is; the SQLite store JSON-serializes
+the state through Jackson by default and accepts a caller-supplied
+serializer for non-trivial types. A JDBC/Postgres store ships in-tree as
+`atmosphere-checkpoint-postgres` (`PostgresCheckpointStore`); other backends
+(Redis, …) can be added by implementing the `CheckpointStore` SPI directly.
+
+## Quick Start
+
+```java
+CheckpointStore store = new InMemoryCheckpointStore();
+store.start();
+
+// Save a root snapshot
+var root = WorkflowSnapshot.root("coord-42", myWorkflowState);
+store.save(root);
+
+// Derive a child snapshot on each workflow step
+var next = root.deriveWith(updatedState);
+store.save(next);
+
+// Resume: load the latest snapshot for a coordination
+var latest = store.list(CheckpointQuery.forCoordination("coord-42"))
+        .stream()
+        .reduce((a, b) -> b)        // last one
+        .orElseThrow();
+
+// Fork to explore an alternative branch
+var branch = store.fork(latest.id(), alternativeState);
+```
+
+## Workflow Primitive (durable hibernation)
+
+The `org.atmosphere.checkpoint.workflow` package composes the
+`CheckpointStore` SPI into a multi-step workflow runner with first-class
+hibernation and resume.
+
+| Type | Purpose |
+|------|---------|
+| `Workflow<S>` | Ordered `List<WorkflowStep<S>>` over an application-owned state `S`. `run(initial)` either starts fresh or resumes from the last persisted snapshot for the workflow's `coordinationId` |
+| `WorkflowStep<S>` | Single step: `name()` + `execute(S) → StepOutcome<S>` + `maxRetries()` + `retryDelay()` |
+| `StepOutcome<S>` | Sealed: `Advance(next)` / `Hibernate(saved)` / `Done(final)` / `Fail(reason)` |
+| `WorkflowResult<S>` | Sealed terminal return value: `Completed` / `Hibernated(lastStepName)` / `Failed(lastStepName, reason)` |
+| `DurableExecutionProvider` | Pluggable durability substrate. Every `run()` resolves its backend via `ServiceLoader` — an external engine adapter takes over when registered and available; the in-tree step engine is the always-on fallback. The `atmosphere-checkpoint-temporal` module ships the Temporal adapter; DBOS/Restate adapters implement the same SPI |
+
+Hibernation is a return-not-park primitive: a step returning
+`StepOutcome.hibernate(state)` causes `run()` to persist a snapshot and
+return `WorkflowResult.Hibernated` to the caller. No platform thread is
+held while the workflow is dormant. A later `run()` against the same
+`coordinationId` and `CheckpointStore` resumes at the step *after* the
+last completed one — including across JVM restarts when the store is
+persistent (`SqliteCheckpointStore`, etc.).
+
+Step names are the resume key — they MUST be stable and unique inside
+the workflow. Reordering or renaming steps between runs is an
+incompatible change and will restart from step 0.
+
+Steps MUST be idempotent. Both retries on transient exceptions and
+resumes after restart re-execute the last step.
+
+```java
+var store = new SqliteCheckpointStore(Path.of("./workflow.db"));
+store.start();
+
+var workflow = new Workflow<>(
+        "doc-pipeline", "coord-123",
+        List.of(
+                step("ingest",  s -> StepOutcome.advance(s + ":ingested")),
+                step("review",  s -> StepOutcome.hibernate(s)),    // wait for human
+                step("publish", s -> StepOutcome.done(s + ":published"))),
+        store);
+
+var result = workflow.run("doc-42");
+// → WorkflowResult.Hibernated; no thread held while we wait for a human.
+
+// Later — same JVM or fresh JVM, same store + coordinationId:
+var resumed = workflow.run(null);
+// → WorkflowResult.Completed; only `publish` runs.
+```
+
+Tests pin every claim:
+
+| Test | Proves |
+|------|--------|
+| `WorkflowTest.linearExecutionAdvancesThroughEverySteps` | Advance → Advance → Done runs every step exactly once |
+| `WorkflowTest.hibernateReturnsImmediatelyAndPersistsState` | Hibernate returns control and writes a snapshot |
+| `WorkflowTest.resumeAfterHibernateContinuesAtNextStep` | Resume skips already-completed steps; only un-completed steps execute |
+| `WorkflowTest.retrySucceedsWithinBudget` | Transient exceptions retry up to `maxRetries()` |
+| `WorkflowTest.retryExhaustedReturnsFailed` | Exhausted retries surface as `WorkflowResult.Failed` |
+| `WorkflowTest.explicitFailIsPropagated` | `StepOutcome.fail("reason")` ends with `Failed` carrying the reason verbatim |
+| `WorkflowTest.duplicateStepNamesRejected` | Constructor rejects duplicate step names (the resume key contract) |
+| `WorkflowSqliteResumeTest.workflowResumesAcrossSqliteStoreClose` | Closes the `SqliteCheckpointStore` entirely between runs, opens a fresh store on the same file, and proves only the un-completed step runs — the cold-restart scenario the primitive exists for |
+| `DurableExecutionProviderTest.workflowRunRoutesToARegisteredExternalProvider` | A `ServiceLoader`-registered external provider takes over `run()`; the local step loop does not execute |
+| `DurableExecutionProviderTest.workflowRunFallsBackToTheLocalEngineWhenNoExternalEngine` | With no available external engine, `run()` executes on the in-tree step engine; unavailable providers are never selected |
+
+## CoordinationJournal Bridge (optional)
+
+If the `atmosphere-coordinator` module is on your classpath, wrap its
+journal with `CheckpointingCoordinationJournal` to automatically persist a
+snapshot on every (or selected) coordination event:
+
+```java
+var store = new InMemoryCheckpointStore();
+var journal = new CheckpointingCoordinationJournal<>(
+        new InMemoryCoordinationJournal(),
+        store,
+        CheckpointingCoordinationJournal.onAgentBoundaries(),   // filter
+        CoordinationStateExtractors.event());                   // what to store
+journal.start();
+```
+
+Snapshots form a chain per coordination: the first snapshot is a root, each
+subsequent one references its predecessor. The chain mirrors the event
+ordering in the underlying journal. Supply your own
+`CoordinationStateExtractor<S>` to capture domain state rather than the raw
+event.
+
+## Listeners
+
+```java
+store.addListener(event -> {
+    if (event instanceof CheckpointEvent.Saved saved) {
+        metrics.counter("checkpoints.saved", "coordination", saved.coordinationId()).increment();
+    }
+});
+```
+
+Listeners must be thread-safe. Exceptions thrown from a listener are logged
+and swallowed; they never abort the store operation.
+
+## Design Notes
+
+- **Framework-neutral**: no hard dependency on any LLM runtime. The state
+  type `S` is whatever the application wants to persist.
+- **No direct coordinator dependency in the SPI**: the decorator lives in
+  the `org.atmosphere.checkpoint.coordinator` sub-package, and coordinator
+  is a `<optional>true</optional>` dependency.
+- **Eviction**: the in-memory store evicts oldest snapshots (by
+  `createdAt`) once it exceeds its cap. Default cap is 10 000.
+- **Sealed events**: `CheckpointEvent` is sealed so exhaustive pattern
+  matches are safe.
+
+## Schema Versioning (`SchemaMigrations`)
+
+Every JDBC-backed store in Atmosphere stamps its schema version, so a
+non-additive schema change is detected instead of silently mis-read.
+`org.atmosphere.checkpoint.SchemaMigrations` is the canonical implementation
+of that convention; `atmosphere-checkpoint-postgres` reuses this class, and
+module families that must not depend on `atmosphere-checkpoint`
+(`durable-sessions-sqlite`, `interactions`, `admin`, `ai-audit-postgres`)
+carry a package-local copy with identical semantics.
+
+The version lives in a shared `atmosphere_schema_version (component, version)`
+table, keyed by the store's **anchor table** — a per-component row rather than
+a database-global marker (e.g. SQLite's `PRAGMA user_version`) because several
+stores legitimately share one database and version independently.
+
+On open, `migrate(connection, component, steps)` where `steps.get(n)` moves
+version `n` to `n + 1`:
+
+| On-disk state | Behaviour |
+|---|---|
+| Fresh (no version row, no anchor table) | every step runs, final version stamped |
+| Unstamped but the anchor table exists | adopted as version **1**, later steps run |
+| Stamped == `steps.size()` | no-op — nothing is written |
+| Stamped > `steps.size()` | **refuses to open** with an `IllegalStateException` naming the database, the found version, and the supported version |
+
+Each step commits with its version stamp in one transaction, so a crash
+mid-migration leaves an already-applied prefix the next open resumes from.
+
+### Adding a migration
+
+1. Append one step to the store's list — never edit or reorder an existing
+   step; existing databases have already applied them.
+2. Make it idempotent (`... IF NOT EXISTS`, or probe before `ALTER`): an
+   adopted unstamped database may already carry the change.
+3. Do not commit, roll back, or toggle auto-commit inside a step — the helper
+   owns the transaction.
+4. Add the new expected version to that module's schema-version test.
+
+Current versions: `checkpoints` 2 (step 1→2 adds `state_type`); `durable_timer`,
+`effect_journal`, `run_record`, `tape_run` 1.
+
+## Relationship to `atmosphere-durable-sessions`
+
+Atmosphere has **two** durability primitives; they solve different
+problems and should be understood together.
+
+### Surface comparison
+
+| Axis | `SessionStore` (durable-sessions) | `CheckpointStore` (checkpoint) |
+|------|-----------------------------------|--------------------------------|
+| Layer | Transport / connection | Coordinator / workflow |
+| Unit persisted | `DurableSession` (token, rooms, broadcaster subs, metadata) | `WorkflowSnapshot<S>` (state, parentId, agentName, coordinationId) |
+| Lifecycle | One session per client connection; replaced on reconnect | Many snapshots per coordination; form a parent-chained history |
+| Mutation model | Overwrite-on-update | Append-only + fork |
+| Triggered by | `DurableSessionInterceptor` on connect/disconnect | `CheckpointingCoordinationJournal` on `CoordinationEvent` |
+| Backends | In-memory, SQLite, Redis (already shipped) | In-memory + SQLite (this module); Postgres/JDBC ships as `atmosphere-checkpoint-postgres` (in-tree); Redis pluggable via the `CheckpointStore` SPI |
+| Primary consumer | WebSocket/SSE reconnect handler | Agent fleet / HITL approval flow |
+
+### Why separate modules
+
+- **SRP**: transport state and workflow state have independent lifecycles.
+  A session reconnect does not imply workflow resumption, and a workflow
+  fork does not require any transport-level change.
+- **Different data models**: `DurableSession` is a flat record updated in
+  place; `WorkflowSnapshot` is an immutable node in a parent-chained DAG
+  with fork semantics.
+- **Different consumers**: the session interceptor runs at connect /
+  disconnect boundaries; the checkpoint bridge runs on every recorded
+  coordination event.
+- **Independent evolvability**: persistence backends (SQLite, Redis) can
+  evolve in each module without coupling their schemas.
+
+### The composition point — the moat-aligned synthesis
+
+The two primitives compose at one point: **carry a `CheckpointId` in the
+`DurableSession.metadata` map so that a streaming client reconnecting via
+durable-sessions can rehydrate the coordinator's workflow position from
+the `CheckpointStore` in a single flow.**
+
+Conceptual pseudocode (no bridge class shipped yet — see below):
+
+```java
+// While the workflow runs, the coordinator records the current checkpoint
+// id on the client's durable session:
+session.metadata().put("checkpointId",
+        journal.lastSnapshot(coordinationId).value());
+
+// On reconnect, the session interceptor rehydrates rooms + broadcasters,
+// then hands off to the coordinator to resume from the snapshot:
+DurableSession durable = sessionStore.load(token).orElseThrow();
+var snapId = durable.metadata().get("checkpointId");
+if (snapId != null) {
+    WorkflowSnapshot<?> resumeAt =
+            checkpointStore.load(CheckpointId.of(snapId)).orElseThrow();
+    // Coordinator resumes from resumeAt.state(), optionally forking.
+}
+```
+
+This is the pattern that makes Atmosphere **streaming-native resumable
+workflows** — distinct from what Python agentic frameworks offer, because
+the transport layer and the workflow layer rehydrate together over one
+WebTransport/WebSocket resume.
+
+### Why no bridge class in this module (yet)
+
+No shipped sample demands this pattern today. Per the project's own
+guidance (`CLAUDE.md`: *"Don't create helpers, utilities, or abstractions
+for one-time operations. Don't design for hypothetical future
+requirements"*), the bridge will land when a sample drives its shape. At
+that point it is expected to be a **single optional class** in this
+module (with `atmosphere-durable-sessions` as a `<optional>true</optional>`
+dependency), not a third module — adding a third module would compound
+the SPI surface without benefit.
+
+### When to use which
+
+- **Need**: a WebSocket/SSE client should recover its rooms, broadcaster
+  subscriptions, and message queue across a restart. **Use**
+  `atmosphere-durable-sessions`.
+- **Need**: an agent coordination should survive a pause (human approval,
+  crash, long-running tool call) and be able to branch/resume/replay at
+  tool-boundary granularity. **Use** `atmosphere-checkpoint`.
+- **Need**: a streaming client reconnects mid-workflow and should pick up
+  both its transport state and its workflow position. **Use both**, with
+  the pattern above.
+
+## Planned Follow-ups
+
+- `atmosphere-checkpoint-redis` — first-party clustered store reusing the
+  existing `atmosphere-redis` infrastructure
+- `fleet.resume(CheckpointId)` convenience API on `AgentFleet`
+- Sample extending `spring-boot-multi-agent-startup-team` with
+  long-running HITL pauses
+
+## Requirements
+
+- Java 21+
+- SLF4J 2.x (transitive)

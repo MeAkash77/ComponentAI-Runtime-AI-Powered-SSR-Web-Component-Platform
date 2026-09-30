@@ -1,0 +1,212 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.ai;
+
+import org.junit.jupiter.api.Test;
+
+import java.util.List;
+import java.util.Set;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
+
+public class RoutingAiSupportTest {
+
+    @Test
+    public void testRoutesToSelectedBackend() {
+        var primary = new StubRuntime("primary");
+        var secondary = new StubRuntime("secondary");
+        var router = new DefaultModelRouter(ModelRouter.FallbackStrategy.FAILOVER);
+        var routing = new RoutingAiSupport(router, List.of(primary, secondary));
+
+        var session = mock(StreamingSession.class);
+        routing.execute(new AgentExecutionContext("Hello", "", null, null, null, null, null, java.util.List.of(), null, null, java.util.List.of(), java.util.Map.of(), java.util.List.of(), null, null), session);
+
+        assertTrue(primary.called);
+        assertFalse(secondary.called);
+    }
+
+    @Test
+    public void testFailoverOnPrimaryFailure() {
+        var primary = new StubRuntime("primary");
+        primary.shouldFail = true;
+        var secondary = new StubRuntime("secondary");
+        // maxConsecutiveFailures=1 so the first failure marks primary unhealthy,
+        // and the router picks secondary on the retry route() call
+        var router = new DefaultModelRouter(ModelRouter.FallbackStrategy.FAILOVER, 1,
+                java.time.Duration.ofMinutes(1));
+        var routing = new RoutingAiSupport(router, List.of(primary, secondary));
+
+        var session = mock(StreamingSession.class);
+        routing.execute(new AgentExecutionContext("Hello", "", null, null, null, null, null, java.util.List.of(), null, null, java.util.List.of(), java.util.Map.of(), java.util.List.of(), null, null), session);
+
+        assertTrue(primary.called);
+        assertTrue(secondary.called);
+    }
+
+    @Test
+    public void testErrorWhenNoBackendsAvailable() {
+        var router = new DefaultModelRouter(ModelRouter.FallbackStrategy.FAILOVER);
+        var routing = new RoutingAiSupport(router, List.of());
+
+        var session = mock(StreamingSession.class);
+        routing.execute(new AgentExecutionContext("Hello", "", null, null, null, null, null, java.util.List.of(), null, null, java.util.List.of(), java.util.Map.of(), java.util.List.of(), null, null), session);
+
+        verify(session).error(any(IllegalStateException.class));
+    }
+
+    @Test
+    public void testCapabilitiesAggregated() {
+        var primary = new StubRuntime("primary");
+        primary.caps = Set.of(AiCapability.TEXT_STREAMING);
+        var secondary = new StubRuntime("secondary");
+        secondary.caps = Set.of(AiCapability.TOOL_CALLING);
+        var router = new DefaultModelRouter(ModelRouter.FallbackStrategy.FAILOVER);
+        var routing = new RoutingAiSupport(router, List.of(primary, secondary));
+
+        var caps = routing.capabilities();
+        assertTrue(caps.contains(AiCapability.TEXT_STREAMING));
+        assertTrue(caps.contains(AiCapability.TOOL_CALLING));
+    }
+
+    @Test
+    public void testNameIncludesBackends() {
+        var primary = new StubRuntime("primary");
+        var secondary = new StubRuntime("secondary");
+        var router = new DefaultModelRouter(ModelRouter.FallbackStrategy.FAILOVER);
+        var routing = new RoutingAiSupport(router, List.of(primary, secondary));
+
+        assertTrue(routing.name().contains("primary"));
+        assertTrue(routing.name().contains("secondary"));
+    }
+
+    @Test
+    public void testRequiredCapabilitiesEnforcedAtRuntime() {
+        var textOnly = new StubRuntime("text-only");
+        textOnly.caps = Set.of(AiCapability.TEXT_STREAMING);
+        var toolCapable = new StubRuntime("tool-capable");
+        toolCapable.caps = Set.of(AiCapability.TEXT_STREAMING, AiCapability.TOOL_CALLING);
+
+        var router = new DefaultModelRouter(ModelRouter.FallbackStrategy.FAILOVER);
+        var required = Set.of(AiCapability.TOOL_CALLING);
+        var routing = new RoutingAiSupport(router, List.of(textOnly, toolCapable), required);
+
+        var session = mock(StreamingSession.class);
+        routing.execute(new AgentExecutionContext("Hello", "", null, null, null, null, null,
+                java.util.List.of(), null, null, java.util.List.of(), java.util.Map.of(),
+                java.util.List.of(), null, null), session);
+
+        assertFalse(textOnly.called, "text-only backend should be skipped (missing TOOL_CALLING)");
+        assertTrue(toolCapable.called, "tool-capable backend should be selected");
+    }
+
+    @Test
+    public void testHealthReportedOnCompletionNotDispatch() {
+        var primary = new StubRuntime("primary") {
+            @Override
+            public void execute(AgentExecutionContext context, StreamingSession session) {
+                called = true;
+                // Simulate async: call session.complete() later
+                session.send("token");
+                session.complete();
+            }
+        };
+        var router = new DefaultModelRouter(ModelRouter.FallbackStrategy.FAILOVER);
+        var routing = new RoutingAiSupport(router, List.of(primary));
+
+        var tokens = new java.util.ArrayList<String>();
+        var completed = new boolean[]{false};
+        var session = new StreamingSession() {
+            @Override public String sessionId() { return "test"; }
+            @Override public void send(String text) { tokens.add(text); }
+            @Override public void sendMetadata(String key, Object value) {}
+            @Override public void progress(String message) {}
+            @Override public void complete() { completed[0] = true; }
+            @Override public void complete(String summary) { completed[0] = true; }
+            @Override public void error(Throwable t) {}
+            @Override public boolean isClosed() { return completed[0]; }
+        };
+
+        routing.execute(new AgentExecutionContext("Hello", "", null, null, null, null, null,
+                java.util.List.of(), null, null, java.util.List.of(), java.util.Map.of(),
+                java.util.List.of(), null, null), session);
+
+        assertTrue(completed[0], "Session should be completed");
+        assertFalse(tokens.isEmpty(), "Tokens should have been delivered");
+    }
+
+    @Test
+    public void testHealthReportedOnErrorNotDispatch() {
+        var failing = new StubRuntime("failing") {
+            @Override
+            public void execute(AgentExecutionContext context, StreamingSession session) {
+                called = true;
+                // Async error through session, not throw
+                session.error(new RuntimeException("async failure"));
+            }
+        };
+        var router = new DefaultModelRouter(ModelRouter.FallbackStrategy.FAILOVER);
+        var routing = new RoutingAiSupport(router, List.of(failing));
+
+        var errorCaught = new Throwable[]{null};
+        var session = new StreamingSession() {
+            @Override public String sessionId() { return "test"; }
+            @Override public void send(String text) {}
+            @Override public void sendMetadata(String key, Object value) {}
+            @Override public void progress(String message) {}
+            @Override public void complete() {}
+            @Override public void complete(String summary) {}
+            @Override public void error(Throwable t) { errorCaught[0] = t; }
+            @Override public boolean isClosed() { return errorCaught[0] != null; }
+        };
+
+        routing.execute(new AgentExecutionContext("Hello", "", null, null, null, null, null,
+                java.util.List.of(), null, null, java.util.List.of(), java.util.Map.of(),
+                java.util.List.of(), null, null), session);
+
+        assertNotNull(errorCaught[0], "Error should have been propagated");
+        assertTrue(errorCaught[0].getMessage().contains("async failure"));
+    }
+
+    static class StubRuntime implements AgentRuntime {
+        final String id;
+        boolean called;
+        boolean shouldFail;
+        Set<AiCapability> caps = Set.of(AiCapability.TEXT_STREAMING);
+
+        StubRuntime(String id) {
+            this.id = id;
+        }
+
+        @Override public String name() { return id; }
+        @Override public boolean isAvailable() { return true; }
+        @Override public int priority() { return 0; }
+        @Override public void configure(AiConfig.LlmSettings settings) { }
+
+        @Override
+        public void execute(AgentExecutionContext context, StreamingSession session) {
+            called = true;
+            if (shouldFail) {
+                throw new RuntimeException("Simulated failure");
+            }
+        }
+
+        @Override
+        public Set<AiCapability> capabilities() {
+            return caps;
+        }
+    }
+}

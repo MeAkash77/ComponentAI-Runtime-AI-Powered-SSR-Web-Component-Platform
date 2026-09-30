@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <parent>
+        <groupId>org.atmosphere</groupId>
+        <artifactId>atmosphere-project</artifactId>
+        <version>4.0.72-SNAPSHOT</version>
+    </parent>
+
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>org.atmosphere</groupId>
+    <artifactId>atmosphere-modules</artifactId>
+    <packaging>pom</packaging>
+    <name>atmosphere-modules</name>
+    <description>Atmosphere Framework modules</description>
+    <url>https://github.com/Atmosphere/atmosphere</url>
+
+    <modules>
+        <module>cpr</module>
+        <module>ai</module>
+        <module>ai-test</module>
+        <module>ai-audit-kafka</module>
+        <module>ai-audit-postgres</module>
+        <module>ai-policy-rego</module>
+        <module>ai-policy-cedar</module>
+        <module>protocol-common</module>
+        <module>mcp</module>
+        <module>mcp-client</module>
+        <module>a2a</module>
+        <module>agui</module>
+        <module>kotlin</module>
+        <module>spring-ai</module>
+        <module>spring-ai-alibaba</module>
+        <module>langchain4j</module>
+        <module>anthropic</module>
+        <module>cohere</module>
+        <module>crewai</module>
+        <module>embabel</module>
+        <module>koog</module>
+        <module>agentscope</module>
+        <module>semantic-kernel</module>
+        <module>redis</module>
+        <module>kafka</module>
+        <module>grpc</module>
+        <module>adk</module>
+        <module>durable-sessions</module>
+        <module>durable-sessions-sqlite</module>
+        <module>durable-sessions-redis</module>
+        <module>rag</module>
+        <module>spring-boot-starter</module>
+        <module>spring-boot3-starter</module>
+        <module>agent</module>
+        <module>coordinator</module>
+        <module>spring-boot-ai-starter</module>
+        <module>verifier</module>
+        <module>verifier-smt</module>
+        <module>admin</module>
+        <module>admin-bundle</module>
+        <module>checkpoint</module>
+        <module>checkpoint-postgres</module>
+        <module>checkpoint-temporal</module>
+        <module>interactions</module>
+        <module>interactions-postgres</module>
+        <module>channels</module>
+        <module>sandbox</module>
+        <module>quarkus-extension</module>
+        <module>quarkus-admin-extension</module>
+        <module>quarkus-grpc</module>
+        <module>quarkus-langchain4j</module>
+        <module>wasync</module>
+        <module>skills</module>
+    </modules>
+
+    <profiles>
+        <profile>
+            <id>perf</id>
+            <modules>
+                <module>benchmarks</module>
+            </modules>
+        </profile>
+    </profiles>
+</project>

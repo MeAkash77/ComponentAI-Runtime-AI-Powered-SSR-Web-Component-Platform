@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <parent>
+        <groupId>org.atmosphere</groupId>
+        <artifactId>atmosphere-project</artifactId>
+        <version>4.0.72-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <modelVersion>4.0.0</modelVersion>
+    <artifactId>atmosphere-quarkus-langchain4j-parent</artifactId>
+    <packaging>pom</packaging>
+    <name>atmosphere-quarkus-langchain4j-parent</name>
+    <description>Quarkus extension that bridges Quarkus LangChain4j's CDI-managed ChatModel beans into Atmosphere's LangChain4jAgentRuntime.</description>
+    <url>https://github.com/Atmosphere/atmosphere</url>
+
+    <properties>
+        <quarkus.version>3.39.5</quarkus.version>
+        <netty.version>4.1.138.Final</netty.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- Netty BOM pinned to 4.1.138.Final, the version Quarkus 3.39.5
+                 ships (verified against quarkus-bom-3.39.5.pom, whose only
+                 io.netty 4.x pin is 4.1.138.Final). Imported BEFORE
+                 quarkus-bom and retained as an explicit floor so the patched
+                 netty stays in place regardless of transitive drift. 4.1.137
+                 closed CVE-2026-59903 (codec-http); 4.1.136 closed the
+                 codec-family batch (GHSA-jppx-w49h-x2qq /
+                 GHSA-mvh2-crg5-v77c / GHSA-6jqx-86gh-f27w codec-http,
+                 GHSA-93wv-jw9v-4972 codec-http2, GHSA-558v-64gr-wgg4 codec,
+                 GHSA-q6cq-mhr2-jmr5 codec-haproxy, GHSA-mfg7-5gfp-c4w3
+                 codec-dns) on top of the earlier CVE-2026-42577 / -42578 /
+                 -41417 fixes. Maven dependencyManagement is
+                 first-declared-wins for imported BOMs. -->
+            <dependency>
+                <groupId>io.netty</groupId>
+                <artifactId>netty-bom</artifactId>
+                <version>${netty.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>io.quarkus</groupId>
+                <artifactId>quarkus-bom</artifactId>
+                <version>${quarkus.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <modules>
+        <module>runtime</module>
+        <module>deployment</module>
+    </modules>
+</project>

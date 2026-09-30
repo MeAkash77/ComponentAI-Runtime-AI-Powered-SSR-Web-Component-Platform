@@ -1,0 +1,103 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.ai;
+
+import org.atmosphere.cpr.AtmosphereResource;
+import org.atmosphere.cpr.Broadcaster;
+
+import java.util.UUID;
+
+/**
+ * Factory for creating {@link StreamingSession} instances.
+ *
+ * <pre>{@code
+ * StreamingSession session = StreamingSessions.start(resource);
+ * session.send("Hello");
+ * session.send(" world");
+ * session.complete();
+ * }</pre>
+ */
+public final class StreamingSessions {
+
+    private StreamingSessions() {
+    }
+
+    /**
+     * Start a new streaming session for the given resource.
+     * Messages are written directly to the resource, bypassing the broadcaster
+     * to avoid re-triggering {@code @Message} handlers.
+     *
+     * @param resource the atmosphere resource
+     * @return a new streaming session
+     */
+    public static StreamingSession start(AtmosphereResource resource) {
+        return new DefaultStreamingSession(UUID.randomUUID().toString(), resource);
+    }
+
+    /**
+     * Start a new streaming session with a specific session ID.
+     *
+     * @param sessionId a caller-provided session ID (for correlation)
+     * @param resource  the atmosphere resource
+     * @return a new streaming session
+     */
+    public static StreamingSession start(String sessionId, AtmosphereResource resource) {
+        return new DefaultStreamingSession(sessionId, resource);
+    }
+
+    /**
+     * Start a new streaming session whose reply fans out to <em>every</em>
+     * subscriber on the resource's (per-path) broadcaster — the room — rather
+     * than only the originating resource. Used by
+     * {@code @AiEndpoint(broadcastReply = true)} for shared-room endpoints,
+     * where one participant's prompt and the assistant's reply are delivered
+     * to all participants in the room.
+     *
+     * <p>The prompt itself is still dispatched to a single {@code @Prompt}
+     * handler (the originating resource), so the model is invoked exactly once
+     * per prompt — only the reply delivery changes.</p>
+     *
+     * @param resource the originating atmosphere resource; its broadcaster is
+     *                 the room the reply fans out to
+     * @return a new streaming session that broadcasts room-wide
+     */
+    public static StreamingSession startRoomBroadcast(AtmosphereResource resource) {
+        return new DefaultStreamingSession(UUID.randomUUID().toString(), resource, true);
+    }
+
+    /**
+     * Start a new streaming session that broadcasts to a topic.
+     * Use this when no specific {@link AtmosphereResource} is available
+     * (e.g., from an MCP tool call that needs to stream text to browser clients).
+     *
+     * @param broadcaster the broadcaster to stream text through
+     * @return a new streaming session
+     */
+    public static StreamingSession start(Broadcaster broadcaster) {
+        return new BroadcasterStreamingSession(UUID.randomUUID().toString(), broadcaster);
+    }
+
+    /**
+     * Start a new streaming session with a specific session ID that broadcasts to a topic.
+     *
+     * @param sessionId   a caller-provided session ID (for correlation)
+     * @param broadcaster the broadcaster to stream text through
+     * @return a new streaming session
+     */
+    public static StreamingSession start(String sessionId, Broadcaster broadcaster) {
+        return new BroadcasterStreamingSession(sessionId, broadcaster);
+    }
+}

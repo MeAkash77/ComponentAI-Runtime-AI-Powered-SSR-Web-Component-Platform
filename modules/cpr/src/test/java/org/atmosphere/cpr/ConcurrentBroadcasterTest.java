@@ -1,0 +1,445 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.cpr;
+
+import org.atmosphere.container.BlockingIOCometSupport;
+import org.atmosphere.util.ExecutorsFactory;
+import org.atmosphere.util.SimpleBroadcaster;
+
+import java.io.IOException;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.mockito.Mockito.mock;
+
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+@SuppressWarnings("deprecation")
+public class ConcurrentBroadcasterTest {
+
+    private AtmosphereResource ar;
+    private DefaultBroadcaster broadcaster;
+    private AR atmosphereHandler;
+    private AtmosphereConfig config;
+    
+    @BeforeEach
+    public void setUp() throws Exception {
+        config = new AtmosphereFramework()
+                .addInitParameter(ApplicationConfig.BROADCASTER_SHARABLE_THREAD_POOLS, "true")
+                .getAtmosphereConfig();
+
+        DefaultBroadcasterFactory factory = new DefaultBroadcasterFactory();
+        factory.configure(DefaultBroadcaster.class, "NEVER", config);
+        config.framework().setBroadcasterFactory(factory);
+        broadcaster = factory.get(DefaultBroadcaster.class, "test");
+    }
+
+    @AfterEach
+    public void unSetUp() throws Exception {
+        broadcaster.destroy();
+        config.getBroadcasterFactory().destroy();
+        ExecutorsFactory.reset(config);
+    }
+
+    public final static class AR implements AtmosphereHandler {
+
+        public AtomicReference<StringBuffer> value = new AtomicReference<StringBuffer>(new StringBuffer());
+
+        @Override
+        public void onRequest(AtmosphereResource e) throws IOException {
+        }
+
+        @Override
+        public void onStateChange(AtmosphereResourceEvent e) throws IOException {
+            value.get().append(e.getMessage());
+        }
+
+        @Override
+        public void destroy() {
+        }
+    }
+
+    public final static class AR2 implements AtmosphereHandler {
+
+        public AtomicInteger count = new AtomicInteger();
+
+        @Override
+        public void onRequest(AtmosphereResource e) throws IOException {
+        }
+
+        @Override
+        public void onStateChange(AtmosphereResourceEvent e) throws IOException {
+            count.incrementAndGet();
+            // logger.info("Message received => " + count);
+            //logger.info(e.getMessage());
+        }
+
+        @Override
+        public void destroy() {
+        }
+    }
+
+    @Test
+    public void testOrderedConcurrentBroadcast() throws InterruptedException {
+        atmosphereHandler = new AR();
+        ar = new AtmosphereResourceImpl(broadcaster.getBroadcasterConfig().getAtmosphereConfig(),
+                broadcaster,
+                mock(AtmosphereRequestImpl.class),
+                AtmosphereResponseImpl.newInstance(),
+                mock(BlockingIOCometSupport.class),
+                atmosphereHandler);
+
+        broadcaster.addAtmosphereResource(ar);
+        final CountDownLatch latch = new CountDownLatch(1000);
+        broadcaster.addBroadcasterListener(new BroadcasterListenerAdapter() {
+            @Override
+            public void onPostCreate(Broadcaster b) {
+            }
+
+            @Override
+            public void onComplete(Broadcaster b) {
+                latch.countDown();
+            }
+
+            @Override
+            public void onPreDestroy(Broadcaster b) {
+            }
+        });
+
+        StringBuffer b = new StringBuffer();
+        for (int i = 0; i < 1000; i++) {
+            b.append("message-" + i);
+            broadcaster.broadcast("message-" + i);
+        }
+        latch.await(60, TimeUnit.SECONDS);
+
+        assertEquals(b.toString(), atmosphereHandler.value.get().toString());
+    }
+
+    @Test
+    public void testMultipleConcurrentBroadcast() throws InterruptedException {
+        AR2 a = new AR2();
+        int count = 50;
+        int client = 100;
+        for (int i = 0; i < client; i++) {
+            broadcaster.addAtmosphereResource(newAR(a));
+        }
+
+        final CountDownLatch latch = new CountDownLatch(count);
+        broadcaster.addBroadcasterListener(new BroadcasterListenerAdapter() {
+            @Override
+            public void onPostCreate(Broadcaster b) {
+            }
+
+            @Override
+            public void onComplete(Broadcaster b) {
+                latch.countDown();
+            }
+
+            @Override
+            public void onPreDestroy(Broadcaster b) {
+            }
+        });
+
+        for (int i = 0; i < count; i++) {
+            broadcaster.broadcast("message-" + i);
+        }
+        latch.await(60, TimeUnit.SECONDS);
+
+        assertEquals(count * client, a.count.get());
+        //Thread.sleep(600000);
+    }
+
+    @Test
+    public void testMultipleNonOrderedConcurrentBroadcast() throws InterruptedException {
+        AtmosphereConfig config = new AtmosphereFramework()
+                .addInitParameter(ApplicationConfig.BROADCASTER_SHARABLE_THREAD_POOLS, "true")
+                .addInitParameter(ApplicationConfig.OUT_OF_ORDER_BROADCAST, "true")
+                .getAtmosphereConfig();
+
+        DefaultBroadcasterFactory factory = new DefaultBroadcasterFactory();
+        factory.configure(DefaultBroadcaster.class, "NEVER", config);
+        config.framework().setBroadcasterFactory(factory);
+        broadcaster = factory.get(DefaultBroadcaster.class, "test");
+
+        AR2 a = new AR2();
+        int count = 50;
+        int client = 100;
+        for (int i = 0; i < client; i++) {
+            broadcaster.addAtmosphereResource(newAR(a));
+        }
+
+        final CountDownLatch latch = new CountDownLatch(count);
+        broadcaster.addBroadcasterListener(new BroadcasterListenerAdapter() {
+            @Override
+            public void onPostCreate(Broadcaster b) {
+            }
+
+            @Override
+            public void onComplete(Broadcaster b) {
+                latch.countDown();
+            }
+
+            @Override
+            public void onPreDestroy(Broadcaster b) {
+            }
+        });
+
+        for (int i = 0; i < count; i++) {
+            broadcaster.broadcast("message-" + i);
+        }
+        latch.await(60, TimeUnit.SECONDS);
+
+        assertEquals(count * client, a.count.get());
+        //Thread.sleep(600000);
+    }
+
+    @Test
+    public void testMultipleNonOrderedSimpleBroadcast() throws InterruptedException {
+        AtmosphereConfig config = new AtmosphereFramework()
+                .addInitParameter(ApplicationConfig.BROADCASTER_SHARABLE_THREAD_POOLS, "true")
+                .addInitParameter(ApplicationConfig.OUT_OF_ORDER_BROADCAST, "true")
+                .getAtmosphereConfig();
+
+        DefaultBroadcasterFactory factory = new DefaultBroadcasterFactory();
+        factory.configure(SimpleBroadcaster.class, "NEVER", config);
+        config.framework().setBroadcasterFactory(factory);
+        broadcaster = (DefaultBroadcaster) factory.get(SimpleBroadcaster.class, "test");
+
+        AR2 a = new AR2();
+        int count = 50;
+        int client = 100;
+        for (int i = 0; i < client; i++) {
+            broadcaster.addAtmosphereResource(newAR(a));
+        }
+
+        final CountDownLatch latch = new CountDownLatch(count);
+        broadcaster.addBroadcasterListener(new BroadcasterListenerAdapter() {
+            @Override
+            public void onPostCreate(Broadcaster b) {
+            }
+
+            @Override
+            public void onComplete(Broadcaster b) {
+                latch.countDown();
+            }
+
+            @Override
+            public void onPreDestroy(Broadcaster b) {
+            }
+        });
+
+        for (int i = 0; i < count; i++) {
+            broadcaster.broadcast("message-" + i);
+        }
+        latch.await(60, TimeUnit.SECONDS);
+
+        assertEquals(count * client, a.count.get());
+        //Thread.sleep(600000);
+    }
+
+    @Test
+    public void testMultipleOrderedSimpleBroadcast() throws InterruptedException {
+        AtmosphereConfig config = new AtmosphereFramework().getAtmosphereConfig();
+
+        DefaultBroadcasterFactory factory = new DefaultBroadcasterFactory();
+        factory.configure(SimpleBroadcaster.class, "NEVER", config);
+        config.framework().setBroadcasterFactory(factory);
+        broadcaster = (DefaultBroadcaster) factory.get(SimpleBroadcaster.class, "test");
+
+        AR2 a = new AR2();
+        int count = 50;
+        int client = 100;
+        for (int i = 0; i < client; i++) {
+            broadcaster.addAtmosphereResource(newAR(a));
+        }
+
+        final CountDownLatch latch = new CountDownLatch(count);
+        broadcaster.addBroadcasterListener(new BroadcasterListenerAdapter() {
+            @Override
+            public void onPostCreate(Broadcaster b) {
+            }
+
+            @Override
+            public void onComplete(Broadcaster b) {
+                latch.countDown();
+            }
+
+            @Override
+            public void onPreDestroy(Broadcaster b) {
+            }
+        });
+
+        for (int i = 0; i < count; i++) {
+            broadcaster.broadcast("message-" + i);
+        }
+        latch.await(60, TimeUnit.SECONDS);
+
+        assertEquals(count * client, a.count.get());
+        //Thread.sleep(600000);
+    }
+
+    @Test
+    public void testOrderedSimpleBroadcast() throws InterruptedException {
+        AtmosphereConfig config = new AtmosphereFramework().getAtmosphereConfig();
+
+        DefaultBroadcasterFactory factory = new DefaultBroadcasterFactory();
+        factory.configure(SimpleBroadcaster.class, "NEVER", config);
+        config.framework().setBroadcasterFactory(factory);
+        broadcaster = (DefaultBroadcaster) factory.get(SimpleBroadcaster.class, "test");
+
+        atmosphereHandler = new AR();
+        ar = new AtmosphereResourceImpl(broadcaster.getBroadcasterConfig().getAtmosphereConfig(),
+                broadcaster,
+                mock(AtmosphereRequestImpl.class),
+                AtmosphereResponseImpl.newInstance(),
+                mock(BlockingIOCometSupport.class),
+                atmosphereHandler);
+
+        broadcaster.addAtmosphereResource(ar);
+        final CountDownLatch latch = new CountDownLatch(1000);
+        broadcaster.addBroadcasterListener(new BroadcasterListenerAdapter() {
+            @Override
+            public void onPostCreate(Broadcaster b) {
+            }
+
+            @Override
+            public void onComplete(Broadcaster b) {
+                latch.countDown();
+            }
+
+            @Override
+            public void onPreDestroy(Broadcaster b) {
+            }
+        });
+
+        StringBuffer b = new StringBuffer();
+        for (int i = 0; i < 1000; i++) {
+            b.append("message-" + i);
+            broadcaster.broadcast("message-" + i);
+        }
+        latch.await(60, TimeUnit.SECONDS);
+
+        assertEquals(b.toString(), atmosphereHandler.value.get().toString());
+    }
+
+    @Test
+    public void testNonOrderedSetBroadcast() throws InterruptedException {
+        AtmosphereConfig config = new AtmosphereFramework()
+                .addInitParameter(ApplicationConfig.BROADCASTER_SHARABLE_THREAD_POOLS, "true")
+                .addInitParameter(ApplicationConfig.OUT_OF_ORDER_BROADCAST, "true")
+                .getAtmosphereConfig();
+
+        DefaultBroadcasterFactory factory = new DefaultBroadcasterFactory();
+        factory.configure(DefaultBroadcaster.class, "NEVER", config);
+        config.framework().setBroadcasterFactory(factory);
+        broadcaster = factory.get(DefaultBroadcaster.class, "test");
+
+        AR2 a = new AR2();
+        AtmosphereResource ar1 = newAR(a);
+        AtmosphereResource ar2 = newAR(a);
+        AtmosphereResource ar3 = newAR(a);
+        broadcaster.addAtmosphereResource(ar1).addAtmosphereResource(ar2).addAtmosphereResource(ar3);
+
+        Set<AtmosphereResource> set = new HashSet<>();
+        set.add(ar1);
+        set.add(ar2);
+
+        int count = 10;
+        final CountDownLatch latch = new CountDownLatch(count);
+        broadcaster.addBroadcasterListener(new BroadcasterListenerAdapter() {
+            @Override
+            public void onPostCreate(Broadcaster b) {
+            }
+
+            @Override
+            public void onComplete(Broadcaster b) {
+                latch.countDown();
+            }
+
+            @Override
+            public void onPreDestroy(Broadcaster b) {
+            }
+        });
+
+        for (int i = 0; i < count; i++) {
+            broadcaster.broadcast("message-" + i, set);
+        }
+        latch.await(60, TimeUnit.SECONDS);
+
+        assertEquals(count * set.size(), a.count.get());
+    }
+
+    @Test
+    public void testNonOrderedDirectResourceBroadcast() throws InterruptedException {
+        AtmosphereConfig config = new AtmosphereFramework()
+                .addInitParameter(ApplicationConfig.BROADCASTER_SHARABLE_THREAD_POOLS, "true")
+                .addInitParameter(ApplicationConfig.OUT_OF_ORDER_BROADCAST, "true")
+                .getAtmosphereConfig();
+
+        DefaultBroadcasterFactory factory = new DefaultBroadcasterFactory();
+        factory.configure(DefaultBroadcaster.class, "NEVER", config);
+        config.framework().setBroadcasterFactory(factory);
+        broadcaster = factory.get(DefaultBroadcaster.class, "test");
+
+        AR2 target = new AR2();
+        AR2 other = new AR2();
+        AtmosphereResource ar1 = newAR(target);
+        AtmosphereResource ar2 = newAR(other);
+        broadcaster.addAtmosphereResource(ar1).addAtmosphereResource(ar2);
+
+        int count = 10;
+        final CountDownLatch latch = new CountDownLatch(count);
+        broadcaster.addBroadcasterListener(new BroadcasterListenerAdapter() {
+            @Override
+            public void onPostCreate(Broadcaster b) {
+            }
+
+            @Override
+            public void onComplete(Broadcaster b) {
+                latch.countDown();
+            }
+
+            @Override
+            public void onPreDestroy(Broadcaster b) {
+            }
+        });
+
+        for (int i = 0; i < count; i++) {
+            broadcaster.broadcast("message-" + i, ar1);
+        }
+        latch.await(60, TimeUnit.SECONDS);
+
+        assertEquals(count, target.count.get());
+        assertEquals(0, other.count.get());
+    }
+
+    AtmosphereResource newAR(AtmosphereHandler a) {
+        return new AtmosphereResourceImpl(broadcaster.getBroadcasterConfig().getAtmosphereConfig(),
+                broadcaster,
+                mock(AtmosphereRequestImpl.class),
+                AtmosphereResponseImpl.newInstance(),
+                mock(BlockingIOCometSupport.class),
+                a);
+    }
+}

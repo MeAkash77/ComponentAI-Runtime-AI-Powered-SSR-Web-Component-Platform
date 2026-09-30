@@ -1,0 +1,164 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.cpr;
+
+import org.atmosphere.cache.UUIDBroadcasterCache;
+import org.atmosphere.container.BlockingIOCometSupport;
+import org.atmosphere.util.ExecutorsFactory;
+
+import jakarta.servlet.ServletException;
+import java.io.IOException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.mockito.Mockito.mock;
+
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+public class UUIDBroadcasterCacheTest {
+    private AtmosphereResource ar;
+    private Broadcaster broadcaster;
+    private AR atmosphereHandler;
+    private UUIDBroadcasterCache broadcasterCache;
+    private AtmosphereConfig config;
+
+    @SuppressWarnings("deprecation")
+    @BeforeEach
+    public void setUp() throws Exception {
+        config = new AtmosphereFramework().getAtmosphereConfig();
+        DefaultBroadcasterFactory factory = new DefaultBroadcasterFactory();
+        factory.configure(DefaultBroadcaster.class, "NEVER", config);
+        broadcaster = factory.get(DefaultBroadcaster.class, "test");
+        config.framework().setBroadcasterFactory(factory);
+
+        broadcasterCache = new UUIDBroadcasterCache();
+        broadcaster.getBroadcasterConfig().setBroadcasterCache(broadcasterCache);
+        broadcasterCache.configure(config);
+        atmosphereHandler = new AR();
+        ar = new AtmosphereResourceImpl(config,
+                broadcaster,
+                mock(AtmosphereRequestImpl.class),
+                AtmosphereResponseImpl.newInstance(),
+                mock(BlockingIOCometSupport.class),
+                atmosphereHandler);
+        broadcaster.addAtmosphereResource(ar);
+    }
+
+    @AfterEach
+    public void addAR() {
+        broadcaster.removeAtmosphereResource(ar);
+        config.getBroadcasterFactory().destroy();
+        ExecutorsFactory.reset(config);
+    }
+
+    @Test
+    public void testBasicCache() throws ExecutionException, InterruptedException, ServletException {
+        broadcaster.broadcast("e1").get();
+        broadcaster.removeAtmosphereResource(ar);
+        broadcaster.broadcast("e2").get();
+        broadcaster.broadcast("e3").get();
+
+        assertEquals(2, broadcasterCache.messages().get(ar.uuid()).size());
+    }
+
+    @Test
+    public void addRemoveAddTest() throws ExecutionException, InterruptedException, ServletException {
+        broadcaster.broadcast("e1").get();
+        broadcaster.removeAtmosphereResource(ar);
+        broadcaster.broadcast("e2").get();
+        assertEquals(broadcasterCache.messages().size(), 1);
+
+        broadcaster.addAtmosphereResource(ar);
+        broadcaster.broadcast("e3").get();
+
+        assertEquals(1, broadcasterCache.messages().size());
+        assertEquals(1, broadcasterCache.messages().get(ar.uuid()).size());
+    }
+
+    @Test
+    public void everythingCachedTest() throws ExecutionException, InterruptedException, ServletException {
+        broadcaster.removeAtmosphereResource(ar);
+
+        broadcaster.broadcast("e1").get();
+        broadcaster.broadcast("e2").get();
+
+        assertEquals(broadcasterCache.messages().size(), 1);
+    }
+
+    @Test
+    public void concurrentCache() throws ExecutionException, InterruptedException, ServletException {
+        final CountDownLatch latch = new CountDownLatch(101);
+        broadcaster.addBroadcasterListener(new BroadcasterListenerAdapter() {
+            @Override
+            public void onPostCreate(Broadcaster b) {
+            }
+
+            @Override
+            public void onComplete(Broadcaster b) {
+                latch.countDown();
+            }
+
+            @Override
+            public void onPreDestroy(Broadcaster b) {
+            }
+        }).broadcast("e-1").get();
+
+        broadcaster.removeAtmosphereResource(ar);
+
+        ExecutorService s = Executors.newCachedThreadPool();
+        final AtomicInteger y = new AtomicInteger();
+
+        for (int i = 0; i < 100; i++) {
+            s.submit(new Runnable() {
+                @Override
+                public void run() {
+                    broadcaster.broadcast("e" + y.getAndIncrement());
+                }
+            });
+        }
+
+        latch.await(10, TimeUnit.SECONDS);
+
+        assertEquals(100, broadcasterCache.messages().get(ar.uuid()).size());
+    }
+
+    public final static class AR implements AtmosphereHandler {
+
+        public AtomicReference<StringBuffer> value = new AtomicReference<StringBuffer>(new StringBuffer());
+
+        @Override
+        public void onRequest(AtmosphereResource e) throws IOException {
+        }
+
+        @Override
+        public void onStateChange(AtmosphereResourceEvent e) throws IOException {
+            value.get().append(e.getMessage());
+        }
+
+        @Override
+        public void destroy() {
+        }
+    }
+
+}

@@ -1,0 +1,176 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.quarkus.admin.runtime;
+
+import io.quarkus.runtime.Startup;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
+import jakarta.enterprise.inject.Produces;
+import jakarta.inject.Inject;
+import jakarta.inject.Singleton;
+import org.atmosphere.admin.AdminEventHandler;
+import org.atmosphere.admin.AdminEventProducer;
+import org.atmosphere.admin.AtmosphereAdmin;
+import org.atmosphere.admin.ControlAuthorizer;
+import org.atmosphere.cpr.AtmosphereFramework;
+import org.atmosphere.quarkus.runtime.LazyAtmosphereConfigurator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * CDI producer for the {@link AtmosphereAdmin} facade in Quarkus.
+ * Eagerly initialized at startup via {@link Startup} to ensure the
+ * Atmosphere framework is available.
+ *
+ * @since 4.0
+ */
+@Startup
+@ApplicationScoped
+public class AdminProducer {
+
+    private static final Logger logger = LoggerFactory.getLogger(AdminProducer.class);
+
+    private volatile AtmosphereAdmin admin;
+
+    /**
+     * Optional CDI hook for a user-supplied {@link ControlAuthorizer}.
+     * If the application declares a {@code @Produces ControlAuthorizer}
+     * (or an {@code @ApplicationScoped} bean), it wins over the
+     * fallback {@link ControlAuthorizer#REQUIRE_PRINCIPAL}. Mirrors the
+     * Spring Boot starter's {@code @ConditionalOnBean} behaviour so the
+     * two starters behave identically — operators ship one authorizer
+     * bean and both runtimes pick it up.
+     */
+    @Inject
+    Instance<ControlAuthorizer> authorizerCandidates;
+
+    @Produces
+    @Singleton
+    public AtmosphereAdmin atmosphereAdmin() {
+        if (admin != null) {
+            return admin;
+        }
+
+        // Wait for framework — it may not be ready yet at first call
+        AtmosphereFramework framework = null;
+        for (int i = 0; i < 50; i++) {
+            framework = LazyAtmosphereConfigurator.getFramework();
+            if (framework != null) {
+                break;
+            }
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+
+        if (framework == null) {
+            logger.warn("Atmosphere Admin: framework not available — admin disabled");
+            admin = new AtmosphereAdmin(null, 1000);
+            return admin;
+        }
+
+        admin = new AtmosphereAdmin(framework, 1000);
+        // Authorizer resolution in priority order:
+        //   1. user-supplied CDI bean (wins always)
+        //   2. REQUIRE_PRINCIPAL fallback — Jakarta Security must resolve a
+        //      non-anonymous Principal for any /api/admin/* write.
+        // Operators wire a custom ControlAuthorizer via CDI (or disable
+        // via atmosphere.admin.http-write-enabled=false). Fail-closed
+        // per Correctness Invariant #6.
+        if (authorizerCandidates != null && !authorizerCandidates.isUnsatisfied()
+                && !authorizerCandidates.isAmbiguous()) {
+            var custom = authorizerCandidates.get();
+            admin.setAuthorizer(custom);
+            logger.info("Atmosphere Admin authorizer: {} (CDI-provided)",
+                    custom.getClass().getName());
+        } else {
+            admin.setAuthorizer(ControlAuthorizer.REQUIRE_PRINCIPAL);
+            logger.info("Atmosphere Admin authorizer: REQUIRE_PRINCIPAL (default). "
+                    + "Produce a @ApplicationScoped ControlAuthorizer bean for "
+                    + "fine-grained role / tenant checks.");
+        }
+
+        // Register the admin event WebSocket handler
+        var handler = new AdminEventHandler();
+        var interceptors = new java.util.LinkedList<org.atmosphere.cpr.AtmosphereInterceptor>();
+        org.atmosphere.annotation.AnnotationUtil
+                .defaultManagedServiceInterceptors(framework, interceptors);
+        framework.addAtmosphereHandler(
+                AdminEventHandler.ADMIN_BROADCASTER_ID, handler, interceptors);
+
+        // Install the event producer
+        var producer = new AdminEventProducer(framework);
+        producer.install();
+
+        // Agent-state controller (registre#21): serves the live per-agent
+        // AgentState registry the AgentProcessor publishes.
+        final var stateFramework = framework;
+        admin.setStateController(new org.atmosphere.admin.state.StateController(() -> {
+            @SuppressWarnings("unchecked")
+            var registry = (java.util.Map<String, org.atmosphere.ai.state.AgentState>)
+                    stateFramework.getAtmosphereConfig().properties().getOrDefault(
+                            org.atmosphere.admin.state.StateController.STATES_PROPERTY,
+                            java.util.Map.<String, org.atmosphere.ai.state.AgentState>of());
+            return registry;
+        }));
+
+        // Wire optional AI runtime controller
+        try {
+            Class.forName("org.atmosphere.ai.AgentRuntimeResolver");
+            admin.setAiRuntimeController(
+                    new org.atmosphere.admin.ai.AiRuntimeController());
+        } catch (ClassNotFoundException ignored) {
+            // atmosphere-ai not on classpath
+        }
+
+        // Coordinator roster + workflow execution. Both modules are optional
+        // dependencies, so the coordinator-typed wiring lives in holder
+        // classes only loaded behind these guards (native-image force-links
+        // types referenced from reachable code).
+        var coordinatorPresent = classPresent("org.atmosphere.coordinator.fleet.AgentFleet");
+        if (coordinatorPresent) {
+            CoordinatorAdminWiring.install(admin, framework);
+            if (classPresent("org.atmosphere.ai.approval.ApprovalRegistry")) {
+                WorkflowAdminWiring.install(admin, framework);
+            }
+        }
+        if (admin.workflowController() == null) {
+            // Authoring/persistence only — the run endpoint reports itself
+            // unavailable loudly instead of pretending manifests execute.
+            admin.setWorkflowController(new org.atmosphere.admin.workflow.WorkflowController(
+                    new org.atmosphere.admin.workflow.InMemoryWorkflowStore(),
+                    admin.authorizer(), admin.auditLog()));
+            logger.info("Atmosphere Admin: workflow execution unavailable "
+                    + "(coordinator/ai modules absent) — authoring only");
+        }
+
+        logger.info("Atmosphere Admin control plane enabled at /api/admin/*");
+        logger.info("Atmosphere Admin dashboard at /admin/");
+        return admin;
+    }
+
+    private static boolean classPresent(String className) {
+        try {
+            Class.forName(className);
+            return true;
+        } catch (ClassNotFoundException absent) {
+            return false;
+        }
+    }
+}

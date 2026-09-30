@@ -1,0 +1,523 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.ai.tool;
+
+import org.atmosphere.ai.annotation.AiTool;
+import org.atmosphere.ai.annotation.Param;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.DeserializationFeature;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.json.JsonMapper;
+
+import java.lang.reflect.Method;
+import java.lang.reflect.Parameter;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Default implementation of {@link ToolRegistry}. Thread-safe, supports
+ * both annotation-driven and manual tool registration.
+ */
+public class DefaultToolRegistry implements ToolRegistry {
+
+    private static final Logger logger = LoggerFactory.getLogger(DefaultToolRegistry.class);
+
+    /**
+     * Referenced by name, never by class — {@code atmosphere-ai} must not
+     * depend on {@code atmosphere-sandbox} (see
+     * {@link #isFrameworkInjectableType}). The instance itself is supplied at
+     * dispatch time by the method's {@link ToolSandboxBinding} scope.
+     */
+    private static final String SANDBOX_CLASS_NAME = "org.atmosphere.ai.sandbox.Sandbox";
+
+    private final ConcurrentHashMap<String, ToolDefinition> tools = new ConcurrentHashMap<>();
+
+    @Override
+    public void register(ToolDefinition tool) {
+        var existing = tools.putIfAbsent(tool.name(), tool);
+        if (existing != null) {
+            throw new IllegalArgumentException(
+                    "Tool already registered: " + tool.name());
+        }
+        logger.info("Registered AI tool: {} — {}", tool.name(), tool.description());
+    }
+
+    @Override
+    public void register(Object toolProvider) {
+        var providerClass = toolProvider.getClass();
+        for (var method : providerClass.getDeclaredMethods()) {
+            var annotation = method.getAnnotation(AiTool.class);
+            if (annotation != null) {
+                var definition = buildFromMethod(toolProvider, method, annotation);
+                register(definition);
+            }
+        }
+    }
+
+    @Override
+    public Optional<ToolDefinition> getTool(String name) {
+        return Optional.ofNullable(tools.get(name));
+    }
+
+    @Override
+    public Collection<ToolDefinition> getTools(Collection<String> names) {
+        var result = new ArrayList<ToolDefinition>(names.size());
+        for (var name : names) {
+            var tool = tools.get(name);
+            if (tool != null) {
+                result.add(tool);
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    @Override
+    public Collection<ToolDefinition> allTools() {
+        return List.copyOf(tools.values());
+    }
+
+    @Override
+    public boolean unregister(String name) {
+        var removed = tools.remove(name) != null;
+        if (removed) {
+            logger.info("Unregistered AI tool: {}", name);
+        }
+        return removed;
+    }
+
+    @Override
+    public ToolResult execute(String toolName, Map<String, Object> arguments) {
+        var tool = tools.get(toolName);
+        if (tool == null) {
+            return ToolResult.failure(toolName, "Unknown tool: " + toolName);
+        }
+        try {
+            var result = tool.executor().execute(arguments);
+            var resultStr = result != null ? result.toString() : "null";
+            return ToolResult.success(toolName, resultStr);
+        } catch (Exception e) {
+            logger.error("Tool execution failed: {}", toolName, e);
+            return ToolResult.failure(toolName, e.getMessage());
+        }
+    }
+
+    private ToolDefinition buildFromMethod(Object instance, Method method, AiTool annotation) {
+        method.setAccessible(true);
+
+        // Resolved once at registration; per-invocation work (provisioning the
+        // sandbox) happens in the executor below. Empty on classpaths without
+        // atmosphere-sandbox — the executor then takes the exact pre-existing
+        // dispatch path.
+        var sandboxBinding = ToolSandboxBindings.find(method).orElse(null);
+
+        // Framework-scoped parameter types don't appear in the JSON schema —
+        // the LLM must never be asked for them. DefaultToolRegistry excludes
+        // any method parameter whose declared type is likely to be supplied by
+        // an injectables map at dispatch time. The actual resolution happens
+        // in the executor below via assignable-from matches on the same map.
+        var parameters = new ArrayList<ToolParameter>();
+        for (Parameter param : method.getParameters()) {
+            if (isFrameworkInjectableType(param.getType())) {
+                continue;
+            }
+            var paramAnnotation = param.getAnnotation(Param.class);
+            if (paramAnnotation != null) {
+                parameters.add(describeParameter(paramAnnotation.value(),
+                        paramAnnotation.description(), param.getParameterizedType(),
+                        param.getType(), paramAnnotation.required(), 0));
+            } else {
+                var name = param.getName();
+                if (name.matches("arg\\d+")) {
+                    logger.warn("Tool method '{}' parameter '{}' has synthetic name — "
+                            + "add @Param annotation or compile with -parameters flag",
+                            method.getName(), name);
+                }
+                parameters.add(describeParameter(name, "", param.getParameterizedType(),
+                        param.getType(), true, 0));
+            }
+        }
+
+        var returnType = ToolParameter.jsonSchemaType(method.getReturnType());
+
+        ToolExecutor executor = new ToolExecutor() {
+            @Override
+            public Object execute(Map<String, Object> args) throws Exception {
+                return execute(args, Map.of());
+            }
+
+            @Override
+            public Object execute(Map<String, Object> args,
+                                  Map<Class<?>, Object> injectables) throws Exception {
+                var scope = injectables != null ? injectables : Map.<Class<?>, Object>of();
+                if (sandboxBinding == null) {
+                    return invokeMethod(args, scope);
+                }
+                // @SandboxTool dispatch: provision the sandbox for this one
+                // invocation, expose it to the method as an injectable, and
+                // close it on every terminal path — success, tool exception,
+                // interrupt (Correctness Invariants #1/#2: framework-created,
+                // framework-closed; the tool method must not close it). A
+                // provisioning failure (backend unavailable) propagates as
+                // this tool call's error — there is no in-JVM fallback.
+                try (var sandboxScope = sandboxBinding.open(method)) {
+                    var extended = new LinkedHashMap<Class<?>, Object>(scope);
+                    extended.put(sandboxScope.injectableType(), sandboxScope.injectable());
+                    return invokeMethod(args, extended);
+                }
+            }
+
+            private Object invokeMethod(Map<String, Object> args,
+                                        Map<Class<?>, Object> scope) throws Exception {
+                var methodParams = method.getParameters();
+                var invokeArgs = new Object[methodParams.length];
+                for (int i = 0; i < methodParams.length; i++) {
+                    var p = methodParams[i];
+                    var injected = resolveInjectable(p.getType(), scope);
+                    if (injected.present()) {
+                        invokeArgs[i] = injected.value();
+                        continue;
+                    }
+                    if (SANDBOX_CLASS_NAME.equals(p.getType().getName())) {
+                        // Fail closed: a sandbox-typed parameter with no
+                        // claiming ToolSandboxBinding must never be invoked
+                        // with null — the method's body expects isolation
+                        // (Invariant #6, no silent in-JVM execution).
+                        throw new IllegalStateException("Tool method '" + method.getName()
+                                + "' declares a " + SANDBOX_CLASS_NAME + " parameter but no "
+                                + "ToolSandboxBinding claimed the method. Annotate it with "
+                                + "@SandboxTool and put atmosphere-sandbox on the classpath — "
+                                + "sandboxed tools never fall back to in-JVM execution.");
+                    }
+                    var paramAnnotation = p.getAnnotation(Param.class);
+                    var paramName = paramAnnotation != null
+                            ? paramAnnotation.value()
+                            : p.getName();
+                    invokeArgs[i] = convertArg(args.get(paramName), p.getType(),
+                            p.getParameterizedType());
+                }
+                return method.invoke(instance, invokeArgs);
+            }
+        };
+
+        // Check for @RequiresApproval on the method
+        var approvalAnnotation = method.getAnnotation(
+                org.atmosphere.ai.annotation.RequiresApproval.class);
+        String approvalMessage = null;
+        long approvalTimeout = 0;
+        if (approvalAnnotation != null) {
+            approvalMessage = approvalAnnotation.value();
+            approvalTimeout = approvalAnnotation.timeoutSeconds();
+        }
+
+        // Check for @Authorize on the method — registered side-table to keep
+        // ToolDefinition's canonical constructor stable. Empty annotations are
+        // dropped at register-time so no-op decorations cost nothing.
+        var authorizeAnnotation = method.getAnnotation(
+                org.atmosphere.ai.annotation.Authorize.class);
+        if (authorizeAnnotation != null) {
+            var authorization = new ToolAuthorization(
+                    java.util.Set.of(authorizeAnnotation.roles()),
+                    java.util.Set.of(authorizeAnnotation.permissions()));
+            ToolAuthorizationRegistry.register(annotation.name(), authorization);
+        }
+
+        return new ToolDefinition(
+                annotation.name(),
+                annotation.description(),
+                parameters,
+                returnType,
+                executor,
+                approvalMessage,
+                approvalTimeout,
+                // Per-tool execution bound from the annotation: 0 inherits the
+                // framework default, negative disables the bound for this tool.
+                annotation.timeoutSeconds(),
+                annotation.kind()
+        );
+    }
+
+    /**
+     * Result of an injectable lookup. A sentinel so {@code null} remains a
+     * legal injected value distinct from "no match".
+     */
+    private record Injected(boolean present, Object value) {
+        private static final Injected ABSENT = new Injected(false, null);
+        static Injected of(Object v) { return new Injected(true, v); }
+    }
+
+    /**
+     * Resolve {@code type} from the injectables map using
+     * {@code isAssignableFrom} so a method can declare an interface
+     * ({@code StreamingSession}) and receive the concrete implementation.
+     *
+     * <p>Exact key match is tried first (fastest path); then we scan the
+     * entries for the first assignable type. The scan is linear on a map
+     * that typically has fewer than ten entries, so this is cheap.</p>
+     */
+    private static Injected resolveInjectable(Class<?> type,
+                                              Map<Class<?>, Object> scope) {
+        if (scope.containsKey(type)) {
+            return Injected.of(scope.get(type));
+        }
+        for (var entry : scope.entrySet()) {
+            if (type.isAssignableFrom(entry.getKey())) {
+                return Injected.of(entry.getValue());
+            }
+        }
+        return Injected.ABSENT;
+    }
+
+    /**
+     * Pre-registration check: is {@code type} likely to be supplied via the
+     * framework injectables map at dispatch time? Kept conservative — we
+     * exclude a parameter from the JSON schema only for types the framework
+     * is known to inject. User domain types still get schema parameters.
+     *
+     * <p>Matched via class name so {@code atmosphere-ai} keeps its
+     * independence from {@code atmosphere-agent} and
+     * {@code atmosphere-coordinator} (which declare {@code AgentFleet},
+     * {@code AgentIdentity}, etc.) — no inverted module dependencies.</p>
+     */
+    private static boolean isFrameworkInjectableType(Class<?> type) {
+        if (type.isPrimitive() || type.isArray()) {
+            return false;
+        }
+        var name = type.getName();
+        return name.equals("org.atmosphere.ai.StreamingSession")
+                || name.equals("org.atmosphere.ai.AiStreamingSession")
+                || name.equals("org.atmosphere.cpr.AtmosphereResource")
+                || name.equals("org.atmosphere.coordinator.fleet.AgentFleet")
+                || name.equals("org.atmosphere.ai.identity.AgentIdentity")
+                || name.equals("org.atmosphere.ai.state.AgentState")
+                || name.equals("org.atmosphere.ai.workspace.AgentWorkspace")
+                || name.equals("org.atmosphere.ai.fs.AgentFileSystem")
+                || name.equals("org.atmosphere.ai.plan.AgentPlanStore")
+                || name.equals(SANDBOX_CLASS_NAME);
+    }
+
+    /** Deepest nesting the schema describer will walk before flattening. */
+    private static final int MAX_SCHEMA_DEPTH = 4;
+
+    /**
+     * Describe one parameter as a JSON Schema node, reading the parameter's
+     * <em>generic</em> type so the model sees what it actually has to produce:
+     * an enum's allowed values, an array/collection's element schema, and a
+     * record's nested fields. Previously every one of these collapsed to a
+     * bare {@code "object"}, leaving the model to guess the shape.
+     *
+     * <p>Recursion is bounded by {@link #MAX_SCHEMA_DEPTH} so a
+     * self-referential record cannot spin.</p>
+     */
+    private static ToolParameter describeParameter(String name, String description,
+                                                   Type genericType,
+                                                   Class<?> rawType, boolean required,
+                                                   int depth) {
+        if (rawType.isEnum()) {
+            var constants = rawType.getEnumConstants();
+            var values = new ArrayList<String>(constants.length);
+            for (var constant : constants) {
+                values.add(((Enum<?>) constant).name());
+            }
+            return ToolParameter.ofEnum(name, description, required, values);
+        }
+        if (depth < MAX_SCHEMA_DEPTH) {
+            var element = elementType(genericType, rawType);
+            if (element != null) {
+                var items = describeParameter("item", "", element,
+                        rawClassOf(element), true, depth + 1);
+                return ToolParameter.ofArray(name, description, required, items);
+            }
+            if (rawType.isRecord()) {
+                var components = rawType.getRecordComponents();
+                var properties = new ArrayList<ToolParameter>(components.length);
+                for (var component : components) {
+                    properties.add(describeParameter(component.getName(), "",
+                            component.getGenericType(), component.getType(), true, depth + 1));
+                }
+                return ToolParameter.ofObject(name, description, required, properties);
+            }
+        }
+        return new ToolParameter(name, description,
+                ToolParameter.jsonSchemaType(rawType), required);
+    }
+
+    /**
+     * The element type of an array or {@link Collection}, or {@code null} when
+     * the type is neither. A raw (un-parameterized) collection yields
+     * {@code Object}, which describes as a plain object node.
+     */
+    private static Type elementType(Type genericType,
+                                                      Class<?> rawType) {
+        if (rawType.isArray()) {
+            return rawType.getComponentType();
+        }
+        if (!Collection.class.isAssignableFrom(rawType)) {
+            return null;
+        }
+        if (genericType instanceof ParameterizedType parameterized) {
+            var args = parameterized.getActualTypeArguments();
+            if (args.length == 1) {
+                return args[0];
+            }
+        }
+        return Object.class;
+    }
+
+    /** Best-effort raw class for a reflective type. */
+    private static Class<?> rawClassOf(Type type) {
+        if (type instanceof Class<?> clazz) {
+            return clazz;
+        }
+        if (type instanceof ParameterizedType parameterized
+                && parameterized.getRawType() instanceof Class<?> raw) {
+            return raw;
+        }
+        return Object.class;
+    }
+
+    /**
+     * Binds a structured argument ({@code Map}/{@code List} from the JSON
+     * parser, or a raw JSON text span from a malformed-input fallback) onto a
+     * record / collection / enum parameter type.
+     */
+    private static final ObjectMapper ARG_JSON = JsonMapper.builder()
+            .enable(DeserializationFeature.USE_LONG_FOR_INTS)
+            .build();
+
+    /**
+     * Convert one model-supplied argument to the tool method's parameter type.
+     *
+     * <p>Scalars keep their historical {@code toString()}-then-parse path so
+     * already-correct simple arguments bind byte-identically. Everything the
+     * scalar path cannot express — enums, records, collections, maps, arrays —
+     * is bound structurally: a nested object aimed at a {@code String} becomes
+     * JSON text (never {@code Map.toString()}'s {@code {key=value}}), an enum
+     * binds by constant name, and a record binds through Jackson. Whatever
+     * still falls through goes to {@link #convertStructuredArg}, which also
+     * reads the parameter's generic type so {@code List<Row>} binds its
+     * elements. A binding failure there returns the raw value so the
+     * downstream reflective invoke surfaces a tool error rather than crashing
+     * the bridge (Correctness Invariant #4).</p>
+     *
+     * @param value       the model-supplied argument (may be null)
+     * @param targetType  the method parameter's raw type
+     * @param genericType the method parameter's generic type, used to bind
+     *                    element types of collections ({@code List<Row>})
+     */
+    private static Object convertArg(Object value, Class<?> targetType, Type genericType) {
+        if (value == null) {
+            return null;
+        }
+        if (targetType.isInstance(value)) {
+            return value;
+        }
+        // A structured argument (nested object / array) aimed at a String
+        // parameter must arrive as JSON text, which is what the tool used to
+        // receive when nested values were left un-parsed. Map.toString() would
+        // hand it `{key=value}` — not JSON, and a fresh corruption of exactly
+        // the kind parsing tool arguments with Jackson removed.
+        if (targetType == String.class && (value instanceof Map<?, ?> || value instanceof List<?>)) {
+            return ToolBridgeUtils.toJsonText(value);
+        }
+        // Enum parameters: the model sends the constant's name as a string.
+        // Without this the raw String reached method.invoke and every
+        // enum-typed @AiTool parameter failed with an argument type mismatch —
+        // the parameter kind was unusable, not merely under-described.
+        if (targetType.isEnum() && value instanceof String name) {
+            for (var constant : targetType.getEnumConstants()) {
+                var enumName = ((Enum<?>) constant).name();
+                if (enumName.equals(name) || enumName.equalsIgnoreCase(name)) {
+                    return constant;
+                }
+            }
+            throw new IllegalArgumentException("'" + name + "' is not a valid "
+                    + targetType.getSimpleName() + " value");
+        }
+        // Structured arguments aimed at a record/POJO parameter bind through
+        // Jackson, so a nested object from the model reaches a typed parameter
+        // instead of failing the reflective invoke.
+        if (value instanceof Map<?, ?> && !targetType.isPrimitive()
+                && targetType != Object.class && !Map.class.isAssignableFrom(targetType)) {
+            return ToolBridgeUtils.convertValue(value, targetType);
+        }
+        // Handle common conversions from JSON-parsed types
+        var str = value.toString();
+        if (targetType == String.class) {
+            return str;
+        } else if (targetType == int.class || targetType == Integer.class) {
+            return Integer.parseInt(str);
+        } else if (targetType == long.class || targetType == Long.class) {
+            return Long.parseLong(str);
+        } else if (targetType == double.class || targetType == Double.class) {
+            return Double.parseDouble(str);
+        } else if (targetType == float.class || targetType == Float.class) {
+            return Float.parseFloat(str);
+        } else if (targetType == boolean.class || targetType == Boolean.class) {
+            return Boolean.parseBoolean(str);
+        }
+        return convertStructuredArg(value, targetType, genericType);
+    }
+
+    /**
+     * Jackson-backed binding for the non-scalar parameter types the legacy
+     * {@code toString()} ladder fell through on (it returned the raw value,
+     * so a record parameter received a {@code Map} and the reflective invoke
+     * threw {@code IllegalArgumentException}).
+     */
+    private static Object convertStructuredArg(Object value, Class<?> targetType, Type genericType) {
+        var javaType = resolveJavaType(targetType, genericType);
+        try {
+            if (value instanceof String raw) {
+                var trimmed = raw.trim();
+                if (targetType.isEnum()) {
+                    // Enum constants arrive as bare strings, not JSON text.
+                    return ARG_JSON.convertValue(trimmed, javaType);
+                }
+                if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+                    // A raw JSON span from the malformed-input fallback path.
+                    return ARG_JSON.readValue(trimmed, javaType);
+                }
+            }
+            return ARG_JSON.convertValue(value, javaType);
+        } catch (JacksonException | IllegalArgumentException e) {
+            logger.debug("Could not bind argument to {} ({}); passing the raw value through",
+                    targetType.getName(), e.toString());
+            return value;
+        }
+    }
+
+    /**
+     * Resolve the Jackson {@link tools.jackson.databind.JavaType} for a
+     * parameter, preferring the generic type so {@code List<Row>} binds its
+     * elements instead of degrading to {@code List<Map>}.
+     */
+    private static tools.jackson.databind.JavaType resolveJavaType(Class<?> targetType,
+                                                                   Type genericType) {
+        if (genericType instanceof ParameterizedType) {
+            return ARG_JSON.constructType(genericType);
+        }
+        return ARG_JSON.constructType(targetType);
+    }
+}

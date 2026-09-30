@@ -1,0 +1,77 @@
+atmosphere:
+  packages: org.atmosphere.samples.springboot.a2astartup
+  # Stateful Interactions API in the Console "Interactions" tab — launch the
+  # team run as a background interaction and watch its durable steps[] timeline.
+  # http-write-enabled + demo-principal are DEMO-ONLY (default-deny otherwise).
+  interactions:
+    http-write-enabled: true
+    demo-principal: demo-user
+  # The bundled Atmosphere Console is the sample UI: fleet roster + live
+  # agent activity render from the coordinator admin API + agent-step events.
+  console-subtitle: AI startup advisory team — @Coordinator fans out to 4 A2A agents
+  web-transport:
+    enabled: true
+    port: 4446
+  # Fleet agents called via A2A (JSON-RPC over HTTP) — same JVM, real protocol.
+  # Demonstrates that agents work identically whether local or remote.
+  init-params:
+    atmosphere.fleet.agents.research-agent.url: http://localhost:${server.port}/atmosphere/a2a/research
+    atmosphere.fleet.agents.strategy-agent.url: http://localhost:${server.port}/atmosphere/a2a/strategy
+    atmosphere.fleet.agents.finance-agent.url: http://localhost:${server.port}/atmosphere/a2a/finance
+    atmosphere.fleet.agents.writer-agent.url: http://localhost:${server.port}/atmosphere/a2a/writer
+  # Embabel config (only active when atmosphere-embabel is on the classpath):
+  embabel:
+    agent-name: ceo
+  # Koog runtime config (active with atmosphere-koog on the classpath). Koog 1.0
+  # has no stable Google client, so Gemini is reached through Koog's OpenAI client
+  # pointed at Google's OpenAI-compatible surface. Works out-of-box with just
+  # GEMINI_API_KEY; override LLM_MODEL / LLM_BASE_URL for any OpenAI-compatible provider.
+  #
+  # base-url MUST default blank, not to the Gemini URL: a configured URL wins over
+  # mode in every resolver, so a hard-defaulted endpoint makes LLM_MODE=local
+  # unreachable and a keyless local run silently dials Google. Blank hands the
+  # choice to AtmosphereKoogAutoConfiguration -> AiConfig.resolveBaseUrl, which
+  # still picks Gemini for the gemini-2.5-flash default and Ollama for
+  # LLM_MODE=local. Pinned by SampleLlmEnvPlaceholderLintTest.
+  koog:
+    model: ${LLM_MODEL:gemini-2.5-flash}
+    base-url: ${LLM_BASE_URL:}
+    api-key: ${LLM_API_KEY:${GEMINI_API_KEY:}}
+  # Session tape: record every agent's AI turn (typed AiEvent steps) as a durable
+  # artifact. Each specialist's run links to the CEO's run via parentRunId, so
+  # the whole team session replays as a tree from the Console "Tape" tab
+  # (SqliteTapeStore via the atmosphere-checkpoint dependency). Off by default.
+  ai:
+    tape:
+      enabled: true
+      store: sqlite
+      path: ${ATMOSPHERE_TAPE_PATH:${java.io.tmpdir}/atmosphere-startup-team-tape.db}
+
+spring:
+  autoconfigure:
+    exclude:
+      - org.springframework.ai.autoconfigure.openai.OpenAiAutoConfiguration
+  # Spring AI config (uncomment when using atmosphere-spring-ai runtime):
+  # ai:
+  #   openai:
+  #     api-key: ${LLM_API_KEY:${GEMINI_API_KEY:}}
+  #     base-url: ${LLM_BASE_URL:https://generativelanguage.googleapis.com/v1beta/openai}
+  #     chat:
+  #       options:
+  #         model: ${LLM_MODEL:gemini-2.5-flash}
+
+llm:
+  model: ${LLM_MODEL:gemini-2.5-flash}
+  base-url: ${LLM_BASE_URL:}
+  api-key: ${LLM_API_KEY:${GEMINI_API_KEY:}}
+
+embabel:
+  models:
+    default-llm: gemini-2.5-flash
+  agent:
+    platform:
+      scanning:
+        bean: true
+
+server:
+  port: ${SERVER_PORT:8080}

@@ -1,0 +1,236 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.ai;
+
+import tools.jackson.databind.ObjectMapper;
+import org.atmosphere.cpr.Broadcaster;
+import org.atmosphere.cpr.RawMessage;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+
+import java.util.List;
+import java.util.concurrent.Future;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
+
+/**
+ * Tests for {@link BroadcasterStreamingSession} — the bridge between
+ * MCP tool calls and real-time browser clients.
+ */
+public class BroadcasterStreamingSessionTest {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    private Broadcaster broadcaster;
+    private StreamingSession session;
+
+    @SuppressWarnings("unchecked")
+    @BeforeEach
+    public void setUp() {
+        broadcaster = mock(Broadcaster.class);
+        when(broadcaster.broadcast(any(RawMessage.class))).thenReturn(mock(Future.class));
+        session = StreamingSessions.start("bcast-session", broadcaster);
+    }
+
+    /** Extract the JSON string from a captured RawMessage. */
+    private static String raw(RawMessage msg) {
+        return (String) msg.message();
+    }
+
+    @Test
+    public void testSendStreamingText() throws Exception {
+        session.send("Hello");
+
+        var captor = ArgumentCaptor.forClass(RawMessage.class);
+        verify(broadcaster).broadcast(captor.capture());
+
+        var json = MAPPER.readTree(raw(captor.getValue()));
+        assertEquals("streaming-text", json.get("type").stringValue());
+        assertEquals("Hello", json.get("data").stringValue());
+        assertEquals("bcast-session", json.get("sessionId").stringValue());
+        assertEquals(1L, json.get("seq").asLong());
+    }
+
+    @Test
+    public void testSendMultipleStreamingTextsWithSequence() throws Exception {
+        session.send("Hello");
+        session.send(" world");
+
+        var captor = ArgumentCaptor.forClass(RawMessage.class);
+        verify(broadcaster, times(2)).broadcast(captor.capture());
+
+        var messages = captor.getAllValues();
+        var first = MAPPER.readTree(raw(messages.get(0)));
+        var second = MAPPER.readTree(raw(messages.get(1)));
+
+        assertEquals(1L, first.get("seq").asLong());
+        assertEquals(2L, second.get("seq").asLong());
+        assertEquals(" world", second.get("data").stringValue());
+    }
+
+    @Test
+    public void testProgress() throws Exception {
+        session.progress("Thinking...");
+
+        var captor = ArgumentCaptor.forClass(RawMessage.class);
+        verify(broadcaster).broadcast(captor.capture());
+
+        var json = MAPPER.readTree(raw(captor.getValue()));
+        assertEquals("progress", json.get("type").stringValue());
+        assertEquals("Thinking...", json.get("data").stringValue());
+    }
+
+    @Test
+    public void testComplete() throws Exception {
+        session.complete();
+
+        var captor = ArgumentCaptor.forClass(RawMessage.class);
+        verify(broadcaster).broadcast(captor.capture());
+
+        var json = MAPPER.readTree(raw(captor.getValue()));
+        assertEquals("complete", json.get("type").stringValue());
+        assertFalse(json.has("data"));
+        assertTrue(session.isClosed());
+    }
+
+    @Test
+    public void testCompleteWithSummary() throws Exception {
+        session.complete("Full response");
+
+        var captor = ArgumentCaptor.forClass(RawMessage.class);
+        verify(broadcaster).broadcast(captor.capture());
+
+        var json = MAPPER.readTree(raw(captor.getValue()));
+        assertEquals("complete", json.get("type").stringValue());
+        assertEquals("Full response", json.get("data").stringValue());
+    }
+
+    @Test
+    public void testError() throws Exception {
+        session.error(new RuntimeException("LLM timeout"));
+
+        var captor = ArgumentCaptor.forClass(RawMessage.class);
+        verify(broadcaster).broadcast(captor.capture());
+
+        var json = MAPPER.readTree(raw(captor.getValue()));
+        assertEquals("error", json.get("type").stringValue());
+        assertEquals("LLM timeout", json.get("data").stringValue());
+        assertTrue(session.isClosed());
+    }
+
+    @Test
+    public void testSendAfterCloseIsIgnored() {
+        session.complete();
+        reset(broadcaster);
+
+        session.send("should be ignored");
+
+        verify(broadcaster, never()).broadcast(any());
+    }
+
+    @Test
+    public void testDoubleCompleteIsIgnored() {
+        session.complete();
+        reset(broadcaster);
+
+        session.complete();
+
+        verify(broadcaster, never()).broadcast(any());
+    }
+
+    @Test
+    public void testSendMetadata() throws Exception {
+        session.sendMetadata("model", "gpt-4o");
+
+        var captor = ArgumentCaptor.forClass(RawMessage.class);
+        verify(broadcaster).broadcast(captor.capture());
+
+        var json = MAPPER.readTree(raw(captor.getValue()));
+        assertEquals("metadata", json.get("type").stringValue());
+        assertEquals("model", json.get("key").stringValue());
+        assertEquals("gpt-4o", json.get("value").stringValue());
+    }
+
+    @Test
+    public void testAutoCloseCallsComplete() throws Exception {
+        try (var s = session) {
+            s.send("streaming-text");
+        }
+
+        var captor = ArgumentCaptor.forClass(RawMessage.class);
+        verify(broadcaster, times(2)).broadcast(captor.capture());
+
+        var last = MAPPER.readTree(raw(captor.getAllValues().get(1)));
+        assertEquals("complete", last.get("type").stringValue());
+        assertTrue(session.isClosed());
+    }
+
+    @Test
+    public void testStartWithAutoGeneratedId() {
+        var s = StreamingSessions.start(broadcaster);
+        assertNotNull(s);
+        assertNotNull(s.sessionId());
+        assertFalse(s.isClosed());
+    }
+
+    @Test
+    public void testSessionId() {
+        assertEquals("bcast-session", session.sessionId());
+    }
+
+    @Test
+    public void testFullStreamLifecycle() throws Exception {
+        session.progress("Connecting...");
+        session.sendMetadata("model", "gpt-4o");
+        session.send("Hello");
+        session.send(" world");
+        session.send("!");
+        session.complete("Hello world!");
+
+        var captor = ArgumentCaptor.forClass(RawMessage.class);
+        verify(broadcaster, times(6)).broadcast(captor.capture());
+
+        var types = captor.getAllValues().stream()
+                .map(m -> {
+                    try {
+                        return MAPPER.readTree(raw(m)).get("type").stringValue();
+                    } catch (Exception e) {
+                        return "error";
+                    }
+                })
+                .toList();
+
+        assertEquals(List.of("progress", "metadata", "streaming-text", "streaming-text", "streaming-text", "complete"), types);
+        assertTrue(session.isClosed());
+    }
+
+    @Test
+    public void testSameWireFormatAsDefaultSession() throws Exception {
+        session.send("test-text");
+
+        var captor = ArgumentCaptor.forClass(RawMessage.class);
+        verify(broadcaster).broadcast(captor.capture());
+
+        var json = MAPPER.readTree(raw(captor.getValue()));
+        assertTrue(json.has("type"));
+        assertTrue(json.has("data"));
+        assertTrue(json.has("sessionId"));
+        assertTrue(json.has("seq"));
+        assertEquals(4, json.size());
+    }
+}

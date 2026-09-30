@@ -1,0 +1,1751 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.cpr;
+
+import jakarta.servlet.AsyncContext;
+import jakarta.servlet.AsyncListener;
+import jakarta.servlet.DispatcherType;
+import jakarta.servlet.RequestDispatcher;
+import jakarta.servlet.ServletContext;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.ServletInputStream;
+import jakarta.servlet.ServletRequest;
+import jakarta.servlet.ServletResponse;
+import jakarta.servlet.http.Cookie;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletRequestWrapper;
+import jakarta.servlet.http.HttpServletResponse;
+import jakarta.servlet.http.HttpSession;
+import jakarta.servlet.http.Part;
+import org.atmosphere.util.FakeHttpSession;
+import org.atmosphere.util.QueryStringDecoder;
+import org.atmosphere.util.ReaderInputStream;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.Reader;
+import java.io.StringReader;
+import java.io.UnsupportedEncodingException;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.security.Principal;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
+
+import static org.atmosphere.cpr.HeaderConfig.X_ATMOSPHERE;
+
+/**
+ * An Atmosphere request representation. An {@link AtmosphereRequest} is a two-way communication channel between the
+ * client and the server. If the {@link AtmosphereRequestImpl#isDestroyable()} is set to false, or if its
+ * associated {@link AtmosphereResource} has been suspended, this object can be re-used at any moment between requests.
+ * You can use its associated {@link AtmosphereResponse} to write bytes at any moment, making this object bi-directional.
+ * <br/>
+ *
+ * @author Jeanfrancois Arcand
+ */
+public class AtmosphereRequestImpl extends HttpServletRequestWrapper implements AtmosphereRequest {
+
+    private final static Logger logger = LoggerFactory.getLogger(AtmosphereRequestImpl.class);
+    private ServletInputStream bis;
+    private BufferedReader br;
+    private final Builder b;
+    private final AtomicBoolean destroyed = new AtomicBoolean(false);
+    private boolean queryComputed;
+    private boolean cookieComputed;
+    private volatile BufferedReader voidReader;
+    private final ServletInputStream voidStream = new InputStreamServletAdapter(new ByteArrayInputStream(new byte[0]));
+    private AtomicBoolean streamSet = new AtomicBoolean();
+    private AtomicBoolean readerSet = new AtomicBoolean();
+    private String uuid;
+    private boolean noopsAsyncContextStarted;
+
+    private AtmosphereRequestImpl(Builder b) {
+        super(b.request == null ? new org.atmosphere.cpr.NoOpsRequest() : b.request);
+        if (b.request == null) b.request(new org.atmosphere.cpr.NoOpsRequest());
+
+        this.b = b;
+        this.uuid = resource() != null ? resource().uuid() : "0";
+    }
+
+    private BufferedReader getVoidReader() {
+        if (voidReader == null) {
+            voidReader = new BufferedReader(new StringReader(""), 5);
+        }
+        return voidReader;
+    }
+
+    private void configureStream() {
+        if (bis == null && !streamSet.getAndSet(true)) {
+            if (b.inputStream != null) {
+                bis = new InputStreamServletAdapter(b.inputStream);
+            } else if (b.reader == null) {
+                if (b.body.hasBytes()) {
+                    bis = new ByteArrayServletInputStream(b.body.asBytes(), b.body.byteOffset(), b.body.byteLength());
+                } else if (b.body.hasString()) {
+                    byte[] bytes = b.body.asString().getBytes(StandardCharsets.UTF_8);
+                    bis = new ByteArrayServletInputStream(bytes, 0, bytes.length);
+                }
+            } else {
+                bis = new InputStreamServletAdapter(new ReaderInputStream(b.reader));
+            }
+        }
+    }
+
+    private void configureReader() {
+        if (br == null && !readerSet.getAndSet(true)) {
+            if (b.reader != null) {
+                br = new BufferedReader(b.reader);
+            } else if (b.inputStream == null) {
+                try {
+                    if (b.body.hasBytes()) {
+                        br = new BufferedReader(new StringReader(new String(b.body.asBytes(), b.body.byteOffset(), b.body.byteLength(), b.encoding)));
+                    } else if (b.body.hasString()) {
+                        br = new BufferedReader(new StringReader(b.body.asString()));
+                    }
+                } catch (UnsupportedEncodingException e) {
+                    throw new RuntimeException(e);
+                }
+            } else {
+                br = new BufferedReader(new InputStreamReader(b.inputStream));
+            }
+        }
+    }
+
+    @Override
+    public boolean destroyed() {
+        return destroyed.get();
+    }
+
+    @Override
+    public AtmosphereRequest destroyable(boolean destroyable) {
+        b.destroyable = destroyable;
+        return this;
+    }
+
+    @Override
+    public String getPathInfo() {
+        return !Objects.equals(b.pathInfo, "") ? b.pathInfo : isNotNoOps() ? b.request.getPathInfo() : "";
+    }
+
+    @Override
+    public String getPathTranslated() {
+        return b.request.getPathTranslated();
+    }
+
+    @Override
+    public String getQueryString() {
+        return !Objects.equals(b.queryString, "") ? b.queryString : isNotNoOps() ? b.request.getQueryString() : toQs();
+    }
+
+    private String toQs() {
+        var q = new StringBuilder();
+        for (Map.Entry<String, String[]> e : b.queryStrings.entrySet()) {
+            for (String k : e.getValue()) {
+                q.append(e.getKey()).append("=").append(k).append("&");
+            }
+        }
+        if (q.length() > 0) q.deleteCharAt(q.length() - 1);
+        return q.toString();
+    }
+
+    @Override
+    public String getRemoteUser() {
+        return b.principal != null ? b.principal.getName() : b.request.getRemoteUser();
+    }
+
+    @Override
+    public String getRequestedSessionId() {
+        return b.request.getRequestedSessionId();
+    }
+
+    @Override
+    public String getMethod() {
+        return b.methodType != null ? b.methodType : b.request.getMethod();
+    }
+
+    @Override
+    public Part getPart(String name) throws IOException, ServletException {
+        return b.request.getPart(name);
+    }
+
+    @Override
+    public Collection<Part> getParts() throws IOException, ServletException {
+        return b.request.getParts();
+    }
+
+    @Override
+    public String getContentType() {
+        return b.contentType != null || b.noContentType ? b.contentType : b.request.getContentType();
+    }
+
+    @Override
+    public DispatcherType getDispatcherType() {
+        return b.request.getDispatcherType();
+    }
+
+    @Override
+    public String getServletPath() {
+        return !Objects.equals(b.servletPath, "") ? b.servletPath : (isNotNoOps() ? b.request.getServletPath() : "");
+    }
+
+    @Override
+    public String getRequestURI() {
+        return b.requestURI != null ? b.requestURI : (isNotNoOps() ? b.request.getRequestURI() : "");
+    }
+
+    @Override
+    public StringBuffer getRequestURL() {
+        return b.requestURL != null ? new StringBuffer(b.requestURL) : (isNotNoOps() ? b.request.getRequestURL() : new StringBuffer());
+    }
+
+    @Override
+    public Enumeration<String> getHeaders(String name) {
+
+        var list = new ArrayList<String>();
+        // Never override the parent Request
+        if (!name.equalsIgnoreCase("content-type")) {
+            Enumeration<String> e = b.request.getHeaders(name);
+            while (e.hasMoreElements())
+                list.add(e.nextElement());
+        }
+
+        if (name.equalsIgnoreCase("content-type")) {
+            String s = getContentType();
+            if (s != null) {
+                list.add(s);
+            }
+        } else {
+            if (b.headers.get(name) != null) {
+                list.add(b.headers.get(name));
+            }
+
+            if (isNotNoOps()) {
+                if (list.isEmpty() && name.startsWith(X_ATMOSPHERE)) {
+                    Object attr = attributeWithoutException(b.request, name);
+                    if (attr != null) {
+                        list.add(attr.toString());
+                    }
+                }
+            }
+        }
+        return Collections.enumeration(list);
+    }
+
+    @Override
+    public int getIntHeader(String name) {
+        return b.request.getIntHeader(name);
+    }
+
+    @Override
+    public Enumeration<String> getHeaderNames() {
+        var list = new HashSet<String>();
+        list.addAll(b.headers.keySet());
+
+        list.addAll(Collections.list(b.request.getHeaderNames()));
+        if (b.request != null) {
+            Enumeration<String> e = b.request.getAttributeNames();
+            while (e.hasMoreElements()) {
+                String name = e.nextElement();
+                if (name.startsWith(X_ATMOSPHERE)) {
+                    list.add(name);
+                }
+            }
+        }
+
+        if (b.contentType != null) {
+            list.add("Content-Type");
+        }
+        return Collections.enumeration(list);
+    }
+
+    @Override
+    public boolean authenticate(HttpServletResponse response) throws IOException, ServletException {
+        return b.request.authenticate(response);
+    }
+
+    @Override
+    public String getAuthType() {
+        return b.authType != null ? b.authType : b.request.getAuthType();
+    }
+
+    @Override
+    public String getContextPath() {
+        String c = "/";
+        try {
+            c = isNotNoOps() && b.request.getContextPath() != null ? b.request.getContextPath() : b.contextPath != null ? b.contextPath : "";
+        } catch (NullPointerException ex) {
+            // https://github.com/Atmosphere/atmosphere/issues/1804
+            logger.warn("Unexpected getContextPath exception. Forcing `/`", ex);
+        }
+        return c;
+    }
+
+    @Override
+    public Cookie[] getCookies() {
+        if (!cookieComputed) {
+            if (b.cookies == null)
+                return new Cookie[0];
+            cookieComputed = true;
+            Cookie[] c = b.request.getCookies();
+            if (c != null && c.length > 0) {
+                b.cookies.addAll(Arrays.asList(c));
+            }
+        }
+        return b.cookies.toArray(new Cookie[]{});
+    }
+
+    @Override
+    public long getDateHeader(String name) {
+        return b.request.getDateHeader(name);
+    }
+
+    @Override
+    public String getHeader(String s) {
+        return getHeader(s, true);
+    }
+
+    @Override
+    public HttpServletRequest wrappedRequest() {
+        return b.request;
+    }
+
+    @Override
+    public String getHeader(String s, boolean checkCase) {
+
+        if ("content-type".equalsIgnoreCase(s)) {
+            return getContentType();
+        }
+
+        String name = b.request.getHeader(s);
+        if (name == null) {
+            if (b.headers.get(s) != null) {
+                return b.headers.get(s);
+            }
+
+            if (s.startsWith(X_ATMOSPHERE) && isNotNoOps()) {
+                // Craziness with Struts 2 who wraps String attribute as BigDecimal
+                // https://github.com/Atmosphere/atmosphere/issues/1367
+                Object o = attributeWithoutException(b.request, s);
+                if (o == null || o instanceof String) {
+                    name = (String) o;
+                } else {
+                    try {
+                        if (b.request instanceof HttpServletRequestWrapper wrapper) {
+                            HttpServletRequest hsr = wrapper;
+                            while (hsr instanceof HttpServletRequestWrapper w) {
+                                hsr = (HttpServletRequest) w.getRequest();
+                                o = attributeWithoutException(hsr, s);
+                                if (o == null || o instanceof String) {
+                                    name = (String) o;
+                                    break;
+                                }
+                            }
+                        }
+                    } catch (Exception ex) {
+                        logger.warn("", ex);
+                    }
+                }
+            }
+        }
+
+        if (name == null && checkCase) {
+            return getHeader(s.toLowerCase(), false);
+        }
+
+        if (name == null && "connection".equalsIgnoreCase(s)) {
+            return "keep-alive";
+        }
+
+        return name;
+    }
+
+    @Override
+    public String getParameter(String s) {
+        String name = isNotNoOps() ? b.request.getParameter(s) : null;
+        if (name == null) {
+            String[] values = b.queryStrings.get(s);
+            if (values != null) {
+                return values[0];
+            }
+        }
+        return name;
+    }
+
+
+    @Override
+    public Map<String, String[]> getParameterMap() {
+        if (!queryComputed) {
+            queryComputed = true;
+            Map<String, String[]> m = (isNotNoOps() ? b.request.getParameterMap() : Collections.emptyMap());
+            for (String e : m.keySet()) {
+                var values = getParameterValues(e);
+                if (values != null) {
+                    b.queryStrings.put(e, values);
+                }
+            }
+        }
+        return Collections.unmodifiableMap(b.queryStrings);
+    }
+
+    @Override
+    public Enumeration<String> getParameterNames() {
+        return Collections.enumeration(getParameterMap().keySet());
+    }
+
+    @Override
+    public String[] getParameterValues(String s) {
+        String[] list = b.request.getParameterValues(s);
+        if (list != null && b.queryStrings.get(s) != null) {
+            String[] newList = b.queryStrings.get(s);
+            if (!Arrays.deepEquals(list, newList)) {
+                String[] s1 = new String[list.length + newList.length];
+                System.arraycopy(list, 0, s1, 0, list.length);
+                System.arraycopy(newList, 0, s1, list.length, newList.length);
+                return s1;
+            } else {
+                return list;
+            }
+        } else {
+            return list == null ? b.queryStrings.get(s) : list;
+        }
+    }
+
+    @Override
+    public String getProtocol() {
+        return b.request.getProtocol();
+    }
+
+    @Override
+    public ServletInputStream getInputStream() throws IOException {
+        if (b.body.isEmpty()) {
+            configureStream();
+            return bis == null ? (isNotNoOps() ? b.request.getInputStream() : voidStream) : bis;
+        } else if (b.body.hasString()) {
+            bis = new InputStreamServletAdapter(new ByteArrayInputStream(b.body.asString().getBytes()));
+        } else if (b.body.hasBytes()) {
+            bis = new InputStreamServletAdapter(new ByteArrayInputStream(b.body.asBytes(), b.body.byteOffset(), b.body.byteLength()));
+        }
+        return bis;
+    }
+
+    @Override
+    public BufferedReader getReader() throws IOException {
+        if (b.body.isEmpty()) {
+            configureReader();
+            return br == null ? (isNotNoOps() ? b.request.getReader() : getVoidReader()) : br;
+        } else if (b.body.hasString()) {
+            br = new BufferedReader(new StringReader(body().asString()));
+        } else if (b.body.hasBytes()) {
+            br = new BufferedReader(new StringReader(new String(body().asBytes(), body().byteOffset(), body().byteLength())));
+        }
+        return br;
+    }
+
+    @SuppressWarnings("deprecation")
+    @Override
+    public String getRealPath(String path) {
+        return b.request.getServletContext().getRealPath(path);
+    }
+
+    @Override
+    public AtmosphereRequest headers(Map<String, String> headers) {
+        headers.forEach((name, value) -> {
+            if (value == null) {
+                b.headers.remove(name);
+            } else {
+                b.headers.put(name, value);
+            }
+        });
+        return this;
+    }
+
+    @Override
+    public AtmosphereRequest header(String name, String value) {
+        if (value == null) {
+            b.headers.remove(name);
+        } else {
+            b.headers.put(name, value);
+        }
+        return this;
+    }
+
+    @Override
+    public AtmosphereRequest queryString(String qs) {
+
+        if (qs == null) return this;
+
+        if (!qs.isEmpty()) {
+            var decoder = new QueryStringDecoder(getRequestURI() + "?" + qs);
+            Map<String, List<String>> m = decoder.getParameters();
+            var newM = new HashMap<String, String[]>();
+            for (Map.Entry<String, List<String>> q : m.entrySet()) {
+                newM.put(q.getKey(), q.getValue().toArray(new String[0]));
+            }
+            b.queryStrings(newM);
+        }
+        b.queryString = qs;
+        return this;
+    }
+
+    @Override
+    public Map<String, String> headersMap() {
+        return b.headers;
+    }
+
+    @Override
+    public Map<String, String[]> queryStringsMap() {
+        return b.queryStrings;
+    }
+
+    @Override
+    public AtmosphereRequest method(String m) {
+        b.method(m);
+        return this;
+    }
+
+    @Override
+    public AtmosphereRequest contentType(String m) {
+        b.contentType(m);
+        return this;
+    }
+
+    @Override
+    public AtmosphereRequest body(String body) {
+        b.body = new Body.StringBody(body);
+        return this;
+    }
+
+    @Override
+    public AtmosphereRequest body(byte[] bytes) {
+        b.body = new Body.BytesBody(bytes, 0, bytes.length);
+        return this;
+    }
+
+    @Override
+    public AtmosphereRequest body(InputStream body) {
+        bis = new InputStreamServletAdapter(body);
+        br = new BufferedReader(new InputStreamReader(body));
+        return this;
+    }
+
+    @Override
+    public AtmosphereRequest body(Reader body) {
+        bis = new InputStreamServletAdapter(new ReaderInputStream(body));
+        br = new BufferedReader(body);
+        return this;
+    }
+
+    @Override
+    public Body body() {
+        return b.body;
+    }
+
+    @Override
+    public AtmosphereRequest servletPath(String servletPath) {
+        b.servletPath = servletPath;
+        return this;
+    }
+
+    @Override
+    public AtmosphereRequest contextPath(String contextPath) {
+        b.contextPath = contextPath;
+        return this;
+    }
+
+    @Override
+    public AtmosphereRequest requestURI(String requestURI) {
+        b.requestURI = requestURI;
+        return this;
+    }
+
+    @Override
+    public void setAttribute(String s, Object o) {
+        if (o == null) {
+            removeAttribute(s);
+            return;
+        }
+        b.localAttributes.put(s, o);
+        if (isNotNoOps() && !destroyed.get()) {
+            try {
+                b.requestLock.lock();
+                try {
+                    b.request.setAttribute(s, o);
+                } finally {
+                    b.requestLock.unlock();
+                }
+            } catch (NullPointerException ex) {
+                // https://github.com/Atmosphere/atmosphere/issues/1806
+                logger.trace("", ex);
+            }
+        }
+    }
+
+    @Override
+    public void setCharacterEncoding(String env) throws UnsupportedEncodingException {
+        b.request.setCharacterEncoding(env);
+    }
+
+    @Override
+    public AsyncContext startAsync() {
+        AsyncContext ac;
+        if (AtmosphereResource.TRANSPORT.WEBSOCKET == resource().transport()) {
+            noopsAsyncContextStarted = true;
+            ac = new NoOpsAsyncContext(getRequest(), resource().getResponse().getResponse());
+        } else {
+            ac = b.request.startAsync();
+        }
+        return isCompletionAware()
+                ? new CompletionAwareAsyncContext(ac, (CompletionAware) resource().getResponse()) : ac;
+    }
+
+    @Override
+    public AsyncContext startAsync(ServletRequest request, ServletResponse response) {
+        AsyncContext ac;
+        if (AtmosphereResource.TRANSPORT.WEBSOCKET == resource().transport()) {
+            noopsAsyncContextStarted = true;
+            ac = new NoOpsAsyncContext(request, response);
+        } else {
+            ac = b.request.startAsync(request, response);
+        }
+        return isCompletionAware()
+                ? new CompletionAwareAsyncContext(ac, (CompletionAware) resource().getResponse()) : ac;
+    }
+
+    @Override
+    public AsyncContext getAsyncContext() {
+        AsyncContext ac;
+        if (AtmosphereResource.TRANSPORT.WEBSOCKET == resource().transport()) {
+            noopsAsyncContextStarted = true;
+            ac = new NoOpsAsyncContext(getRequest(), resource().getResponse().getResponse());
+        } else {
+            ac = b.request.getAsyncContext();
+        }
+        return isCompletionAware()
+                ? new CompletionAwareAsyncContext(ac, (CompletionAware) resource().getResponse()) : ac;
+    }
+
+    @Override
+    public Object getAttribute(String s) {
+        return b.localAttributes.get(s) != null ? b.localAttributes.get(s) : (isNotNoOps() ? attributeWithoutException(b.request, s) : null);
+    }
+
+    @Override
+    public void removeAttribute(String name) {
+
+        b.localAttributes.remove(name);
+        if (isNotNoOps() && !destroyed.get()) {
+            b.requestLock.lock();
+            try {
+                b.request.removeAttribute(name);
+            } finally {
+                b.requestLock.unlock();
+            }
+        }
+    }
+
+    @Override
+    public HttpSession getSession() {
+        return getSession(true);
+    }
+
+    @Override
+    public HttpSession getSession(boolean create) {
+        if (b.webSocketFakeSession != null) {
+            return b.webSocketFakeSession;
+        }
+
+        if (resource() != null) {
+            // UGLY, but we need to prevent looping here.
+            HttpSession session = ((AtmosphereResourceImpl) resource()).session;
+            try {
+                if (session != null) {
+                    // check if session is valid (isNew() will throw if not)
+                    session.isNew();
+                    return session;
+                }
+            } catch (IllegalStateException e) {
+                // session has been invalidated
+            }
+        }
+
+        try {
+            return b.request.getSession(create);
+        } catch (java.lang.IllegalStateException ex) {
+            // JettyAsyncSupportListenerAdapter
+            if (ex.getMessage() != null && ex.getMessage().equals("No SessionManager")) {
+                return null;
+            }
+            throw ex;
+        } catch (NullPointerException ex) {
+            // GLASSFISH http://java.net/jira/browse/GLASSFISH-18856
+            try {
+                return b.request.getSession(create);
+            } catch (Exception e) {
+                logger.trace("", ex);
+                return null;
+            }
+        } catch (RuntimeException ex) {
+            // https://github.com/Atmosphere/atmosphere/issues/1974
+            logger.trace("", ex);
+            if (ex.getMessage() != null && ex.getMessage().contains("SESN0007E")) {
+                return null;
+            }
+            throw ex;
+        }
+    }
+
+    @Override
+    public Principal getUserPrincipal() {
+        return b.principal != null ? b.principal : b.request.getUserPrincipal();
+    }
+
+    @Override
+    public boolean isRequestedSessionIdFromCookie() {
+        return b.request.isRequestedSessionIdFromCookie();
+    }
+
+    @SuppressWarnings("deprecation")
+    @Override
+    public boolean isRequestedSessionIdFromUrl() {
+        return b.request.isRequestedSessionIdFromURL();
+    }
+
+    @Override
+    public boolean isRequestedSessionIdFromURL() {
+        return b.request.isRequestedSessionIdFromURL();
+    }
+
+    @Override
+    public boolean isRequestedSessionIdValid() {
+        return b.request.isRequestedSessionIdValid();
+    }
+
+    @Override
+    public boolean isUserInRole(String role) {
+        return b.request.isUserInRole(role);
+    }
+
+    @Override
+    public void login(String username, String password) throws ServletException {
+        b.request.login(username, password);
+    }
+
+    @Override
+    public void logout() throws ServletException {
+        b.request.logout();
+    }
+
+    @Override
+    public String getRemoteAddr() {
+        return isNotNoOps() ? b.request.getRemoteAddr() : b.lazyRemote != null ? b.lazyRemote.getHostAddress() : b.remoteAddr;
+    }
+
+    @Override
+    public String getRemoteHost() {
+        return isNotNoOps() ? b.request.getRemoteHost() : b.lazyRemote != null ? b.lazyRemote.getHostName() : b.remoteHost;
+    }
+
+    @Override
+    public int getRemotePort() {
+        return isNotNoOps() ? b.request.getRemotePort() : b.lazyRemote != null ? b.lazyRemote.getPort() : b.remotePort;
+    }
+
+    @Override
+    public RequestDispatcher getRequestDispatcher(String path) {
+        return b.request.getRequestDispatcher(path);
+    }
+
+    @Override
+    public String getScheme() {
+        return b.request.getScheme();
+    }
+
+    @Override
+    public String getServerName() {
+        return !b.serverName.isEmpty() ? b.serverName : b.request.getServerName();
+    }
+
+    @Override
+    public int getServerPort() {
+        return b.serverPort != 0 ? b.serverPort : b.request.getServerPort();
+    }
+
+    @Override
+    public ServletContext getServletContext() {
+        return b.request.getServletContext();
+    }
+
+    @Override
+    public boolean isAsyncStarted() {
+        if (AtmosphereResource.TRANSPORT.WEBSOCKET == resource().transport()) {
+            return noopsAsyncContextStarted;
+        }
+        try {
+            return b.request.isAsyncStarted();
+        } catch (Throwable ex) {
+            logger.trace("", ex);
+            return false;
+        }
+    }
+
+    @Override
+    public boolean isAsyncSupported() {
+        try {
+            return b.request.isAsyncSupported();
+        } catch (Throwable ex) {
+            // Servlet 2.5 incompatible API.
+            logger.trace("", ex);
+            return false;
+        }
+    }
+
+    @Override
+    public boolean isSecure() {
+        return isNotNoOps() ? b.request.isSecure() : b.isSecure;
+    }
+
+    @Override
+    public String getLocalName() {
+        return isNotNoOps() ? b.request.getLocalName() : b.lazyLocal != null ? b.lazyLocal.getHostName() : b.localName;
+    }
+
+    @Override
+    public int getLocalPort() {
+        return isNotNoOps() ? b.request.getLocalPort() : b.lazyLocal != null ? b.lazyLocal.getPort() : b.localPort;
+    }
+
+    @Override
+    public String getLocalAddr() {
+        return isNotNoOps() ? b.request.getLocalAddr() : b.lazyLocal != null ? b.lazyLocal.getHostAddress() : b.localAddr;
+    }
+
+    private boolean isNotNoOps() {
+        return !(b.request instanceof org.atmosphere.cpr.NoOpsRequest);
+    }
+
+    @Override
+    public Locale getLocale() {
+        return isNotNoOps() ? b.request.getLocale() : b.locales.iterator().hasNext() ? b.locales.iterator().next() : Locale.getDefault();
+    }
+
+    @Override
+    public AtmosphereResource resource() {
+        try {
+            Object o = getAttribute(FrameworkConfig.ATMOSPHERE_RESOURCE);
+            if (!(o instanceof AtmosphereResource r)) {
+                // WebSphere is in trouble.
+                return null;
+            }
+            return r;
+        } catch (Exception ex) {
+            logger.warn("", ex);
+            return null;
+        }
+    }
+
+    @Override
+    public Enumeration<Locale> getLocales() {
+        return isNotNoOps() ? b.request.getLocales() : Collections.enumeration(b.locales);
+    }
+
+    @Override
+    public boolean dispatchRequestAsynchronously() {
+        return b.dispatchRequestAsynchronously;
+    }
+
+    @Override
+    public boolean isDestroyable() {
+        return b.destroyable;
+    }
+
+    @Override
+    public AtmosphereRequest pathInfo(String pathInfo) {
+        b.pathInfo = pathInfo;
+        return this;
+    }
+
+    @Override
+    public Enumeration<String> getAttributeNames() {
+        var l = new HashSet<String>(b.localAttributes.unmodifiableMap().keySet());
+
+        if (isNotNoOps()) {
+            b.requestLock.lock();
+            try {
+                l.addAll(Collections.list(b.request.getAttributeNames()));
+            } finally {
+                b.requestLock.unlock();
+            }
+        }
+        return Collections.enumeration(l);
+    }
+
+    private static Object attributeWithoutException(HttpServletRequest request, String attribute) {
+        try {
+            return request.getAttribute(attribute);
+        } catch (NullPointerException ex) {
+            // https://github.com/Atmosphere/atmosphere/issues/1732
+            logger.trace("Unexpected NPE", ex);
+            return "";
+        }
+    }
+
+    @Override
+    public LocalAttributes localAttributes() {
+        return b.localAttributes;
+    }
+
+    @Override
+    public String getCharacterEncoding() {
+        return b.request.getCharacterEncoding() == null ? b.encoding : b.request.getCharacterEncoding();
+    }
+
+    @Override
+    public int getContentLength() {
+        if (b.contentLength == null) {
+            return b.request.getContentLength();
+        } else {
+            return b.contentLength.intValue();
+        }
+    }
+
+    @Override
+    public String uuid() {
+        if (Objects.equals(uuid, "0")) {
+            this.uuid = resource() != null ? resource().uuid() : "0";
+        }
+        return uuid;
+    }
+
+    @Override
+    public void destroy() {
+        destroy(b.destroyable);
+    }
+
+    @Override
+    public void destroy(boolean force) {
+        if (!force) return;
+        destroyed.set(true);
+        b.localAttributes.clear();
+        if (bis != null) {
+            try {
+                bis.close();
+            } catch (IOException e) {
+                // Best-effort close during destroy
+            }
+        }
+
+        if (br != null) {
+            try {
+                br.close();
+            } catch (IOException e) {
+                // Best-effort close during destroy
+            }
+        }
+
+        b.headers.clear();
+        b.queryStrings.clear();
+    }
+
+    @Override
+    public void setRequest(ServletRequest request) {
+        super.setRequest(request);
+        if (request instanceof HttpServletRequest httpServletRequest) {
+            b.request = httpServletRequest;
+        }
+    }
+
+    public final static class Builder implements AtmosphereRequest.Builder {
+        private static final Body NULL_BODY = new Body.EmptyBody();
+        private final ReentrantLock requestLock = new ReentrantLock();
+        private HttpServletRequest request;
+        private String pathInfo = "";
+        private String encoding = "UTF-8";
+        private String methodType;
+        private String contentType;
+        private boolean noContentType;
+        private Long contentLength;
+        private Map<String, String> headers = new ConcurrentHashMap<>();
+        private Map<String, String[]> queryStrings = new ConcurrentHashMap<>();
+        private String servletPath = "";
+        private String requestURI;
+        private String requestURL;
+        private InputStream inputStream;
+        private Reader reader;
+        private String remoteAddr = "";
+        private String remoteHost = "";
+        private int remotePort;
+        private String localAddr = "";
+        private String localName = "";
+        private int localPort;
+        private boolean dispatchRequestAsynchronously;
+        private boolean destroyable = true;
+        private Set<Cookie> cookies = ConcurrentHashMap.newKeySet();
+        private final Set<Locale> locales = ConcurrentHashMap.newKeySet();
+        private Principal principal;
+        private String authType;
+        private String contextPath = "";
+        private String serverName = "";
+        private int serverPort;
+        private HttpSession webSocketFakeSession;
+        private String queryString = "";
+        private boolean isSecure;
+        // Callable to lazily execute.
+        private LazyComputation lazyRemote;
+        private LazyComputation lazyLocal;
+        public Body body;
+        private LocalAttributes localAttributes = new LocalAttributes();
+
+        public Builder() {
+        }
+
+        @Override
+        public Builder destroyable(boolean destroyable) {
+            this.destroyable = destroyable;
+            return this;
+        }
+
+        @Override
+        public Builder headers(Map<String, String> headers) {
+            this.headers = new ConcurrentHashMap<>();
+            headers.forEach((k, v) -> {
+                if (k != null && v != null) {
+                    this.headers.put(k, v);
+                }
+            });
+            return this;
+        }
+
+        @Override
+        public Builder cookies(Set<Cookie> cookies) {
+            this.cookies = cookies;
+            return this;
+        }
+
+        @Override
+        public Builder dispatchRequestAsynchronously(boolean dispatchRequestAsynchronously) {
+            this.dispatchRequestAsynchronously = dispatchRequestAsynchronously;
+            return this;
+        }
+
+        @Override
+        public Builder remoteAddr(String remoteAddr) {
+            this.remoteAddr = remoteAddr;
+            return this;
+        }
+
+        @Override
+        public Builder remoteHost(String remoteHost) {
+            this.remoteHost = remoteHost;
+            return this;
+        }
+
+        @Override
+        public Builder remotePort(int remotePort) {
+            this.remotePort = remotePort;
+            return this;
+        }
+
+        @Override
+        public Builder localAddr(String localAddr) {
+            this.localAddr = localAddr;
+            return this;
+        }
+
+        @Override
+        public Builder localName(String localName) {
+            this.localName = localName;
+            return this;
+        }
+
+        @Override
+        public Builder localPort(int localPort) {
+            this.localPort = localPort;
+            return this;
+        }
+
+        @Override
+        public Builder remoteInetSocketAddress(Callable<InetSocketAddress> remoteAddr, boolean disableDnsLookup) {
+            this.lazyRemote = new LazyComputation(remoteAddr, disableDnsLookup);
+            return this;
+        }
+
+        @Override
+        public Builder localInetSocketAddress(Callable<InetSocketAddress> localAddr, boolean disableDnsLookup) {
+            this.lazyLocal = new LazyComputation(localAddr, disableDnsLookup);
+            return this;
+        }
+
+        @Override
+        public Builder attributes(Map<String, Object> attributes) {
+            localAttributes = new LocalAttributes(attributes);
+            return this;
+        }
+
+        @Override
+        public Builder request(HttpServletRequest request) {
+            this.request = request;
+            return this;
+        }
+
+        @Override
+        public Builder servletPath(String servletPath) {
+            this.servletPath = servletPath;
+            return this;
+        }
+
+        @Override
+        public Builder requestURI(String requestURI) {
+            this.requestURI = requestURI;
+            return this;
+        }
+
+        @Override
+        public Builder requestURL(String requestURL) {
+            this.requestURL = requestURL;
+            return this;
+        }
+
+        @Override
+        public Builder pathInfo(String pathInfo) {
+            this.pathInfo = pathInfo;
+            return this;
+        }
+
+        @Override
+        public Builder queryString(String queryString) {
+            this.queryString = queryString;
+            return this;
+        }
+
+        @Override
+        public Builder body(byte[] dataBytes) {
+            return body(dataBytes, 0, dataBytes.length);
+        }
+
+        @Override
+        public Builder body(byte[] dataBytes, int offset, int length) {
+            this.body = new Body.BytesBody(dataBytes, offset, length);
+            return this;
+        }
+
+        @Override
+        public Builder encoding(String encoding) {
+            this.encoding = encoding;
+            return this;
+        }
+
+        @Override
+        public Builder method(String methodType) {
+            this.methodType = methodType;
+            return this;
+        }
+
+        @Override
+        public Builder contentType(String contentType) {
+            this.contentType = contentType;
+            if (contentType == null) {
+                noContentType = true;
+            }
+            return this;
+        }
+
+        @Override
+        public Builder contentLength(Long contentLength) {
+            this.contentLength = contentLength;
+            return this;
+        }
+
+        @Override
+        public Builder body(String data) {
+            this.body = new Body.StringBody(data);
+            return this;
+        }
+
+        @Override
+        public Builder inputStream(InputStream inputStream) {
+            this.inputStream = inputStream;
+            return this;
+        }
+
+        @Override
+        public Builder reader(Reader reader) {
+            this.reader = reader;
+            return this;
+        }
+
+        @Override
+        public AtmosphereRequest build() {
+            if (body == null) {
+                body = NULL_BODY;
+            }
+            return new AtmosphereRequestImpl(this);
+        }
+
+        @Override
+        public Builder queryStrings(Map<String, String[]> queryStrings) {
+            this.queryStrings = new ConcurrentHashMap<>();
+            queryStrings.forEach((k, v) -> {
+                if (k != null && v != null) {
+                    this.queryStrings.put(k, v);
+                }
+            });
+            return this;
+        }
+
+        @Override
+        public Builder contextPath(String contextPath) {
+            this.contextPath = contextPath == null ? "" : contextPath;
+            return this;
+        }
+
+        @Override
+        public Builder serverName(String serverName) {
+            this.serverName = serverName;
+            return this;
+        }
+
+        @Override
+        public Builder serverPort(int serverPort) {
+            this.serverPort = serverPort;
+            return this;
+        }
+
+        @Override
+        public Builder session(HttpSession session) {
+            if (request == null) {
+                request = new org.atmosphere.cpr.NoOpsRequest();
+            }
+
+            if (request instanceof org.atmosphere.cpr.NoOpsRequest noOpsRequest) {
+                noOpsRequest.fake = session;
+            } else {
+                webSocketFakeSession = session;
+            }
+            return this;
+        }
+
+        @Override
+        public Builder principal(Principal principal) {
+            this.principal = principal;
+            return this;
+        }
+
+        @Override
+        public Builder authType(String authType) {
+            this.authType = authType;
+            return this;
+        }
+
+        @Deprecated
+        @Override
+        public Builder isSSecure(boolean isSecure) {
+            this.isSecure = isSecure;
+            return this;
+        }
+
+        @Override
+        public Builder isSecure(boolean isSecure) {
+            this.isSecure = isSecure;
+            return this;
+        }
+
+        @Override
+        public Builder locale(Locale locale) {
+            locales.add(locale);
+            return this;
+        }
+
+        @Override
+        public Builder userPrincipal(Principal userPrincipal) {
+            this.principal = userPrincipal;
+            return this;
+        }
+    }
+
+    public sealed interface Body permits Body.StringBody, Body.BytesBody, Body.EmptyBody {
+
+        /**
+         * True is the body is a String
+         *
+         * @return True is the body is a String
+         */
+        boolean hasString();
+
+        /**
+         * True is the body is a byte array
+         *
+         * @return True is the body is a byte array
+         */
+        boolean hasBytes();
+
+        /**
+         * Return the request body as a String. If the body was a byte array, this method will return null.
+         *
+         * @return the request body as a String. If the body was a byte array, this method will return null.
+         */
+        String asString();
+
+        /**
+         * Return the request body as a byte array. If the body was String, this method will return null.
+         *
+         * @return the request body as a byte array. If the body was String, this method will return null.
+         */
+        byte[] asBytes();
+
+        /**
+         * The {@link #asBytes()} offset
+         *
+         * @return The {@link #asBytes()} offset
+         */
+        int byteOffset();
+
+        /**
+         * The {@link #asBytes()} length
+         *
+         * @return The {@link #asBytes()} length
+         */
+        int byteLength();
+
+        /**
+         * True if this object is empty
+         *
+         * @return True if this object is empty
+         */
+        boolean isEmpty();
+
+        record StringBody(String data) implements Body {
+            @Override public boolean hasString() { return true; }
+            @Override public boolean hasBytes() { return false; }
+            @Override public String asString() { return data; }
+            @Override public byte[] asBytes() { return null; }
+            @Override public int byteOffset() { return 0; }
+            @Override public int byteLength() { return 0; }
+            @Override public boolean isEmpty() { return false; }
+        }
+
+        record BytesBody(byte[] data, int offset, int length) implements Body {
+            @Override public boolean hasString() { return false; }
+            @Override public boolean hasBytes() { return true; }
+            @Override public String asString() { return null; }
+            @Override public byte[] asBytes() { return data; }
+            @Override public int byteOffset() { return offset; }
+            @Override public int byteLength() { return length; }
+            @Override public boolean isEmpty() { return false; }
+        }
+
+        record EmptyBody() implements Body {
+            @Override public boolean hasString() { return false; }
+            @Override public boolean hasBytes() { return false; }
+            @Override public String asString() { return null; }
+            @Override public byte[] asBytes() { return null; }
+            @Override public int byteOffset() { return 0; }
+            @Override public int byteLength() { return 0; }
+            @Override public boolean isEmpty() { return true; }
+        }
+    }
+
+    /**
+     * Create an instance of this class without an associated {@link HttpServletRequest}.
+     *
+     * @return an instance of this class without an associated {@link HttpServletRequest}
+     */
+    public static AtmosphereRequest newInstance() {
+        return new Builder().build();
+    }
+
+    /**
+     * Wrap an {@link HttpServletRequest}.
+     *
+     * @param request {@link HttpServletRequest}
+     * @return an {@link AtmosphereRequest}
+     */
+    public static AtmosphereRequest wrap(HttpServletRequest request) {
+        // Do not rewrap.
+        if (request instanceof AtmosphereRequestImpl atmosphereRequestImpl) {
+            return atmosphereRequestImpl;
+        }
+
+        var b = new Builder();
+        Enumeration<String> e = request.getAttributeNames();
+        String s;
+        while (e.hasMoreElements()) {
+            s = e.nextElement();
+            Object value = attributeWithoutException(request, s);
+            if (value != null) { // Check for null values
+                b.localAttributes.put(s, value);
+            } else {
+                logger.warn("Attribute {} is null", s);
+            }
+        }
+        return b.request(request).build();
+    }
+
+
+    /**
+     * Copy the HttpServletRequest content inside an AtmosphereRequest. By default the returned AtmosphereRequest
+     * is not destroyable.
+     *
+     * @param request {@link HttpServletRequest}
+     * @return an {@link AtmosphereRequest}
+     */
+    public static AtmosphereRequest cloneRequest(HttpServletRequest request, boolean loadInMemory, boolean copySession, boolean isDestroyable, boolean createSession) {
+        Builder b;
+        HttpServletRequest r;
+
+        Cookie[] cs = request.getCookies();
+        Set<Cookie> hs = ConcurrentHashMap.newKeySet();
+        if (cs != null) {
+            Collections.addAll(hs, cs);
+        }
+
+        boolean isWrapped = false;
+        if (request instanceof AtmosphereRequestImpl atmosphereRequestImpl) {
+            b = atmosphereRequestImpl.b;
+            isWrapped = true;
+        } else {
+            b = new Builder();
+            b.request(request);
+        }
+
+        HttpSession session = request.getSession(false);
+        if (copySession) {
+            session = request.getSession(createSession);
+            if (session != null) {
+                session = new FakeHttpSession(session);
+            } else {
+                session = new FakeHttpSession("", null, System.currentTimeMillis(), -1);
+            }
+        }
+
+        b.servletPath(request.getServletPath())
+                .pathInfo(request.getPathInfo())
+                .contextPath(request.getContextPath())
+                .requestURI(request.getRequestURI())
+                .requestURL(request.getRequestURL().toString())
+                .method(request.getMethod())
+                .serverName(request.getServerName())
+                .serverPort(request.getServerPort())
+                .remoteAddr(request.getRemoteAddr())
+                .remoteHost(request.getRemoteHost())
+                .remotePort(request.getRemotePort())
+                .destroyable(isDestroyable)
+                .cookies(hs)
+                .session(session)
+                .principal(request.getUserPrincipal())
+                .authType(request.getAuthType())
+                .isSecure(request.isSecure());
+
+        if (loadInMemory) {
+            String s = (String) attributeWithoutException(request, FrameworkConfig.THROW_EXCEPTION_ON_CLONED_REQUEST);
+            boolean throwException = Boolean.parseBoolean(s);
+            r = new org.atmosphere.cpr.NoOpsRequest(throwException);
+            if (isWrapped) {
+                load(b.request, b);
+            } else {
+                load(request, b);
+            }
+            b.request(r);
+        }
+
+        return isWrapped ? (AtmosphereRequestImpl) request : b.build();
+    }
+
+    /**
+     * @deprecated Use {@link org.atmosphere.cpr.NoOpsRequest} directly instead.
+     */
+    @Deprecated
+    public static class NoOpsRequest extends org.atmosphere.cpr.NoOpsRequest {
+        public NoOpsRequest() {
+            super();
+        }
+
+        public NoOpsRequest(boolean throwExceptionOnCloned) {
+            super(throwExceptionOnCloned);
+        }
+    }
+
+    public static final class LazyComputation {
+
+        private final Callable<InetSocketAddress> callable;
+        private final boolean disableDnsLookup;
+        private InetSocketAddress address;
+
+        public LazyComputation(Callable<InetSocketAddress> callable, boolean disableDnsLookup) {
+            this.disableDnsLookup = disableDnsLookup;
+            this.callable = callable;
+        }
+
+        public InetSocketAddress address() {
+            if (address == null) {
+                try {
+                    address = callable.call();
+                } catch (Exception e) {
+                    logger.warn("", e);
+                }
+
+                // Fallback
+                if (address == null) {
+                    address = new InetSocketAddress(8080);
+                }
+            }
+            return address;
+        }
+
+        public int getPort() {
+            return address().getPort();
+        }
+
+        public String getHostAddress() {
+            return address().getAddress().getHostAddress();
+        }
+
+        public String getHostName() {
+            if (disableDnsLookup) {
+                return address().getHostString();
+            } else {
+                return address().getHostName();
+            }
+        }
+
+    }
+
+    private boolean isCompletionAware() {
+        return Boolean.parseBoolean(resource().getAtmosphereConfig()
+                .getInitParameter(ApplicationConfig.RESPONSE_COMPLETION_AWARE));
+    }
+
+    private class CompletionAwareAsyncContext implements AsyncContext {
+        private AsyncContext context;
+        private CompletionAware callback;
+
+        public CompletionAwareAsyncContext(AsyncContext context, CompletionAware callback) {
+            this.context = context;
+            this.callback = callback;
+        }
+
+        public void addListener(AsyncListener listener) throws IllegalStateException {
+            context.addListener(listener);
+        }
+
+        public void addListener(AsyncListener listener, ServletRequest request, ServletResponse response) throws IllegalStateException {
+            context.addListener(listener, request, response);
+        }
+
+        public void complete() {
+            context.complete();
+            callback.onComplete();
+        }
+
+        public <T extends AsyncListener> T createListener(Class<T> clazz) throws ServletException {
+            return context.createListener(clazz);
+        }
+
+        public void dispatch() throws IllegalStateException {
+            context.dispatch();
+        }
+
+        public void dispatch(ServletContext servletContext, String path) throws IllegalStateException {
+            context.dispatch(servletContext, path);
+        }
+
+        public void dispatch(String path) throws IllegalStateException {
+            context.dispatch(path);
+        }
+
+        public ServletRequest getRequest() {
+            return context.getRequest();
+        }
+
+        public ServletResponse getResponse() {
+            return context.getResponse();
+        }
+
+        public long getTimeout() {
+            return context.getTimeout();
+        }
+
+        public boolean hasOriginalRequestAndResponse() {
+            return context.hasOriginalRequestAndResponse();
+        }
+
+        public void setTimeout(long timeoutMilliseconds) throws IllegalStateException {
+            context.setTimeout(timeoutMilliseconds);
+        }
+
+        public void start(Runnable run) {
+            context.start(run);
+        }
+
+    }
+
+    private class NoOpsAsyncContext implements AsyncContext {
+        private final ServletRequest request;
+        private final ServletResponse response;
+        private long timeout;
+
+        public NoOpsAsyncContext(ServletRequest request, ServletResponse response) {
+            this.request = request;
+            this.response = response;
+            this.timeout = -1;
+        }
+
+        @Override
+        public void addListener(AsyncListener listener) throws IllegalStateException {
+        }
+
+        @Override
+        public void addListener(AsyncListener listener, ServletRequest request, ServletResponse response) throws IllegalStateException {
+        }
+
+        @Override
+        public void complete() {
+        }
+
+        @Override
+        public <T extends AsyncListener> T createListener(Class<T> clazz) throws ServletException {
+            throw new ServletException("Not supported");
+        }
+
+        @Override
+        public void dispatch() throws IllegalStateException {
+        }
+
+        @Override
+        public void dispatch(ServletContext servletContext, String path) throws IllegalStateException {
+        }
+
+        @Override
+        public void dispatch(String path) throws IllegalStateException {
+        }
+
+        @Override
+        public ServletRequest getRequest() {
+            return request;
+        }
+
+        @Override
+        public ServletResponse getResponse() {
+            return response;
+        }
+
+        @Override
+        public long getTimeout() {
+            return timeout;
+        }
+
+        @Override
+        public boolean hasOriginalRequestAndResponse() {
+            return false;
+        }
+
+        @Override
+        public void setTimeout(long timeout) throws IllegalStateException {
+            this.timeout = timeout;
+        }
+
+        @Override
+        public void start(Runnable run) {
+            throw new RuntimeException("Not supported");
+        }
+    }
+
+    private static void load(HttpServletRequest request, Builder b) {
+        Enumeration<String> e = request.getHeaderNames();
+        String s;
+        while (e.hasMoreElements()) {
+            s = e.nextElement();
+            var headerValue = request.getHeader(s);
+            if (headerValue != null) {
+                b.headers.put(s, headerValue);
+            }
+        }
+        b.requestLock.lock();
+        try {
+            e = request.getAttributeNames();
+        } finally {
+            b.requestLock.unlock();
+        }
+        while (e.hasMoreElements()) {
+            s = e.nextElement();
+            b.localAttributes.put(s, attributeWithoutException(request, s));
+        }
+
+        e = request.getParameterNames();
+        while (e.hasMoreElements()) {
+            s = e.nextElement();
+            var paramValues = request.getParameterValues(s);
+            if (paramValues != null) {
+                b.queryStrings.put(s, paramValues);
+            }
+        }
+        b.queryString = request.getQueryString();
+
+        Enumeration<Locale> l = request.getLocales();
+        while (l.hasMoreElements()) {
+            b.locale(l.nextElement());
+        }
+    }
+
+    @Override
+    public String toString() {
+        try {
+            return "AtmosphereRequest{" +
+                    " method=" + getMethod() +
+                    " contextPath=" + getContextPath() +
+                    " servletPath=" + getServletPath() +
+                    " pathInfo=" + getPathInfo() +
+                    " requestURI=" + getRequestURI() +
+                    " requestURL=" + getRequestURL() +
+                    " AtmosphereResource UUID=" + (resource() != null ? resource().uuid() : "") +
+                    " destroyable=" + b.destroyable +
+                    '}';
+        } catch (Exception e) {
+            // Jetty error
+            return "AtmosphereRequest{" +
+                    " contextPath=" + getContextPath() +
+                    " servletPath=" + getServletPath() +
+                    " pathInfo=" + getPathInfo() +
+                    " requestURI=" + getRequestURI() +
+                    " destroyable=" + b.destroyable +
+                    '}';
+
+        }
+    }
+
+    @Override
+    public String requestURL() {
+        return b.requestURL;
+    }
+}

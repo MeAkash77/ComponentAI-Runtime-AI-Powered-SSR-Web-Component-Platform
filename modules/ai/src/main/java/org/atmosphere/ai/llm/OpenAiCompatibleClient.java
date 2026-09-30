@@ -1,0 +1,1826 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.ai.llm;
+
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.ObjectMapper;
+import org.atmosphere.ai.AiEvent;
+import org.atmosphere.ai.RetryPolicy;
+import org.atmosphere.ai.StreamingSession;
+import org.atmosphere.ai.resume.DurableRunContext;
+import org.atmosphere.ai.resume.DurableRunScopeHolder;
+import org.atmosphere.ai.resume.EffectJournal;
+import org.atmosphere.ai.resume.EffectKeys;
+import org.atmosphere.ai.resume.EffectKind;
+import org.atmosphere.ai.resume.EffectRecord;
+import org.atmosphere.ai.tool.ToolBridgeUtils;
+import org.atmosphere.ai.tool.ToolDefinition;
+import org.atmosphere.ai.tool.ToolExecutionHelper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * LLM client that speaks the OpenAI-compatible chat completions API.
+ * Works with OpenAI, Google Gemini, Ollama, Azure OpenAI, Groq, Together AI,
+ * and any endpoint that implements the OpenAI streaming format.
+ *
+ * <p>Uses JDK 21's {@link HttpClient} with no external HTTP dependencies.</p>
+ *
+ * <p>Supported endpoints:</p>
+ * <ul>
+ *   <li>OpenAI: {@code https://api.openai.com/v1}</li>
+ *   <li>Gemini: {@code https://generativelanguage.googleapis.com/v1beta/openai}</li>
+ *   <li>Ollama: {@code http://localhost:11434/v1}</li>
+ *   <li>Azure: {@code https://{resource}.openai.azure.com/openai/deployments/{model}}</li>
+ * </ul>
+ */
+public class OpenAiCompatibleClient implements LlmClient {
+
+    private static final Logger logger = LoggerFactory.getLogger(OpenAiCompatibleClient.class);
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final String DATA_PREFIX = "data: ";
+    private static final String DONE_MARKER = "[DONE]";
+    // Tool-loop iteration cap is per-request via
+    // ChatCompletionRequest.toolLoopPolicy() (defaults to
+    // ToolLoopPolicy.DEFAULT which preserves the historical 5-iteration cap).
+
+    private final String baseUrl;
+    private final String apiKey;
+    private final HttpClient httpClient;
+    private final Duration timeout;
+    private final RetryPolicy retryPolicy;
+    /**
+     * Opt-in framework-level generation overrides (temperature, max_tokens,
+     * top_p, stop) sourced from {@link org.atmosphere.ai.AiConfig.LlmSettings}.
+     * Never {@code null} — the builder defaults it to
+     * {@link org.atmosphere.ai.GenerationParams#defaults()} (all unset), which
+     * keeps the request body byte-identical to the pre-feature behavior. Each
+     * set component is applied in {@link #buildRequestBody} and
+     * {@link #buildResponsesApiBody}; an unset component leaves today's wire
+     * shape untouched (Correctness Invariant #7 — the same override reaches
+     * both the chat-completions and Responses-API body builders).
+     */
+    private final org.atmosphere.ai.GenerationParams generation;
+    /**
+     * Caller-supplied headers attached to every outgoing HTTP request, in
+     * insertion order. Used for proxy routing (Helicone, OpenRouter), per-
+     * tenant identifiers, request tracing, or any provider-specific header
+     * the rest of the builder API does not surface explicitly. Reserved
+     * names ({@code Authorization}, {@code Content-Type}, {@code Accept})
+     * are filtered out at request-build time so the client's own protocol
+     * headers cannot be overridden accidentally.
+     */
+    private final java.util.Map<String, String> customHeaders;
+
+    /**
+     * Max cached conversation IDs for Responses API stateful continuation.
+     * Subsequent turns send only {@code previous_response_id} instead of
+     * the full conversation history.
+     */
+    private static final int MAX_RESPONSE_CACHE_SIZE = 1000;
+    private final Map<String, String> responseIdCache = java.util.Collections.synchronizedMap(
+            new java.util.LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+                    return size() > MAX_RESPONSE_CACHE_SIZE;
+                }
+            });
+
+    private OpenAiCompatibleClient(String baseUrl, String apiKey, HttpClient httpClient,
+                                   Duration timeout, RetryPolicy retryPolicy,
+                                   java.util.Map<String, String> customHeaders,
+                                   org.atmosphere.ai.GenerationParams generation) {
+        this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
+        this.apiKey = apiKey;
+        this.httpClient = httpClient;
+        this.timeout = timeout;
+        this.retryPolicy = retryPolicy;
+        this.customHeaders = customHeaders;
+        this.generation = generation != null
+                ? generation : org.atmosphere.ai.GenerationParams.defaults();
+    }
+
+    /**
+     * Returns the framework-level generation overrides this client applies to
+     * every outgoing request body. Never {@code null}; defaults to
+     * {@link org.atmosphere.ai.GenerationParams#defaults()} (all unset).
+     * Package-private so the body-shape tests can assert the builder wiring.
+     */
+    org.atmosphere.ai.GenerationParams generation() {
+        return generation;
+    }
+
+    /**
+     * Returns the caller-supplied headers attached to every outgoing
+     * request. Immutable view; never {@code null}.
+     */
+    public java.util.Map<String, String> customHeaders() {
+        return customHeaders;
+    }
+
+    /**
+     * Returns the API key configured for this client (may be null).
+     */
+    public String apiKey() {
+        return apiKey;
+    }
+
+    /**
+     * Returns the instance-level {@link RetryPolicy} — the fallback used
+     * when a {@link ChatCompletionRequest} does not carry its own override.
+     * Package-private because callers should rely on the per-request
+     * override path for production use; the accessor exists so tests can
+     * verify the builder wiring without reaching into private state.
+     */
+    RetryPolicy retryPolicy() {
+        return retryPolicy;
+    }
+
+    /**
+     * Returns the base URL this client targets. Package-private: the
+     * accessor exists so the quick-factory tests can verify each factory's
+     * encoded endpoint without reaching into private state.
+     */
+    String baseUrl() {
+        return baseUrl;
+    }
+
+    /**
+     * Create a new builder.
+     */
+    public static Builder builder() {
+        return new Builder();
+    }
+
+    /**
+     * Quick factory for common configurations.
+     */
+    public static OpenAiCompatibleClient gemini(String apiKey) {
+        return builder()
+                .baseUrl("https://generativelanguage.googleapis.com/v1beta/openai")
+                .apiKey(apiKey)
+                .build();
+    }
+
+    /**
+     * Quick factory for local Ollama.
+     */
+    public static OpenAiCompatibleClient ollama() {
+        return builder()
+                .baseUrl("http://localhost:11434/v1")
+                .build();
+    }
+
+    /**
+     * Quick factory for OpenAI.
+     */
+    public static OpenAiCompatibleClient openai(String apiKey) {
+        return builder()
+                .baseUrl("https://api.openai.com/v1")
+                .apiKey(apiKey)
+                .build();
+    }
+
+    /**
+     * Quick factory for a local LiteLLM proxy on its default port
+     * ({@code http://localhost:4000/v1}). LiteLLM exposes an
+     * OpenAI-compatible endpoint that fronts many upstream providers behind a
+     * single gateway, so it reuses this client unchanged.
+     *
+     * @param apiKey the LiteLLM proxy virtual/master key; may be {@code null}
+     *               for an unsecured local proxy
+     */
+    public static OpenAiCompatibleClient litellm(String apiKey) {
+        return litellm("http://localhost:4000/v1", apiKey);
+    }
+
+    /**
+     * Quick factory for a LiteLLM proxy at an explicit base URL. Point
+     * {@code baseUrl} at the proxy's OpenAI-compatible endpoint (typically
+     * ending in {@code /v1}).
+     *
+     * @param baseUrl the LiteLLM proxy base URL, e.g.
+     *                {@code https://litellm.internal.example.com/v1}
+     * @param apiKey  the LiteLLM proxy virtual/master key; may be {@code null}
+     *                for an unsecured proxy
+     */
+    public static OpenAiCompatibleClient litellm(String baseUrl, String apiKey) {
+        return builder()
+                .baseUrl(baseUrl)
+                .apiKey(apiKey)
+                .build();
+    }
+
+    @Override
+    public void streamChatCompletion(ChatCompletionRequest request, StreamingSession session) {
+        streamChatCompletion(request, session, null, null);
+    }
+
+    @Override
+    public void streamChatCompletion(ChatCompletionRequest request, StreamingSession session,
+                                     java.util.concurrent.atomic.AtomicBoolean cancelled,
+                                     java.util.function.Consumer<java.io.Closeable> streamSink) {
+        var effective = cancelled != null
+                ? cancelled
+                : new java.util.concurrent.atomic.AtomicBoolean();
+        // Native-logprobs accumulator, one per top-level stream (it spans
+        // tool-loop rounds so the aggregate reflects the whole response).
+        // Null when the request did not opt in — the SSE forwarders then add
+        // zero capture overhead and the wire behavior is unchanged.
+        var logprobTokens = request.logprobs()
+                ? new ArrayList<org.atmosphere.ai.TokenLogprob>() : null;
+        try {
+            doStreamWithToolLoop(request, session, 0, effective, streamSink, logprobTokens);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            session.error(e);
+        } catch (java.io.IOException e) {
+            // Expected path when cancel() closes the in-flight InputStream from
+            // another thread — the blocked readLine() unwinds with "Stream
+            // closed" or "Socket closed". Don't treat it as a hard error if
+            // cancellation was requested; fall through to session.error()
+            // otherwise so upstream failures still surface.
+            if (effective.get()) {
+                logger.debug("Built-in stream cancelled via InputStream.close()");
+                if (!session.isClosed()) {
+                    session.complete();
+                }
+            } else {
+                logger.error("Error during chat completion streaming", e);
+                if (!session.isClosed()) {
+                    session.error(e);
+                }
+            }
+        } catch (Exception e) {
+            logger.error("Error during chat completion streaming", e);
+            if (!session.isClosed()) {
+                session.error(e);
+            }
+        }
+    }
+
+    private void doStreamWithToolLoop(ChatCompletionRequest request,
+                                      StreamingSession session, int toolRound,
+                                      java.util.concurrent.atomic.AtomicBoolean cancelled,
+                                      java.util.function.Consumer<java.io.Closeable> streamSink,
+                                      List<org.atmosphere.ai.TokenLogprob> logprobTokens)
+            throws InterruptedException, java.io.IOException {
+
+        // Durable-run round seam: when a durable scope is installed, each LLM
+        // round is recorded (assistant text + tool calls + usage) and replayed
+        // from the journal on resume with no provider HTTP call. Off this path
+        // (no scope / NOOP journal) the method is byte-identical to before.
+        var durableCtx = DurableRunScopeHolder.current(session);
+        var durable = durableCtx != null && durableCtx.journal() != EffectJournal.NOOP;
+        var roundKey = durable ? EffectKeys.llmRound(durableCtx.runId(), toolRound) : null;
+        if (durable) {
+            if (toolRound == 0) {
+                // Record the run input seed once at dispatch (full assembled
+                // history + model + tool-set digest). A crash-resume re-drives the
+                // runtime directly from this seed; on replay it is already present
+                // so this is a no-op.
+                recordSeedIfAbsent(durableCtx, request);
+            }
+            var recorded = durableCtx.journal().lookupCommitted(durableCtx.runId(), roundKey);
+            if (recorded.isPresent()) {
+                replayRound(recorded.get().resultPayload(), request, session, toolRound,
+                        cancelled, streamSink, logprobTokens);
+                return;
+            }
+            // Two-phase: record the round PENDING before dispatch; commit it
+            // after the SSE stream is fully consumed (below).
+            durableCtx.journal().appendPending(durableCtx.runId(), EffectKind.LLM_ROUND,
+                    roundKey, EffectKeys.sha256Hex(request.model(), Integer.toString(toolRound)));
+        }
+
+        var conversationId = request.conversationId();
+        // Under durable runs, force Chat Completions. The Responses API's
+        // stateful previous_response_id is process-local and lost on crash, so a
+        // re-driven Responses run cannot reuse the provider-side response cache;
+        // full chat-completions history keeps deterministic replay sound.
+        var useResponsesApi = !durable && isResponsesApiApplicable(conversationId);
+        String requestBody;
+        String endpoint;
+
+        if (useResponsesApi) {
+            var previousId = responseIdCache.get(conversationId);
+            requestBody = buildResponsesApiBody(request, previousId);
+            endpoint = baseUrl + "/responses";
+            logger.debug("Streaming via Responses API: model={}, previousResponseId={}, round={}",
+                    request.model(), previousId, toolRound);
+        } else {
+            requestBody = buildRequestBody(request);
+            endpoint = baseUrl + "/chat/completions";
+            logger.debug("Streaming chat completion: model={}, messages={}, tools={}, round={}",
+                    request.model(), request.messages().size(), request.tools().size(), toolRound);
+        }
+
+        // Observation hook: model dispatch is about to happen. Fired before
+        // sendWithRetry so listeners see request-level fan-out (one fire per
+        // tool-loop round, matching how Spring AI / LC4j / ADK observability
+        // surfaces count "model calls"). The corresponding onModelEnd fires
+        // when the streaming response has been fully consumed, see below.
+        var modelScope = org.atmosphere.ai.ModelCallScope.open(
+                request.listeners(), request.model(),
+                request.messages().size(), request.tools().size());
+
+        java.net.http.HttpResponse<java.io.InputStream> response;
+        try {
+            response = sendWithRetry(requestBody, endpoint, session, request.retryPolicy());
+        } catch (RuntimeException dispatchError) {
+            // Transport-layer failures must surface to onModelError so
+            // observability consumers can distinguish provider failures from
+            // application-side errors (e.g. tool execution exceptions).
+            modelScope.fail(dispatchError);
+            throw dispatchError;
+        }
+        if (response == null) {
+            // sendWithRetry already wrote session.error with the retried
+            // failure cause; mirror that into onModelError so the bridge stays
+            // consistent (an exhausted retry budget IS a model dispatch
+            // failure even though the helper returns null instead of
+            // throwing).
+            modelScope.fail(
+                    new LlmException("Model dispatch failed after retry budget exhausted"));
+            return;
+        }
+
+        // If the Responses API returned 404 (cache miss), fall back to Chat Completions
+        if (useResponsesApi && response.statusCode() == 404) {
+            logger.info("Responses API cache miss for conversation {}, falling back to Chat Completions",
+                    conversationId);
+            // Drain the 404 response body before retrying
+            try (var errorStream = response.body()) {
+                errorStream.readAllBytes();
+            } catch (java.io.IOException ignored) {
+                logger.trace("Failed to drain 404 response body", ignored);
+            }
+            responseIdCache.remove(conversationId);
+            var fallbackBody = buildRequestBody(request);
+            response = sendWithRetry(fallbackBody, baseUrl + "/chat/completions", session, request.retryPolicy());
+            if (response == null) {
+                return;
+            }
+            useResponsesApi = false;
+        }
+
+        var accumulators = new HashMap<Integer, ToolCallAccumulator>();
+        var toolCallsRequested = new boolean[]{false};
+        var capturedResponseId = new String[]{null};
+        // Accumulates this round's assistant text for the durable record; null
+        // off the durable path so the SSE forwarders add no capture overhead.
+        var roundText = durable ? new StringBuilder() : null;
+
+        // D-6 Built-in hard-cancel: hand the caller a reference to the in-flight
+        // InputStream BEFORE entering the blocking read loop. When the caller
+        // closes it from another thread, BufferedReader.readLine() throws
+        // IOException and the loop exits immediately — no waiting for the HTTP
+        // timeout or the next SSE line. The try-with-resources ensures the
+        // stream is still closed on normal completion.
+        var inFlightStream = response.body();
+        if (streamSink != null) {
+            streamSink.accept(inFlightStream);
+        }
+        // Per-round captured usage, populated as the SSE forwarders parse the
+        // provider's usage block. Fed to the onModelEnd listener fire at the
+        // bottom of this round so observers see the same TokenUsage record
+        // that the wire protocol carries via session.usage(). Single-element
+        // holder mirrors the existing capturedResponseId / toolCallsRequested
+        // mutable-output pattern in this method.
+        org.atmosphere.ai.TokenUsage[] capturedUsage = new org.atmosphere.ai.TokenUsage[1];
+        try (var reader = new BufferedReader(new InputStreamReader(inFlightStream, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (cancelled.get() || session.isClosed()) {
+                    break;
+                }
+                if (useResponsesApi) {
+                    processResponsesApiSSELine(line, session, accumulators,
+                            toolCallsRequested, capturedResponseId, capturedUsage, roundText,
+                            logprobTokens);
+                } else {
+                    processSSELine(line, session, accumulators, toolCallsRequested,
+                            capturedUsage, roundText, logprobTokens);
+                }
+            }
+        } catch (java.io.IOException e) {
+            if (cancelled.get()) {
+                // Expected: the caller closed the InputStream to interrupt us.
+                // Re-throw so the outer catch in streamChatCompletion can
+                // distinguish cancel from a real failure and complete the
+                // session cleanly.
+                throw e;
+            }
+            logger.error("Error reading SSE stream", e);
+            if (!session.isClosed()) {
+                session.error(e);
+            }
+            return;
+        } finally {
+            // Clear the streamSink reference so the handle's cancel() becomes
+            // a no-op once this frame has unwound. Without this, a delayed
+            // cancel after the natural completion of the loop would try to
+            // close an already-closed stream.
+            if (streamSink != null) {
+                streamSink.accept(null);
+            }
+        }
+
+        // Cache the response ID for next turn if we got one
+        if (conversationId != null && capturedResponseId[0] != null) {
+            responseIdCache.put(conversationId, capturedResponseId[0]);
+            logger.debug("Cached response ID {} for conversation {}", capturedResponseId[0], conversationId);
+        }
+
+        // Observation hook: this model dispatch round has ended (the SSE
+        // stream is fully consumed). Fires once per round — the caller's tool
+        // loop runs the same wiring on every follow-up round, so observability
+        // consumers see one onModelStart/onModelEnd pair per LLM call.
+        modelScope.complete(capturedUsage[0]);
+
+        // Commit the recorded round (two-phase) once the SSE stream is fully
+        // consumed, then continue with tool execution / recursion.
+        if (durable) {
+            durableCtx.journal().commit(durableCtx.runId(), roundKey,
+                    recordRound(roundText, accumulators, capturedUsage[0]));
+        }
+        continueAfterRound(request, session, toolRound, toolCallsRequested[0],
+                accumulators, durable, cancelled, streamSink, logprobTokens);
+    }
+
+    /**
+     * Execute the round's tool calls (if any) and recurse for the next round, or
+     * complete the session when the model returned a final answer. Extracted from
+     * {@code doStreamWithToolLoop} so the live path and the durable replay path
+     * share one implementation. On the durable path tool calls are iterated in
+     * model-emitted index order so the per-(tool,args) occurrence ordinals — and
+     * thus the tool idempotency keys — reproduce identically on replay.
+     */
+    private void continueAfterRound(ChatCompletionRequest request, StreamingSession session,
+                                    int toolRound, boolean toolCallsRequested,
+                                    Map<Integer, ToolCallAccumulator> accumulators,
+                                    boolean durable,
+                                    java.util.concurrent.atomic.AtomicBoolean cancelled,
+                                    java.util.function.Consumer<java.io.Closeable> streamSink,
+                                    List<org.atmosphere.ai.TokenLogprob> logprobTokens)
+            throws InterruptedException, java.io.IOException {
+        // If the model requested tool calls, execute them and re-submit
+        if (toolCallsRequested && !accumulators.isEmpty() && !request.tools().isEmpty()) {
+            // Per-request tool-loop policy controls both the iteration cap and
+            // the overflow behavior. The canonical-constructor default
+            // (ToolLoopPolicy.DEFAULT) preserves the historical 5-iteration
+            // cap with complete-without-tools overflow, so any caller that
+            // does not opt-in keeps the pre-policy behavior bit-identical.
+            var loopPolicy = request.toolLoopPolicy();
+            if (toolRound >= loopPolicy.maxIterations()) {
+                logger.warn("Tool loop cap ({}) reached, applying onMaxIterations={}",
+                        loopPolicy.maxIterations(), loopPolicy.onMaxIterations());
+                if (!session.isClosed()) {
+                    switch (loopPolicy.onMaxIterations()) {
+                        case COMPLETE_WITHOUT_TOOLS -> {
+                            // Terminal-path symmetry (Invariant #2): the
+                            // overflow completion emits the same confidence
+                            // signal the natural completion does.
+                            emitLogprobConfidence(session, logprobTokens);
+                            session.complete();
+                        }
+                        case FAIL -> session.error(
+                                new ToolLoopPolicy.ToolLoopExhaustedException(
+                                        loopPolicy.maxIterations()));
+                    }
+                }
+                return;
+            }
+
+            var toolMap = ToolExecutionHelper.toToolMap(request.tools());
+            var updatedMessages = new ArrayList<>(request.messages());
+
+            // Deterministic order on the durable path: iterate tool calls by
+            // their model-emitted index (HashMap iteration order is not stable)
+            // so the occurrence ordinals reproduce on replay. The live path keeps
+            // the existing entry-set order.
+            var orderedEntries = durable
+                    ? accumulators.entrySet().stream()
+                            .sorted(Map.Entry.comparingByKey()).toList()
+                    : new ArrayList<>(accumulators.entrySet());
+
+            // Build the assistant message that references every tool_call the
+            // model just emitted. Gemini's v1beta/openai compatibility layer
+            // needs this to pair each subsequent function_response with the
+            // originating function_call — a null-content placeholder does not
+            // satisfy it. OpenAI itself accepts either shape, so including
+            // the tool_calls array broadens interop without regressing.
+            var assistantToolCalls = new ArrayList<ChatMessage.ToolCall>();
+            for (var entry : orderedEntries) {
+                var acc = entry.getValue();
+                assistantToolCalls.add(new ChatMessage.ToolCall(
+                        acc.id(), acc.functionName(), acc.arguments()));
+            }
+            updatedMessages.add(ChatMessage.assistantToolCalls(assistantToolCalls));
+
+            // Execute each tool call and add result messages. For each call,
+            // fire the lifecycle listeners attached to the request so
+            // {@code @AgentLifecycleListener} consumers see onToolCall /
+            // onToolResult events in-order alongside the AiEvent wire frames.
+            for (var entry : orderedEntries) {
+                var acc = entry.getValue();
+                var toolName = acc.functionName();
+                var args = ToolBridgeUtils.parseJsonArgs(acc.arguments());
+
+                // ToolStart is emitted by ToolExecutionHelper.executeWithApproval
+                // at the shared execution seam so every runtime bridge (LC4j,
+                // Spring AI, ADK, SK, BuiltIn) surfaces identical tool frames
+                // (Correctness Invariant #7, Mode Parity).
+                org.atmosphere.ai.AgentLifecycleListener.fireToolCall(
+                        request.listeners(), toolName, args);
+
+                var tool = toolMap.get(toolName);
+                if (tool == null) {
+                    logger.warn("Tool not found: {}", toolName);
+                    var errorResult = "{\"error\":\"Tool not found: " + toolName + "\"}";
+                    session.emit(new AiEvent.ToolStart(toolName, args));
+                    session.emit(new AiEvent.ToolError(toolName, "Tool not found"));
+                    session.emit(new AiEvent.ToolResult(toolName, errorResult));
+                    org.atmosphere.ai.AgentLifecycleListener.fireToolResult(
+                            request.listeners(), toolName, errorResult);
+                    updatedMessages.add(ChatMessage.tool(errorResult, acc.id(), toolName));
+                    continue;
+                }
+
+                // Compose injectables for the @AiTool method: anything the
+                // session already carries (fleet, identity, state supplied by
+                // the endpoint handler), plus the live session and
+                // AtmosphereResource so tool methods can declare those types
+                // as parameters. Framework-runtime bridges that layer on top
+                // of this loop inherit the same map automatically.
+                var toolInjectables = new java.util.LinkedHashMap<Class<?>, Object>(
+                        session.injectables());
+                toolInjectables.putIfAbsent(
+                        org.atmosphere.ai.StreamingSession.class, session);
+                var resultStr = ToolExecutionHelper.executeWithApproval(
+                        toolName, tool, args, session, request.approvalStrategy(),
+                        request.approvalPolicy(), toolInjectables);
+                // ToolResult is emitted inside executeWithApproval.
+                org.atmosphere.ai.AgentLifecycleListener.fireToolResult(
+                        request.listeners(), toolName, resultStr);
+                updatedMessages.add(ChatMessage.tool(resultStr, acc.id(), toolName));
+            }
+
+            logger.debug("Tool round {}: executed {} tool calls, re-submitting",
+                    toolRound + 1, accumulators.size());
+
+            // The logprobs opt-in must survive into every follow-up round:
+            // the final answer (and therefore the tokens worth scoring) is
+            // produced by the LAST round, so dropping the flag here would
+            // leave the confidence aggregate reflecting only the tool-call
+            // round. jsonSchema is intentionally left at the shim default to
+            // keep this round's wire shape unchanged — see the follow-up note
+            // in the class Javadoc history rather than widening scope here.
+            var followUp = new ChatCompletionRequest(
+                    request.model(), List.copyOf(updatedMessages),
+                    request.temperature(), request.maxStreamingTexts(),
+                    request.jsonMode(), request.tools(), request.conversationId(),
+                    request.approvalStrategy(), request.parts(), request.listeners(),
+                    request.cacheHint(), request.retryPolicy(), request.approvalPolicy(),
+                    request.toolLoopPolicy(), null, request.logprobs());
+            if (cancelled.get()) {
+                return;
+            }
+            doStreamWithToolLoop(followUp, session, toolRound + 1, cancelled, streamSink,
+                    logprobTokens);
+        } else if (!session.isClosed()) {
+            // Fire the native-logprobs confidence BEFORE the terminal frame so
+            // the pipeline's ConfidenceCapturingSession observes the explicit
+            // LOGPROBS_NATIVE emission and skips its own model-reported-field
+            // parse (no double confidence event per response).
+            emitLogprobConfidence(session, logprobTokens);
+            session.complete();
+        }
+    }
+
+    /**
+     * Emit a {@link org.atmosphere.ai.AiConfidence} with source
+     * {@code LOGPROBS_NATIVE} when the stream captured token logprobs.
+     * Deliberately silent when the provider returned none — emitting an empty
+     * LOGPROBS_NATIVE record would set the capturing decorator's explicit
+     * flag and suppress the model-reported-field fallback, degrading the
+     * signal instead of enriching it.
+     */
+    private static void emitLogprobConfidence(StreamingSession session,
+                                              List<org.atmosphere.ai.TokenLogprob> logprobTokens) {
+        if (logprobTokens != null && !logprobTokens.isEmpty()) {
+            session.confidence(org.atmosphere.ai.AiConfidence.fromLogprobs(logprobTokens));
+        }
+    }
+
+    /**
+     * Replay a recorded LLM round with no provider HTTP call: re-emit the
+     * recorded assistant text, rebuild the tool-call accumulators from the
+     * record, and continue exactly as the live path would. The tool calls then
+     * resolve to their own recorded outcomes via the {@code executeWithApproval}
+     * memo seam, so a fully-recorded run reconstructs with zero side effects.
+     */
+    private void replayRound(String payload, ChatCompletionRequest request,
+                             StreamingSession session, int toolRound,
+                             java.util.concurrent.atomic.AtomicBoolean cancelled,
+                             java.util.function.Consumer<java.io.Closeable> streamSink,
+                             List<org.atmosphere.ai.TokenLogprob> logprobTokens)
+            throws InterruptedException, java.io.IOException {
+        var round = deserializeRound(payload);
+        if (round.assistantText() != null && !round.assistantText().isEmpty()) {
+            session.send(round.assistantText());
+        }
+        var accumulators = new HashMap<Integer, ToolCallAccumulator>();
+        int index = 0;
+        for (var tc : round.toolCalls()) {
+            var acc = new ToolCallAccumulator();
+            acc.setId(tc.id());
+            acc.setFunctionName(tc.name());
+            if (tc.argumentsJson() != null) {
+                acc.appendArguments(tc.argumentsJson());
+            }
+            accumulators.put(index++, acc);
+        }
+        logger.debug("Replaying recorded LLM round {} ({} tool calls, no HTTP)",
+                toolRound, round.toolCalls().size());
+        // Recorded rounds carry no logprobs — the accumulator stays as-is, so
+        // a fully-replayed run emits no LOGPROBS_NATIVE confidence and the
+        // model-reported-field fallback still fires (runtime truth on replay).
+        continueAfterRound(request, session, toolRound, !round.toolCalls().isEmpty(),
+                accumulators, true, cancelled, streamSink, logprobTokens);
+    }
+
+    /**
+     * Record the run input seed once, at the first round's dispatch — the full
+     * assembled chat history, the model, the conversation id, a stable digest of
+     * the available tool set (a resume tripwire), and the principal + endpoint a
+     * crash-resume needs to refuse a foreign principal and resolve the live tool
+     * set. Idempotent: on replay (or a later round) the seed is already committed
+     * and this returns without a second write.
+     */
+    private void recordSeedIfAbsent(DurableRunContext ctx, ChatCompletionRequest request) {
+        var key = EffectKeys.runInput(ctx.runId());
+        if (ctx.journal().lookupCommitted(ctx.runId(), key).isPresent()) {
+            return;
+        }
+        var toolNames = request.tools().stream()
+                .map(org.atmosphere.ai.tool.ToolDefinition::name)
+                .sorted()
+                .toArray(String[]::new);
+        var toolsDigest = EffectKeys.sha256Hex(toolNames);
+        var seed = new EffectRecord.RunSeed(
+                request.model(), request.messages(), toolsDigest,
+                request.jsonSchema() != null ? "json_schema" : null,
+                request.conversationId(), ctx.userId(), ctx.endpointPath());
+        var digest = EffectKeys.sha256Hex(request.model(), toolsDigest, ctx.userId());
+        ctx.journal().appendPending(ctx.runId(), EffectKind.RUN_INPUT, key, digest);
+        ctx.journal().commit(ctx.runId(), key,
+                org.atmosphere.ai.resume.RunSeeds.serialize(seed));
+    }
+
+    /** Serialize this round's outcome (assistant text + tool calls + usage) for the journal. */
+    private String recordRound(StringBuilder roundText,
+                               Map<Integer, ToolCallAccumulator> accumulators,
+                               org.atmosphere.ai.TokenUsage usage) {
+        var toolCalls = new ArrayList<ChatMessage.ToolCall>();
+        accumulators.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .forEach(e -> {
+                    var acc = e.getValue();
+                    toolCalls.add(new ChatMessage.ToolCall(
+                            acc.id(), acc.functionName(), acc.arguments()));
+                });
+        var round = new EffectRecord.RecordedRound(
+                roundText != null ? roundText.toString() : null, toolCalls, usage);
+        return MAPPER.writeValueAsString(round);
+    }
+
+    private EffectRecord.RecordedRound deserializeRound(String payload) {
+        return MAPPER.readValue(payload, EffectRecord.RecordedRound.class);
+    }
+
+    private HttpResponse<java.io.InputStream> sendWithRetry(String requestBody,
+                                                             String endpoint,
+                                                             StreamingSession session,
+                                                             RetryPolicy override)
+            throws InterruptedException {
+        var isResponsesEndpoint = endpoint.endsWith("/responses");
+        HttpResponse<java.io.InputStream> response = null; // NOPMD — null fallback needed if all retries throw
+        Exception lastException = null;
+
+        // Per-request override wins; otherwise inherit the client's
+        // constructor-time policy. Wave 6: callers thread their own
+        // RetryPolicy via ChatCompletionRequest.retryPolicy when they need
+        // tighter or looser semantics than the client default.
+        var effectivePolicy = override != null ? override : retryPolicy;
+        var maxRetries = effectivePolicy.maxRetries();
+        for (int attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                var httpRequest = buildHttpRequest(requestBody, endpoint);
+                response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofInputStream());
+
+                if (response.statusCode() == 200) {
+                    return response;
+                }
+
+                // Return 404 from Responses API as-is so caller can fall back
+                if (isResponsesEndpoint && response.statusCode() == 404) {
+                    return response;
+                }
+
+                String errorBody;
+                try (var errorStream = response.body()) {
+                    errorBody = new String(errorStream.readAllBytes(), StandardCharsets.UTF_8);
+                }
+
+                if (!isRetryable(response.statusCode(), effectivePolicy) || attempt == maxRetries) {
+                    logger.error("LLM API error ({}): {}", response.statusCode(), errorBody);
+                    // Typed taxonomy: classify the status (429 → RateLimited
+                    // with the Retry-After hint, 401/403 → AuthenticationFailed,
+                    // 400 refined to context-length/content-filter, 5xx →
+                    // TransientProviderError) so retry, metrics, and routing
+                    // consumers can distinguish terminal from transient. The
+                    // message is unchanged from the pre-taxonomy LlmException.
+                    session.error(org.atmosphere.ai.ProviderErrorClassifier.fromHttpStatus(
+                            response.statusCode(),
+                            "API returned " + response.statusCode()
+                                    + ": " + extractErrorMessage(errorBody),
+                            retryAfterHintOf(response)));
+                    return null;
+                }
+
+                var delay = computeRetryDelay(attempt, response, effectivePolicy);
+                logger.warn("LLM API error ({}), retrying in {}ms (attempt {}/{})",
+                        response.statusCode(), delay.toMillis(), attempt + 1, maxRetries);
+                Thread.sleep(delay.toMillis());
+                response = null; // NOPMD — clear before retry to avoid stale reference
+            } catch (java.net.http.HttpTimeoutException e) {
+                lastException = e;
+                if (attempt == maxRetries) {
+                    break;
+                }
+                var delay = computeRetryDelay(attempt, null, effectivePolicy);
+                logger.warn("LLM request timeout, retrying in {}ms (attempt {}/{}): {}",
+                        delay.toMillis(), attempt + 1, maxRetries, e.getMessage());
+                Thread.sleep(delay.toMillis());
+            } catch (java.io.IOException e) {
+                lastException = e;
+                if (attempt == maxRetries) {
+                    break;
+                }
+                var delay = computeRetryDelay(attempt, null, effectivePolicy);
+                logger.warn("LLM connection error, retrying in {}ms (attempt {}/{}): {}",
+                        delay.toMillis(), attempt + 1, maxRetries, e.getMessage());
+                Thread.sleep(delay.toMillis());
+            }
+        }
+
+        var cause = lastException != null ? lastException
+                : new LlmException("Failed after " + (maxRetries + 1) + " attempts");
+        logger.error("LLM API failed after {} retries", maxRetries, cause);
+        if (!session.isClosed()) {
+            session.error(cause);
+        }
+        return null;
+    }
+
+    private static boolean isRetryable(int statusCode, RetryPolicy policy) {
+        // Status table folded into the shared classifier so the HTTP retry
+        // decision and the typed exception surfaced on the terminal path can
+        // never disagree (single source of truth).
+        return org.atmosphere.ai.ProviderErrorClassifier.isRetryableStatus(statusCode, policy);
+    }
+
+    /**
+     * Parsed {@code Retry-After} hint for the typed 429 classification, or
+     * null. Only consulted on an actual 429 — other statuses never read the
+     * header.
+     */
+    private static Duration retryAfterHintOf(HttpResponse<?> response) {
+        if (response.statusCode() != 429) {
+            return null;
+        }
+        return response.headers().firstValue("Retry-After")
+                .flatMap(org.atmosphere.ai.ProviderErrorClassifier::parseRetryAfter)
+                .orElse(null);
+    }
+
+    private Duration computeRetryDelay(int attempt, HttpResponse<?> response, RetryPolicy policy) {
+        // Respect Retry-After header on 429 responses
+        if (response != null && response.statusCode() == 429) {
+            var retryAfter = response.headers().firstValue("Retry-After");
+            if (retryAfter.isPresent()) {
+                try {
+                    var seconds = Integer.parseInt(retryAfter.get());
+                    return Duration.ofSeconds(Math.min(seconds, 60));
+                } catch (NumberFormatException ex) {
+                    logger.trace("Failed to parse Retry-After header", ex);
+                }
+            }
+        }
+        return policy.delayForAttempt(attempt);
+    }
+
+    private void processSSELine(String line, StreamingSession session,
+                                Map<Integer, ToolCallAccumulator> accumulators,
+                                boolean[] toolCallsRequested,
+                                org.atmosphere.ai.TokenUsage[] usageHolder,
+                                StringBuilder roundText,
+                                List<org.atmosphere.ai.TokenLogprob> logprobTokens) {
+        if (line.isBlank() || !line.startsWith(DATA_PREFIX)) {
+            return;
+        }
+
+        var data = line.substring(DATA_PREFIX.length()).trim();
+        if (DONE_MARKER.equals(data)) {
+            return;
+        }
+
+        try {
+            var node = MAPPER.readTree(data);
+            var choices = node.get("choices");
+            if (choices == null || choices.isEmpty()) {
+                return;
+            }
+
+            var firstChoice = choices.get(0);
+            var delta = firstChoice.get("delta");
+            if (delta == null) {
+                return;
+            }
+
+            // Extract content text
+            var contentNode = delta.get("content");
+            if (contentNode != null && !contentNode.isNull() && contentNode.isString()) {
+                var text = contentNode.stringValue();
+                if (!text.isEmpty()) {
+                    session.send(text);
+                    if (roundText != null) {
+                        roundText.append(text);
+                    }
+                }
+            }
+
+            // Capture per-token logprobs when the request asked for them.
+            // OpenAI streams them per-chunk under choices[0].logprobs.content
+            // as [{token, logprob, top_logprobs}, ...]; the accumulated list
+            // feeds AiConfidence.fromLogprobs on completion.
+            if (logprobTokens != null) {
+                captureLogprobs(firstChoice.get("logprobs"), logprobTokens);
+            }
+
+            // Accumulate tool call fragments. Each argument chunk is also
+            // forwarded to {@link StreamingSession#toolCallDelta} so browser
+            // UIs can render partial tool arguments as the model types them
+            // (before the consolidated {@code AiEvent.ToolStart} frame fires
+            // for the complete tool call).
+            var toolCallsNode = delta.get("tool_calls");
+            if (toolCallsNode != null && toolCallsNode.isArray()) {
+                for (var tcNode : toolCallsNode) {
+                    var index = tcNode.has("index") ? tcNode.get("index").asInt() : 0;
+                    var acc = accumulators.computeIfAbsent(index, k -> new ToolCallAccumulator());
+
+                    if (tcNode.has("id")) {
+                        acc.setId(tcNode.get("id").stringValue());
+                    }
+                    var fnNode = tcNode.get("function");
+                    if (fnNode != null) {
+                        if (fnNode.has("name") && !fnNode.get("name").isNull()) {
+                            acc.setFunctionName(fnNode.get("name").stringValue());
+                        }
+                        if (fnNode.has("arguments") && !fnNode.get("arguments").isNull()) {
+                            var argChunk = fnNode.get("arguments").stringValue();
+                            acc.appendArguments(argChunk);
+                            session.toolCallDelta(acc.id(), argChunk);
+                        }
+                    }
+                }
+            }
+
+            // Check for finish reason
+            var finishNode = firstChoice.get("finish_reason");
+            if (finishNode != null && !finishNode.isNull()) {
+                var reason = finishNode.stringValue();
+                if ("tool_calls".equals(reason)) {
+                    toolCallsRequested[0] = true;
+                }
+                if (!"null".equals(reason)) {
+                    logger.debug("Stream finished: reason={}", reason);
+                }
+            }
+
+            // Forward usage metadata if present, capturing it for the
+            // per-round AgentLifecycleListener.onModelEnd fire so observability
+            // consumers see the same TokenUsage record the wire protocol carries.
+            var usageNode = node.get("usage");
+            if (usageNode != null && !usageNode.isNull()) {
+                var captured = forwardUsageMetadata(usageNode, session);
+                if (captured != null && usageHolder != null) {
+                    usageHolder[0] = captured;
+                }
+            }
+
+            // Forward model metadata
+            var modelNode = node.get("model");
+            if (modelNode != null && !modelNode.isNull()) {
+                session.sendMetadata("ai.model", modelNode.stringValue());
+            }
+        } catch (JacksonException e) {
+            logger.warn("Failed to parse SSE data: {}", data, e);
+        }
+    }
+
+    /** Bound on captured logprob entries — matches the output ceiling a
+     *  single response can realistically carry; beyond it the capture stops
+     *  and the aggregate reflects the captured prefix (Invariant #3). */
+    private static final int MAX_LOGPROB_TOKENS = 4096;
+
+    /**
+     * Fold one chunk's {@code choices[0].logprobs.content} entries into the
+     * accumulator. Boundary-defensive (Invariant #4): entries missing a
+     * numeric {@code logprob} or a {@code token} string are skipped, NaN is
+     * skipped, and a (theoretically impossible but observed-in-the-wild)
+     * positive logprob is clamped to {@code 0.0} so a single malformed entry
+     * can never abort the stream via {@link TokenLogprob}'s validation.
+     */
+    private static void captureLogprobs(tools.jackson.databind.JsonNode logprobsNode,
+                                        List<org.atmosphere.ai.TokenLogprob> logprobTokens) {
+        if (logprobsNode == null || logprobsNode.isNull()) {
+            return;
+        }
+        var content = logprobsNode.get("content");
+        if (content == null || !content.isArray()) {
+            return;
+        }
+        for (var entry : content) {
+            if (logprobTokens.size() >= MAX_LOGPROB_TOKENS) {
+                logger.debug("Logprob capture truncated at {} tokens", MAX_LOGPROB_TOKENS);
+                return;
+            }
+            var tokenNode = entry.get("token");
+            var logprobNode = entry.get("logprob");
+            if (tokenNode == null || !tokenNode.isString()
+                    || logprobNode == null || !logprobNode.isNumber()) {
+                continue;
+            }
+            var logprob = logprobNode.asDouble();
+            if (Double.isNaN(logprob)) {
+                continue;
+            }
+            logprobTokens.add(new org.atmosphere.ai.TokenLogprob(
+                    tokenNode.stringValue(), Math.min(logprob, 0.0)));
+        }
+    }
+
+    /**
+     * Build a {@link org.atmosphere.ai.TokenUsage} from a chat-completions
+     * {@code usage} JSON node, emit it on the streaming session, and return
+     * it so the caller can also feed the per-round
+     * {@code AgentLifecycleListener.onModelEnd} fire. Returns {@code null}
+     * when the node has no counted tokens.
+     */
+    private static org.atmosphere.ai.TokenUsage forwardUsageMetadata(
+            tools.jackson.databind.JsonNode usageNode, StreamingSession session) {
+        long input = usageNode.has("prompt_tokens") ? usageNode.get("prompt_tokens").asLong() : 0L;
+        long output = usageNode.has("completion_tokens") ? usageNode.get("completion_tokens").asLong() : 0L;
+        long total = usageNode.has("total_tokens") ? usageNode.get("total_tokens").asLong() : input + output;
+        long cachedInput = 0L;
+        if (usageNode.has("prompt_tokens_details")) {
+            var details = usageNode.get("prompt_tokens_details");
+            if (details.has("cached_tokens")) {
+                cachedInput = details.get("cached_tokens").asLong();
+            }
+        }
+        var usage = org.atmosphere.ai.TokenUsage.fromCounts(input, output, cachedInput, total);
+        if (usage.hasCounts()) {
+            session.usage(usage);
+            return usage;
+        }
+        return null;
+    }
+
+    private String buildRequestBody(ChatCompletionRequest request) throws JacksonException {
+        var body = new LinkedHashMap<String, Object>();
+        body.put("model", request.model());
+
+        // Serialize messages. If the request carries multi-modal parts, the
+        // last user message's {@code content} is replaced with the OpenAI
+        // multi-content array format: a list of {"type":"text"} and
+        // {"type":"image_url","image_url":{"url":"data:<mime>;base64,<b64>"}}
+        // entries. Non-user messages and all messages on text-only paths
+        // keep the legacy plain-string content.
+        var serialized = new ArrayList<Map<String, Object>>(request.messages().size());
+        var messages = request.messages();
+        var parts = request.parts();
+        var hasVisualParts = !parts.isEmpty()
+                && parts.stream().anyMatch(p ->
+                        p instanceof org.atmosphere.ai.Content.Image
+                                || p instanceof org.atmosphere.ai.Content.Audio);
+        var lastUserIndex = hasVisualParts ? findLastUserMessageIndex(messages) : -1;
+        for (int i = 0; i < messages.size(); i++) {
+            var m = messages.get(i);
+            if (i == lastUserIndex) {
+                serialized.add(serializeMultiContentUserMessage(m, parts));
+            } else {
+                serialized.add(serializeMessage(m));
+            }
+        }
+        body.put("messages", serialized);
+
+        body.put("stream", true);
+        // Temperature: a framework-level GenerationParams override wins when
+        // set; otherwise emit the per-request value exactly as before so the
+        // unset path stays byte-identical.
+        body.put("temperature",
+                generation.temperature() != null ? generation.temperature() : request.temperature());
+        // Max tokens: a GenerationParams override wins; otherwise fall back to
+        // the per-request maxStreamingTexts (only emitted when > 0, as before).
+        if (generation.maxTokens() != null) {
+            body.put("max_tokens", generation.maxTokens());
+        } else if (request.maxStreamingTexts() > 0) {
+            body.put("max_tokens", request.maxStreamingTexts());
+        }
+        // top_p and stop are emitted ONLY when the framework override is set —
+        // today neither field is sent, so an unset GenerationParams keeps the
+        // wire shape unchanged.
+        if (generation.topP() != null) {
+            body.put("top_p", generation.topP());
+        }
+        if (generation.stop() != null && !generation.stop().isEmpty()) {
+            body.put("stop", generation.stop());
+        }
+        if (request.jsonSchema() != null && !request.jsonSchema().isBlank()) {
+            // Provider-enforced strict structured output: thread the generated
+            // JSON Schema into OpenAI's response_format json_schema field so the
+            // model cannot emit non-conforming output. Set only when the pipeline
+            // opted into native structured output (NativeStructuredOutput); the
+            // weaker json_object branch below remains the graceful fall-back when
+            // native is disabled or a provider rejects the schema.
+            var jsonSchema = new LinkedHashMap<String, Object>();
+            jsonSchema.put("name", "structured_output");
+            jsonSchema.put("schema", MAPPER.readTree(request.jsonSchema()));
+            jsonSchema.put("strict", true);
+            body.put("response_format", Map.of("type", "json_schema", "json_schema", jsonSchema));
+        } else if (request.jsonMode()) {
+            body.put("response_format", Map.of("type", "json_object"));
+        }
+        if (!request.tools().isEmpty()) {
+            body.put("tools", serializeTools(request.tools()));
+        }
+        var cacheHint = request.cacheHint();
+        if (cacheHint != null && cacheHint.enabled() && supportsPromptCacheKey()) {
+            cacheHint.cacheKey().filter(k -> !k.isBlank())
+                    .ifPresent(k -> body.put("prompt_cache_key", k));
+        }
+        // Native logprobs: requested by BuiltInAgentRuntime when a confidence
+        // elicitation is active, gated per-endpoint exactly like
+        // prompt_cache_key (LogprobsMode AUTO defers to the shared allow-list;
+        // some compat proxies reject the field). Chat-completions only — the
+        // Responses API path never requests logprobs, so confidence there
+        // stays on the model-reported-field decorator fallback. That
+        // intentional mode difference is documented in modules/ai/README.md
+        // (§ Native logprobs confidence → "Mode scope"), per Correctness
+        // Invariant #7.
+        if (request.logprobs() && supportsLogprobs()) {
+            body.put("logprobs", true);
+        }
+        return MAPPER.writeValueAsString(body);
+    }
+
+    /**
+     * Returns {@code true} if this client should emit {@code logprobs: true}
+     * for a request that opted in. Resolution mirrors
+     * {@link #supportsPromptCacheKey()}: the tri-state
+     * {@code atmosphere.ai.logprobs} knob ({@link LogprobsMode}) is consulted
+     * first; under {@link LogprobsMode#AUTO} the decision defers to the shared
+     * known-tolerant-endpoint allow-list
+     * ({@link CacheHint#endpointAcceptsPromptCacheKey(String)}) so both
+     * optional OpenAI fields make the identical AUTO decision for any given
+     * endpoint (default-deny on unknown hosts — a strict compat proxy that
+     * rejects the field would otherwise fail the whole request).
+     */
+    boolean supportsLogprobs() {
+        return org.atmosphere.ai.AiConfig.resolveLogprobsMode()
+                .resolve(CacheHint.endpointAcceptsPromptCacheKey(baseUrl));
+    }
+
+    /**
+     * Returns {@code true} if the configured endpoint accepts the OpenAI
+     * {@code prompt_cache_key} field. OpenAI itself silently ignores unknown
+     * fields, but stricter OpenAI-compat layers (notably Gemini's
+     * {@code generativelanguage.googleapis.com/v1beta/openai}) reject the
+     * request with HTTP 400 {@code "Unknown name 'prompt_cache_key'"}. Gate
+     * emission to providers that are known to honor or ignore the field
+     * gracefully — the upstream behavior on unknown providers is to drop
+     * the hint silently and let {@link org.atmosphere.ai.cache.ResponseCache}
+     * still short-circuit identical requests at the pipeline level.
+     */
+    boolean supportsPromptCacheKey() {
+        // Tri-state override: ENABLED force-emits, DISABLED force-suppresses,
+        // AUTO (default) defers to the legacy host allow-list below — keeping
+        // the AUTO path byte-identical to the pre-flag behavior. The mode is
+        // read from the framework-wide AiConfig settings; when unconfigured
+        // (e.g. unit tests that build a client directly) it resolves to AUTO.
+        var settings = org.atmosphere.ai.AiConfig.get();
+        var mode = settings != null
+                ? settings.promptCacheKeyMode()
+                : PromptCacheKeyMode.AUTO;
+        return mode.resolve(autoSupportsPromptCacheKey());
+    }
+
+    /**
+     * The host allow-list (default-DENY) used under {@link PromptCacheKeyMode#AUTO}.
+     * Delegates to {@link CacheHint#endpointAcceptsPromptCacheKey(String)} — the
+     * single source of truth shared with the LangChain4j and Spring AI adapters
+     * — so the Built-in and framework runtimes make the identical AUTO decision
+     * for any given endpoint (Mode Parity). A {@code null}/blank {@code baseUrl}
+     * resolves to {@code false} (default-deny on unknown), matching the shared
+     * helper's contract.
+     */
+    private boolean autoSupportsPromptCacheKey() {
+        return CacheHint.endpointAcceptsPromptCacheKey(baseUrl);
+    }
+
+    private static int findLastUserMessageIndex(List<ChatMessage> messages) {
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            if ("user".equals(messages.get(i).role())) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static Map<String, Object> serializeMultiContentUserMessage(
+            ChatMessage m, List<org.atmosphere.ai.Content> parts) {
+        var msg = new LinkedHashMap<String, Object>();
+        msg.put("role", m.role());
+        var contentArray = new ArrayList<Map<String, Object>>();
+        if (m.content() != null && !m.content().isEmpty()) {
+            contentArray.add(Map.of("type", "text", "text", m.content()));
+        }
+        for (var part : parts) {
+            if (part instanceof org.atmosphere.ai.Content.Image img) {
+                var dataUrl = "data:" + img.mimeType() + ";base64," + img.dataBase64();
+                contentArray.add(Map.of(
+                        "type", "image_url",
+                        "image_url", Map.of("url", dataUrl)));
+            } else if (part instanceof org.atmosphere.ai.Content.Audio audio) {
+                // OpenAI chat completions supports audio input on some models
+                // via the input_audio content type (gpt-4o-audio-preview). The
+                // format is {"type":"input_audio","input_audio":{"data":"<b64>","format":"mp3"}}.
+                var format = audio.mimeType().substring(audio.mimeType().indexOf('/') + 1);
+                contentArray.add(Map.of(
+                        "type", "input_audio",
+                        "input_audio", Map.of("data", audio.dataBase64(), "format", format)));
+            }
+        }
+        msg.put("content", contentArray);
+        if (m.toolCallId() != null) {
+            msg.put("tool_call_id", m.toolCallId());
+        }
+        return msg;
+    }
+
+    // Package-private so ChatMessageSerializationTest can pin the wire shape.
+    static Map<String, Object> serializeMessage(ChatMessage m) {
+        var msg = new LinkedHashMap<String, Object>();
+        msg.put("role", m.role());
+        // Assistant messages carrying tool_calls have null content but MUST
+        // emit the tool_calls array so downstream endpoints (notably Gemini
+        // compat) can pair the subsequent tool-role messages with their
+        // originating function_call. OpenAI allows null content on these.
+        if (m.content() != null) {
+            msg.put("content", m.content());
+        }
+        if (m.toolCallId() != null) {
+            msg.put("tool_call_id", m.toolCallId());
+        }
+        // Optional function name on tool messages. OpenAI chat-completions
+        // treats this as optional, but Gemini's v1beta/openai compatibility
+        // layer rejects tool messages without it (it maps to the native
+        // function_response.name which is required). Emitting it when
+        // available broadens interop without breaking OpenAI itself.
+        if (m.name() != null && "tool".equals(m.role())) {
+            msg.put("name", m.name());
+        }
+        if (!m.toolCalls().isEmpty()) {
+            var arr = new ArrayList<Map<String, Object>>();
+            for (var tc : m.toolCalls()) {
+                var fn = new LinkedHashMap<String, Object>();
+                fn.put("name", tc.name());
+                fn.put("arguments", tc.argumentsJson() == null ? "{}" : tc.argumentsJson());
+                var wrapper = new LinkedHashMap<String, Object>();
+                wrapper.put("id", tc.id());
+                wrapper.put("type", "function");
+                wrapper.put("function", fn);
+                arr.add(wrapper);
+            }
+            msg.put("tool_calls", arr);
+        }
+        return msg;
+    }
+
+    private static List<Map<String, Object>> serializeTools(List<ToolDefinition> tools) {
+        return tools.stream().map(tool -> {
+            var fn = new LinkedHashMap<String, Object>();
+            fn.put("name", tool.name());
+            fn.put("description", tool.description());
+            fn.put("parameters", buildParametersObject(tool));
+            var wrapper = new LinkedHashMap<String, Object>();
+            wrapper.put("type", "function");
+            wrapper.put("function", fn);
+            return (Map<String, Object>) wrapper;
+        }).toList();
+    }
+
+    private static Map<String, Object> buildParametersObject(ToolDefinition tool) {
+        var params = new LinkedHashMap<String, Object>();
+        params.put("type", "object");
+        var properties = new LinkedHashMap<String, Object>();
+        var required = new ArrayList<String>();
+        for (var p : tool.parameters()) {
+            // Structural facets (enum values, array items, nested object
+            // properties) travel with the property so the model sees the same
+            // contract the validator enforces. Emitted by the shared helper so
+            // every bridge serializes an identical property shape.
+            properties.put(p.name(), ToolBridgeUtils.parameterSchemaMap(p));
+            if (p.required()) {
+                required.add(p.name());
+            }
+        }
+        params.put("properties", properties);
+        params.put("required", required);
+        return params;
+    }
+
+    private HttpRequest buildHttpRequest(String requestBody, String endpoint) {
+        var builder = HttpRequest.newBuilder()
+                .uri(URI.create(endpoint))
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
+                .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+                .timeout(timeout);
+
+        if (apiKey != null && !apiKey.isBlank()) {
+            builder.header("Authorization", "Bearer " + apiKey);
+        }
+        applyCustomHeaders(builder);
+
+        return builder.build();
+    }
+
+    /**
+     * Attach any builder-supplied custom headers to the request, skipping
+     * the three protocol headers the client owns ({@code Authorization},
+     * {@code Content-Type}, {@code Accept}). Skipping prevents a misuse
+     * where a caller sets {@code customHeaders("Authorization", "...")}
+     * and quietly displaces the apiKey-derived value.
+     */
+    private void applyCustomHeaders(HttpRequest.Builder builder) {
+        if (customHeaders == null || customHeaders.isEmpty()) {
+            return;
+        }
+        for (var entry : customHeaders.entrySet()) {
+            var name = entry.getKey();
+            if (name == null || name.isBlank()) {
+                continue;
+            }
+            if (name.equalsIgnoreCase("Authorization")
+                    || name.equalsIgnoreCase("Content-Type")
+                    || name.equalsIgnoreCase("Accept")) {
+                logger.debug("Skipping reserved header {} from customHeaders", name);
+                continue;
+            }
+            var value = entry.getValue();
+            if (value == null) {
+                continue;
+            }
+            builder.header(name, value);
+        }
+    }
+
+    private String extractErrorMessage(String errorBody) {
+        try {
+            var node = MAPPER.readTree(errorBody);
+            // Handle array response (e.g. Gemini: [{"error":{...}}])
+            if (node.isArray() && !node.isEmpty()) {
+                node = node.get(0);
+            }
+            var errorNode = node.get("error");
+            if (errorNode != null && errorNode.has("message")) {
+                return errorNode.get("message").stringValue();
+            }
+        } catch (Exception ex) {
+            logger.trace("Failed to parse error response JSON", ex);
+        }
+        return errorBody.length() > 200 ? errorBody.substring(0, 200) + "..." : errorBody;
+    }
+
+    /**
+     * Live model enumeration against the OpenAI-compatible
+     * {@code GET {baseUrl}/models} endpoint ({@code /v1/models} on OpenAI,
+     * Gemini-compat, Ollama, Azure — the base URL already carries the
+     * version segment). Response shape: {@code {"object":"list","data":
+     * [{"id":"..."} , ...]}} — parsed defensively by {@link ModelListJson}.
+     *
+     * <p>Best-effort by contract: any transport failure, non-2xx status, or
+     * unparseable body returns an empty list (logged at DEBUG) so enumeration
+     * can never break discovery or dispatch. The request runs with a short
+     * timeout independent of the streaming timeout so a slow provider cannot
+     * pin an admin/discovery caller.</p>
+     */
+    @Override
+    public List<String> listModels() {
+        var enumTimeout = timeout.compareTo(Duration.ofSeconds(10)) < 0
+                ? timeout : Duration.ofSeconds(10);
+        var builder = HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl + "/models"))
+                .header("Accept", "application/json")
+                .GET()
+                .timeout(enumTimeout);
+        if (apiKey != null && !apiKey.isBlank()) {
+            builder.header("Authorization", "Bearer " + apiKey);
+        }
+        applyCustomHeaders(builder);
+        try {
+            var response = httpClient.send(builder.build(),
+                    HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() / 100 != 2) {
+                logger.debug("Model enumeration returned {}", response.statusCode());
+                return List.of();
+            }
+            return ModelListJson.parse(MAPPER, response.body());
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            logger.debug("Model enumeration interrupted", ie);
+            return List.of();
+        } catch (Exception e) {
+            logger.debug("Model enumeration failed", e);
+            return List.of();
+        }
+    }
+
+    // -- OpenAI Responses API support --
+
+    /**
+     * Checks whether the Responses API path should be used for this request.
+     * The Responses API is used when: (a) the endpoint is OpenAI, and
+     * (b) a conversationId is present. On the first turn (no cached response ID),
+     * the request omits {@code previous_response_id} to establish the cache.
+     */
+    private boolean isResponsesApiApplicable(String conversationId) {
+        return conversationId != null && isOpenAiResponsesApiCapable();
+    }
+
+    /**
+     * Returns {@code true} if the configured endpoint is OpenAI's API,
+     * which supports the Responses API at {@code /v1/responses}.
+     */
+    private boolean isOpenAiResponsesApiCapable() {
+        return baseUrl.contains("api.openai.com");
+    }
+
+    /**
+     * Build a request body for the OpenAI Responses API.
+     * When a previousResponseId is available, only the new user input is sent
+     * (stateful continuation). On the first turn (no previousResponseId),
+     * the full message history is included via the {@code input} array and
+     * the system prompt via {@code instructions}.
+     */
+    private String buildResponsesApiBody(ChatCompletionRequest request, String previousResponseId) {
+        var body = new LinkedHashMap<String, Object>();
+        body.put("model", request.model());
+        if (previousResponseId != null) {
+            body.put("previous_response_id", previousResponseId);
+        }
+        body.put("stream", true);
+        body.put("store", true);
+
+        if (previousResponseId != null) {
+            // Continuation: send tool results + new user message as input items
+            var inputItems = new ArrayList<Map<String, Object>>();
+            for (var msg : request.messages()) {
+                if ("tool".equals(msg.role()) && msg.toolCallId() != null) {
+                    // Tool results must be sent as function_call_output items
+                    var item = new LinkedHashMap<String, Object>();
+                    item.put("type", "function_call_output");
+                    item.put("call_id", msg.toolCallId());
+                    item.put("output", msg.content());
+                    inputItems.add(item);
+                } else if ("user".equals(msg.role())) {
+                    var item = new LinkedHashMap<String, Object>();
+                    item.put("role", "user");
+                    item.put("content", msg.content());
+                    inputItems.add(item);
+                }
+            }
+            if (!inputItems.isEmpty()) {
+                body.put("input", inputItems);
+            }
+        } else {
+            // First turn: send all messages as input items
+            var inputItems = new ArrayList<Map<String, Object>>();
+            for (var msg : request.messages()) {
+                if ("system".equals(msg.role())) {
+                    // System messages go into "instructions" field
+                    body.put("instructions", msg.content());
+                } else {
+                    var item = new LinkedHashMap<String, Object>();
+                    item.put("role", msg.role());
+                    item.put("content", msg.content());
+                    inputItems.add(item);
+                }
+            }
+            if (!inputItems.isEmpty()) {
+                body.put("input", inputItems);
+            }
+        }
+
+        // Max output tokens: a framework GenerationParams override wins;
+        // otherwise fall back to the per-request maxStreamingTexts (only when
+        // > 0, as before). The Responses API names the field
+        // max_output_tokens (vs. chat-completions' max_tokens) — same override
+        // value, provider-correct field name (Correctness Invariant #7).
+        if (generation.maxTokens() != null) {
+            body.put("max_output_tokens", generation.maxTokens());
+        } else if (request.maxStreamingTexts() > 0) {
+            body.put("max_output_tokens", request.maxStreamingTexts());
+        }
+        // Temperature: a GenerationParams override wins; otherwise emit the
+        // per-request value exactly as before (only when >= 0) so the unset
+        // path stays byte-identical.
+        if (generation.temperature() != null) {
+            body.put("temperature", generation.temperature());
+        } else if (request.temperature() >= 0) {
+            body.put("temperature", request.temperature());
+        }
+        // top_p is emitted only when the framework override is set — today the
+        // Responses path never sends it, so an unset GenerationParams keeps the
+        // wire shape unchanged. NOTE: the Responses API has no `stop` parameter
+        // (unlike chat-completions), so GenerationParams.stop() is intentionally
+        // NOT forwarded here — see modules/ai/README.md (§ Generation parameters).
+        if (generation.topP() != null) {
+            body.put("top_p", generation.topP());
+        }
+        if (!request.tools().isEmpty()) {
+            body.put("tools", buildResponsesApiTools(request.tools()));
+        }
+
+        try {
+            return MAPPER.writeValueAsString(body);
+        } catch (JacksonException e) {
+            // Should not happen with simple map structures
+            throw new IllegalStateException("Failed to serialize Responses API body", e);
+        }
+    }
+
+    /**
+     * Build tools array in Responses API format.
+     * The Responses API uses the same function tool format as Chat Completions.
+     */
+    private static List<Map<String, Object>> buildResponsesApiTools(List<ToolDefinition> tools) {
+        return serializeTools(tools);
+    }
+
+    /**
+     * Process an SSE line from the OpenAI Responses API stream.
+     * The Responses API SSE format uses typed events like {@code response.output_text.delta}
+     * and {@code response.completed}.
+     */
+    private void processResponsesApiSSELine(String line, StreamingSession session,
+                                            Map<Integer, ToolCallAccumulator> accumulators,
+                                            boolean[] toolCallsRequested,
+                                            String[] capturedResponseId,
+                                            org.atmosphere.ai.TokenUsage[] usageHolder,
+                                            StringBuilder roundText,
+                                            List<org.atmosphere.ai.TokenLogprob> logprobTokens) {
+        if (line.isBlank() || !line.startsWith(DATA_PREFIX)) {
+            return;
+        }
+
+        var data = line.substring(DATA_PREFIX.length()).trim();
+        if (DONE_MARKER.equals(data)) {
+            return;
+        }
+
+        try {
+            var node = MAPPER.readTree(data);
+            var type = node.has("type") ? node.get("type").stringValue() : null;
+
+            if (type == null) {
+                // Fallback: treat as Chat Completions format (shouldn't happen normally)
+                processSSELine(line, session, accumulators, toolCallsRequested, usageHolder,
+                        roundText, logprobTokens);
+                return;
+            }
+
+            switch (type) {
+                case "response.output_text.delta" -> {
+                    var delta = node.get("delta");
+                    if (delta != null && delta.isString()) {
+                        var text = delta.stringValue();
+                        if (!text.isEmpty()) {
+                            session.send(text);
+                            if (roundText != null) {
+                                roundText.append(text);
+                            }
+                        }
+                    }
+                }
+                case "response.function_call_arguments.delta" -> {
+                    var index = node.has("output_index") ? node.get("output_index").asInt() : 0;
+                    var acc = accumulators.computeIfAbsent(index, k -> new ToolCallAccumulator());
+                    var delta = node.get("delta");
+                    if (delta != null && delta.isString()) {
+                        var chunk = delta.stringValue();
+                        acc.appendArguments(chunk);
+                        session.toolCallDelta(acc.id(), chunk);
+                    }
+                }
+                case "response.function_call_arguments.done" -> {
+                    var index = node.has("output_index") ? node.get("output_index").asInt() : 0;
+                    var acc = accumulators.computeIfAbsent(index, k -> new ToolCallAccumulator());
+                    // The call ID and function name come from the output_item.added event
+                    if (node.has("call_id")) {
+                        acc.setId(node.get("call_id").stringValue());
+                    }
+                    if (node.has("name")) {
+                        acc.setFunctionName(node.get("name").stringValue());
+                    }
+                    toolCallsRequested[0] = true;
+                }
+                case "response.output_item.added" -> {
+                    // Capture function call metadata
+                    var item = node.get("item");
+                    if (item != null && "function_call".equals(
+                            item.has("type") ? item.get("type").stringValue() : null)) {
+                        var index = node.has("output_index") ? node.get("output_index").asInt() : 0;
+                        var acc = accumulators.computeIfAbsent(index, k -> new ToolCallAccumulator());
+                        if (item.has("call_id")) {
+                            acc.setId(item.get("call_id").stringValue());
+                        }
+                        if (item.has("name")) {
+                            acc.setFunctionName(item.get("name").stringValue());
+                        }
+                    }
+                }
+                case "response.completed" -> {
+                    var responseNode = node.get("response");
+                    if (responseNode != null) {
+                        // Capture the response ID for stateful continuation
+                        if (responseNode.has("id")) {
+                            capturedResponseId[0] = responseNode.get("id").stringValue();
+                        }
+                        // Forward usage metadata, capturing it for the
+                        // per-round AgentLifecycleListener.onModelEnd fire.
+                        var usageNode = responseNode.get("usage");
+                        if (usageNode != null && !usageNode.isNull()) {
+                            var captured = forwardResponsesApiUsage(usageNode, session);
+                            if (captured != null && usageHolder != null) {
+                                usageHolder[0] = captured;
+                            }
+                        }
+                        // Forward model metadata
+                        var modelNode = responseNode.get("model");
+                        if (modelNode != null && !modelNode.isNull()) {
+                            session.sendMetadata("ai.model", modelNode.stringValue());
+                        }
+                    }
+                }
+                default -> logger.trace("Ignoring Responses API event type: {}", type);
+            }
+        } catch (JacksonException e) {
+            logger.warn("Failed to parse Responses API SSE data: {}", data, e);
+        }
+    }
+
+    /**
+     * Responses-API equivalent of {@link #forwardUsageMetadata}: emits the
+     * usage on the streaming session and returns it so the round can also
+     * fire {@code AgentLifecycleListener.onModelEnd}. The Responses API
+     * reports usage in a slightly different structure
+     * ({@code input_tokens} / {@code output_tokens}) than Chat Completions.
+     * Returns {@code null} when no counted tokens are present.
+     */
+    private static org.atmosphere.ai.TokenUsage forwardResponsesApiUsage(
+            tools.jackson.databind.JsonNode usageNode, StreamingSession session) {
+        long input = usageNode.has("input_tokens") ? usageNode.get("input_tokens").asLong() : 0L;
+        long output = usageNode.has("output_tokens") ? usageNode.get("output_tokens").asLong() : 0L;
+        long cachedInput = 0L;
+        if (usageNode.has("input_tokens_details")) {
+            var details = usageNode.get("input_tokens_details");
+            if (details.has("cached_tokens")) {
+                cachedInput = details.get("cached_tokens").asLong();
+            }
+        }
+        var usage = org.atmosphere.ai.TokenUsage.fromCounts(input, output, cachedInput, null);
+        if (usage.hasCounts()) {
+            session.usage(usage);
+            return usage;
+        }
+        return null;
+    }
+
+    /**
+     * Cache a response ID for the first turn of a conversation.
+     * Called from {@link #processSSELine} when the endpoint is OpenAI and
+     * a conversationId is present but no previous response ID exists yet
+     * (i.e., first turn via Chat Completions that should seed the cache
+     * for future Responses API turns).
+     *
+     * <p>Note: The Chat Completions API does not return a response ID
+     * compatible with the Responses API. The cache is seeded only when
+     * using the Responses API (second turn onwards), or on the first
+     * Responses API call with no previous_response_id.</p>
+     */
+    // visible for testing
+    Map<String, String> responseIdCache() {
+        return responseIdCache;
+    }
+
+    /**
+     * Seed the response ID cache for a conversation. This allows the first
+     * turn to use Chat Completions, then subsequent turns to use the
+     * Responses API if a response ID is provided.
+     *
+     * @param conversationId the conversation identifier
+     * @param responseId     the OpenAI response ID (e.g. {@code resp_abc123})
+     */
+    public void seedResponseId(String conversationId, String responseId) {
+        if (conversationId != null && responseId != null) {
+            responseIdCache.put(conversationId, responseId);
+        }
+    }
+
+    /**
+     * Evict a cached response ID for a conversation.
+     *
+     * @param conversationId the conversation identifier
+     */
+    public void evictResponseId(String conversationId) {
+        if (conversationId != null) {
+            responseIdCache.remove(conversationId);
+        }
+    }
+
+    /**
+     * Exception for LLM API errors.
+     */
+    public static class LlmException extends org.atmosphere.ai.AiException {
+        public LlmException(String message) {
+            super(message);
+        }
+    }
+
+    public static final class Builder {
+        private String baseUrl = "http://localhost:11434/v1";
+        private String apiKey;
+        private HttpClient httpClient;
+        private Duration timeout = Duration.ofSeconds(120);
+        private RetryPolicy retryPolicy;
+        private int maxRetries = 3;
+        private Duration retryBaseDelay = Duration.ofMillis(500);
+        private final java.util.LinkedHashMap<String, String> customHeaders = new java.util.LinkedHashMap<>();
+        private org.atmosphere.ai.GenerationParams generation =
+                org.atmosphere.ai.GenerationParams.defaults();
+
+        private Builder() {
+        }
+
+        public Builder baseUrl(String baseUrl) {
+            this.baseUrl = baseUrl;
+            return this;
+        }
+
+        public Builder apiKey(String apiKey) {
+            this.apiKey = apiKey;
+            return this;
+        }
+
+        public Builder httpClient(HttpClient httpClient) {
+            this.httpClient = httpClient;
+            return this;
+        }
+
+        public Builder timeout(Duration timeout) {
+            this.timeout = timeout;
+            return this;
+        }
+
+        /**
+         * Set a custom retry policy. Overrides {@link #maxRetries} and {@link #retryBaseDelay}.
+         */
+        public Builder retryPolicy(RetryPolicy retryPolicy) {
+            this.retryPolicy = retryPolicy;
+            return this;
+        }
+
+        /**
+         * Maximum number of retries on transient errors (429, 500, 502, 503)
+         * and connection/timeout failures. Default is 3.
+         */
+        public Builder maxRetries(int maxRetries) {
+            this.maxRetries = maxRetries;
+            return this;
+        }
+
+        /**
+         * Base delay for exponential backoff between retries.
+         * Actual delay is {@code base * 2^attempt} with 20% jitter, capped at 30s.
+         * Default is 500ms.
+         */
+        public Builder retryBaseDelay(Duration retryBaseDelay) {
+            this.retryBaseDelay = retryBaseDelay;
+            return this;
+        }
+
+        /**
+         * Add a single header attached to every outgoing HTTP request.
+         * Useful for proxy routing (Helicone, OpenRouter, LiteLLM), per-
+         * tenant identifiers, request tracing, and any provider-specific
+         * header the rest of this builder does not surface explicitly.
+         *
+         * <p>The protocol headers {@code Authorization}, {@code Content-Type},
+         * and {@code Accept} are reserved — entries with those names are
+         * dropped at request-build time so a caller-supplied
+         * {@code Authorization} cannot accidentally displace the apiKey-
+         * derived value.</p>
+         *
+         * @param name  header name; null or blank entries are ignored
+         * @param value header value; null entries are ignored
+         */
+        public Builder customHeader(String name, String value) {
+            if (name != null && !name.isBlank() && value != null) {
+                this.customHeaders.put(name, value);
+            }
+            return this;
+        }
+
+        /**
+         * Bulk variant of {@link #customHeader(String, String)}. Replaces
+         * any previously-configured custom headers with the entries of the
+         * supplied map (order preserved). Passing {@code null} clears the
+         * map.
+         */
+        public Builder customHeaders(java.util.Map<String, String> headers) {
+            this.customHeaders.clear();
+            if (headers != null) {
+                for (var entry : headers.entrySet()) {
+                    customHeader(entry.getKey(), entry.getValue());
+                }
+            }
+            return this;
+        }
+
+        /**
+         * Set the framework-level {@link org.atmosphere.ai.GenerationParams}
+         * (temperature, max_tokens, top_p, stop) applied to every outgoing
+         * request body. Each set component overrides the corresponding wire
+         * field; unset components leave today's behavior unchanged. Passing
+         * {@code null} restores {@link org.atmosphere.ai.GenerationParams#defaults()}.
+         */
+        public Builder generation(org.atmosphere.ai.GenerationParams generation) {
+            this.generation = generation != null
+                    ? generation : org.atmosphere.ai.GenerationParams.defaults();
+            return this;
+        }
+
+        public OpenAiCompatibleClient build() {
+            var client = this.httpClient != null ? this.httpClient : HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofSeconds(30))
+                    .build();
+            var policy = this.retryPolicy != null ? this.retryPolicy
+                    : new RetryPolicy(maxRetries, retryBaseDelay, Duration.ofSeconds(30),
+                            2.0, RetryPolicy.DEFAULT.retryableErrors());
+            return new OpenAiCompatibleClient(baseUrl, apiKey, client, timeout, policy,
+                    java.util.Map.copyOf(customHeaders), generation);
+        }
+    }
+}

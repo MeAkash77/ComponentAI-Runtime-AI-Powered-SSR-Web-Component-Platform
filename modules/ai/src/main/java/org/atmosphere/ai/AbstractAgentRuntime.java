@@ -1,0 +1,603 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.ai;
+
+import org.atmosphere.ai.llm.ChatMessage;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Base class for {@link AgentRuntime} implementations. Provides classpath-based
+ * availability detection, lazy client initialization, and a template method
+ * ({@link #doExecute}) for framework-specific execution.
+ *
+ * @param <C> the native client type (e.g. {@code ChatClient}, {@code StreamingChatModel})
+ */
+public abstract class AbstractAgentRuntime<C> implements AgentRuntime {
+
+    private static final Logger lifecycleLogger = LoggerFactory.getLogger(AbstractAgentRuntime.class);
+
+    private volatile C nativeClient;
+    /**
+     * Per-agent clients for agents with {@link AiConfig#agentScoped scoped}
+     * settings (workspace RUNTIME.md, registre#39). Keyed by agent id and
+     * rebuilt when the agent's settings instance changes; bounded by the
+     * number of configured agents.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<String, ScopedClient>
+            agentClients = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** One agent's scoped client, pinned to the settings that built it. */
+    private record ScopedClient(AiConfig.LlmSettings settings, Object client) {
+    }
+
+    /** Returns the current native client instance, or {@code null} if not yet configured. */
+    protected C getNativeClient() {
+        return nativeClient;
+    }
+
+    /** Sets the native client instance. */
+    protected void setNativeClient(C client) {
+        this.nativeClient = client;
+    }
+
+    /**
+     * Provider-neutral entry point to install the native client without a
+     * compile-time dependency on its concrete type — for reflective or non-DI
+     * wiring. The argument is validated against {@link #nativeClientClassName()}
+     * and delegated to {@link #setNativeClient(Object)}. Provider-typed static
+     * setters (e.g. LangChain4j {@code setModel}, Spring AI
+     * {@code setChatClient}) remain the primary, documented wiring path and
+     * additionally carry the ServiceLoader handoff this neutral entry cannot
+     * replace.
+     *
+     * @param client the native client instance; must be assignable to this
+     *               runtime's native client type
+     * @throws IllegalArgumentException if {@code client} is {@code null} or not
+     *                                  assignable to the runtime's native client type
+     * @throws IllegalStateException    if the native client class is not on the classpath
+     */
+    @SuppressWarnings("unchecked") // guarded by expected.isInstance(client) below
+    public final void configureNativeClient(Object client) {
+        if (client == null) {
+            throw new IllegalArgumentException(name() + ": native client must not be null");
+        }
+        Class<?> expected;
+        try {
+            expected = Class.forName(nativeClientClassName());
+        } catch (ClassNotFoundException e) {
+            throw new IllegalStateException(name() + ": native client class "
+                    + nativeClientClassName() + " is not on the classpath", e);
+        }
+        if (!expected.isInstance(client)) {
+            throw new IllegalArgumentException(name() + ": expected native client of type "
+                    + expected.getName() + " but got " + client.getClass().getName());
+        }
+        setNativeClient((C) client);
+    }
+
+    /**
+     * Returns the fully-qualified class name used to check whether this
+     * runtime's dependencies are on the classpath.
+     */
+    protected abstract String nativeClientClassName();
+
+    /**
+     * Creates the native client from the given LLM settings. Called by
+     * {@link #configure(AiConfig.LlmSettings)} when no client has been set yet.
+     *
+     * @param settings the resolved LLM settings
+     * @return the native client, or {@code null} if configuration is not possible
+     */
+    protected abstract C createNativeClient(AiConfig.LlmSettings settings);
+
+    /**
+     * Performs the actual agent execution after the native client has been resolved.
+     *
+     * @param client  the non-null native client
+     * @param context the execution context
+     * @param session the streaming session
+     */
+    protected abstract void doExecute(C client, AgentExecutionContext context,
+                                      StreamingSession session);
+
+    /**
+     * Cancellation-aware variant of {@link #doExecute}. The default
+     * implementation blocks on {@link #doExecute} and returns an
+     * already-completed handle — runtimes with a native cancel primitive
+     * (Reactor {@code Disposable}, Koog {@code Job}, ADK {@code Runner.close},
+     * Built-in HttpClient request cancel) should override this to return a
+     * handle whose {@link ExecutionHandle#cancel()} fires the native
+     * primitive and whose {@link ExecutionHandle#whenDone()} completes when
+     * the native pipeline terminates.
+     *
+     * <p>Phase 2 of the unified {@code @Agent} API: the default keeps legacy
+     * runtimes wire-compatible, and subclasses opt in to real cancellation.</p>
+     *
+     * @param client  the non-null native client
+     * @param context the execution context
+     * @param session the streaming session
+     * @return a handle the caller can use to cancel or await termination
+     */
+    protected ExecutionHandle doExecuteWithHandle(
+            C client, AgentExecutionContext context, StreamingSession session) {
+        doExecute(client, context, session);
+        return ExecutionHandle.completed();
+    }
+
+    /**
+     * Functional adapter over a native client's streaming entry point. The
+     * hand-rolled HTTP runtimes (Anthropic, Cohere, and any future provider
+     * with a direct {@code /messages}-style endpoint) share the same seven-arg
+     * streaming signature, so their dispatch funnels through
+     * {@link #streamThroughGateway} / {@link #streamThroughGatewayWithHandle}
+     * via a {@code client::stream} method reference instead of copy-pasting the
+     * gateway-admission + virtual-thread + cancellation boilerplate per adapter.
+     */
+    @FunctionalInterface
+    protected interface NativeStreamCall {
+        void stream(String model, List<ChatMessage> messages, String systemPrompt,
+                    String message, AgentExecutionContext context,
+                    StreamingSession session, AtomicBoolean cancelled);
+    }
+
+    /**
+     * Synchronous streaming dispatch: admit through the gateway, then invoke the
+     * native stream with the resolved model and the assembled history.
+     */
+    protected final void streamThroughGateway(AgentExecutionContext context,
+            StreamingSession session, String defaultModel, NativeStreamCall call) {
+        admitThroughGateway(context);
+        call.stream(effectiveModel(context, defaultModel), assembleMessages(context),
+                context.systemPrompt(), context.message(), context, session, null);
+    }
+
+    /**
+     * Cancellation-aware streaming dispatch on a virtual thread. The returned
+     * {@link ExecutionHandle#cancel()} flips a flag the native stream polls, and
+     * {@link ExecutionHandle#whenDone()} settles when the worker terminates
+     * (success or failure).
+     */
+    protected final ExecutionHandle streamThroughGatewayWithHandle(AgentExecutionContext context,
+            StreamingSession session, String defaultModel, NativeStreamCall call) {
+        admitThroughGateway(context);
+        var cancelled = new AtomicBoolean();
+        var done = new CompletableFuture<Void>();
+        Thread.startVirtualThread(() -> {
+            try {
+                call.stream(effectiveModel(context, defaultModel), assembleMessages(context),
+                        context.systemPrompt(), context.message(), context, session, cancelled);
+                done.complete(null);
+            } catch (Throwable t) {
+                done.completeExceptionally(t);
+            }
+        });
+        return new ExecutionHandle() {
+            @Override public void cancel() { cancelled.set(true); }
+
+            @Override public boolean isDone() { return done.isDone(); }
+
+            @Override public CompletableFuture<Void> whenDone() { return done; }
+        };
+    }
+
+    /**
+     * Resolve the effective model: an explicit {@code context.model()} wins,
+     * else the framework-resolved {@link AiConfig} model, else the provider
+     * default supplied by the adapter.
+     */
+    protected static String effectiveModel(AgentExecutionContext context, String defaultModel) {
+        if (context != null && context.model() != null && !context.model().isBlank()) {
+            return context.model();
+        }
+        var settings = AiConfig.forAgent(context != null ? context.agentId() : null);
+        if (settings != null && settings.model() != null && !settings.model().isBlank()) {
+            return settings.model();
+        }
+        return defaultModel;
+    }
+
+    /**
+     * Read a system property, returning {@code fallback} when it is unset or
+     * blank. Shared by the hand-rolled HTTP runtimes for API-key / version /
+     * base-url resolution.
+     */
+    protected static String systemProperty(String key, String fallback) {
+        var value = System.getProperty(key);
+        return (value == null || value.isBlank()) ? fallback : value;
+    }
+
+    /**
+     * Reports the single model the framework has configured via {@link AiConfig},
+     * or an empty list when nothing is configured. Runtimes that can enumerate
+     * multiple models (e.g. provider list endpoints) should override this.
+     */
+    @Override
+    public java.util.List<String> models() {
+        var settings = AiConfig.get();
+        if (settings == null || settings.model() == null || settings.model().isBlank()) {
+            return java.util.List.of();
+        }
+        return java.util.List.of(settings.model());
+    }
+
+    /**
+     * Admit the call through the process-wide {@link org.atmosphere.ai.gateway.AiGatewayHolder}
+     * so per-user rate limits, credential resolution, and unified trace
+     * emission apply uniformly regardless of which framework runtime the
+     * caller picked. Every concrete runtime's {@link #doExecute} (and any
+     * equivalent cancel-aware entry point) MUST call this before issuing
+     * the native LLM dispatch, otherwise the gateway is a choke point on
+     * exactly one runtime — the credibility gap the v0.7 gist was called
+     * out on.
+     *
+     * <p>A rejected admission throws {@link IllegalStateException} with
+     * the gateway's rationale; callers must propagate (Correctness
+     * Invariant #3 — never ignore backpressure).</p>
+     *
+     * <p>Exposed as a static so Kotlin runtimes ({@code KoogAgentRuntime},
+     * {@code EmbabelAgentRuntime}) that implement {@link AgentRuntime}
+     * directly can call it without inheriting from this class.</p>
+     *
+     * @param runtimeName the runtime identifier (used for trace labels and
+     *                    the {@link org.atmosphere.ai.gateway.AiGateway}
+     *                    admit decision)
+     * @param context     the execution context whose {@code userId()} /
+     *                    {@code model()} seed the gateway decision
+     */
+    public static void admitThroughGateway(String runtimeName,
+                                           AgentExecutionContext context) {
+        var gateway = org.atmosphere.ai.gateway.AiGatewayHolder.get();
+        var userId = context.userId() != null
+                ? context.userId() : org.atmosphere.ai.gateway.AiGateway.ANONYMOUS_USER;
+        var decision = gateway.admit(userId, runtimeName,
+                context.model() != null ? context.model() : "default");
+        if (!decision.accepted()) {
+            throw new IllegalStateException(
+                    "AiGateway rejected call for user " + userId + ": " + decision.reason());
+        }
+    }
+
+    /** Instance convenience — delegates to the static with {@link #name()}. */
+    protected final void admitThroughGateway(AgentExecutionContext context) {
+        admitThroughGateway(name(), context);
+    }
+
+    /**
+     * Returns a human-readable description of the client type for error messages.
+     */
+    protected abstract String clientDescription();
+
+    @Override
+    public boolean isAvailable() {
+        try {
+            Class.forName(nativeClientClassName());
+            return true;
+        } catch (ClassNotFoundException e) {
+            return false;
+        }
+    }
+
+    @Override
+    public int priority() {
+        return 100;
+    }
+
+    @Override
+    public void configure(AiConfig.LlmSettings settings) {
+        if (nativeClient != null) {
+            return;
+        }
+        nativeClient = createNativeClient(settings);
+    }
+
+    @Override
+    public void execute(AgentExecutionContext context, StreamingSession session) {
+        var client = resolveClient(context);
+        session.progress("Connecting to " + name() + "...");
+        // Install the cross-runtime ToolLoopGuard before fireStart so the guard
+        // observes every onModelStart this runtime emits during the execute.
+        // No-op when no ToolLoopPolicy is attached to context.metadata().
+        var effectiveContext = org.atmosphere.ai.llm.ToolLoopGuard.installIfPresent(name(), context, session);
+        fireStart(effectiveContext);
+        try {
+            executeWithOuterRetry(client, effectiveContext, session);
+            // If the bridge drained the stream but surfaced an error out-of-band
+            // via session.error(...) (Spring AI reactive, ADK async callbacks,
+            // LC4j onError, Koog error frames), honour that state instead of
+            // reporting completion to listeners.
+            if (session.hasErrored()) {
+                fireError(effectiveContext, new java.util.concurrent.CancellationException(
+                        "stream reported error via session.error(...)"));
+            } else {
+                fireCompletion(effectiveContext);
+            }
+        } catch (RuntimeException e) {
+            fireError(effectiveContext, e);
+            throw e;
+        }
+    }
+
+    @Override
+    public ExecutionHandle executeWithHandle(
+            AgentExecutionContext context, StreamingSession session) {
+        var client = resolveClient(context);
+        session.progress("Connecting to " + name() + "...");
+        // Same ToolLoopGuard install as #execute — keeps the cap behavior
+        // identical across sync and cancel-aware entry points (Mode Parity).
+        var effectiveContext = org.atmosphere.ai.llm.ToolLoopGuard.installIfPresent(name(), context, session);
+        fireStart(effectiveContext);
+        try {
+            var handle = doExecuteWithHandle(client, effectiveContext, session);
+            handle.whenDone().whenComplete((ok, err) -> {
+                // Three outcomes map to two listener events:
+                //   1. future completed exceptionally  → fireError(err)
+                //   2. future completed normally, session errored out of band → fireError
+                //   3. future completed normally, session clean → fireCompletion
+                // Without the session.hasErrored() check, case 2 was silently
+                // misreported as onCompletion — Spring AI and ADK reactive
+                // bridges can drain a faulted stream while still resolving
+                // whenDone() with a null value.
+                if (err != null) {
+                    fireError(effectiveContext, err);
+                } else if (session.hasErrored()) {
+                    fireError(effectiveContext, new java.util.concurrent.CancellationException(
+                            "stream reported error via session.error(...)"));
+                } else {
+                    fireCompletion(effectiveContext);
+                }
+            });
+            return handle;
+        } catch (RuntimeException e) {
+            fireError(effectiveContext, e);
+            throw e;
+        }
+    }
+
+    /**
+     * Resolve (or lazily create) the native client. Factored out so both
+     * {@link #execute} and {@link #executeWithHandle} share identical setup
+     * semantics and error messages.
+     */
+    @SuppressWarnings("unchecked")
+    private C resolveClient(AgentExecutionContext context) {
+        // Agent-scoped settings (workspace RUNTIME.md, registre#39): build and
+        // cache a dedicated client so one agent's model/endpoint pin never
+        // reconfigures the shared client the rest of the JVM uses.
+        var agentId = context != null ? context.agentId() : null;
+        var scopedSettings = AiConfig.agentScoped(agentId);
+        if (scopedSettings != null) {
+            var scoped = agentClients.compute(agentId, (id, existing) ->
+                    existing != null && existing.settings() == scopedSettings
+                            ? existing
+                            : new ScopedClient(scopedSettings, createNativeClient(scopedSettings)));
+            return (C) scoped.client();
+        }
+        var client = nativeClient;
+        if (client == null) {
+            var settings = AiConfig.get();
+            if (settings == null) {
+                settings = AiConfig.fromEnvironment();
+            }
+            configure(settings);
+            client = nativeClient;
+        }
+        if (client == null) {
+            throw new IllegalStateException(
+                    name() + ": " + clientDescription() + " not configured. "
+                            + configurationHint());
+        }
+        return client;
+    }
+
+    /**
+     * Returns a hint message for the {@link IllegalStateException} thrown when
+     * the native client is not configured.
+     */
+    protected String configurationHint() {
+        return "Check your classpath and configuration.";
+    }
+
+    /**
+     * Phase 3 helper: fire {@link AgentLifecycleListener#onStart} on every
+     * listener attached to the context. Runtime bridges call this once at the
+     * beginning of their execution path. Exceptions thrown by listeners are
+     * caught and logged at TRACE so one broken listener cannot abort the
+     * pipeline.
+     */
+    protected static void fireStart(AgentExecutionContext context) {
+        for (var listener : context.listeners()) {
+            try {
+                listener.onStart(context);
+            } catch (Exception e) {
+                lifecycleLogger.trace("AgentLifecycleListener.onStart failed: {}", e.getMessage(), e);
+            }
+        }
+    }
+
+    /** Phase 3 helper: fire {@link AgentLifecycleListener#onToolCall}. */
+    protected static void fireToolCall(AgentExecutionContext context, String toolName,
+                                        Map<String, Object> arguments) {
+        for (var listener : context.listeners()) {
+            try {
+                listener.onToolCall(toolName, arguments);
+            } catch (Exception e) {
+                lifecycleLogger.trace("AgentLifecycleListener.onToolCall failed: {}", e.getMessage(), e);
+            }
+        }
+    }
+
+    /** Phase 3 helper: fire {@link AgentLifecycleListener#onToolResult}. */
+    protected static void fireToolResult(AgentExecutionContext context, String toolName,
+                                          String resultPreview) {
+        for (var listener : context.listeners()) {
+            try {
+                listener.onToolResult(toolName, resultPreview);
+            } catch (Exception e) {
+                lifecycleLogger.trace("AgentLifecycleListener.onToolResult failed: {}", e.getMessage(), e);
+            }
+        }
+    }
+
+    /** Phase 3 helper: fire {@link AgentLifecycleListener#onCompletion}. */
+    protected static void fireCompletion(AgentExecutionContext context) {
+        for (var listener : context.listeners()) {
+            try {
+                listener.onCompletion(context);
+            } catch (Exception e) {
+                lifecycleLogger.trace("AgentLifecycleListener.onCompletion failed: {}", e.getMessage(), e);
+            }
+        }
+    }
+
+    /** Phase 3 helper: fire {@link AgentLifecycleListener#onError}. */
+    protected static void fireError(AgentExecutionContext context, Throwable error) {
+        for (var listener : context.listeners()) {
+            try {
+                listener.onError(context, error);
+            } catch (Exception e) {
+                lifecycleLogger.trace("AgentLifecycleListener.onError failed: {}", e.getMessage(), e);
+            }
+        }
+    }
+
+    /**
+     * Subclass hook: return {@code true} when this runtime already honours
+     * {@link AgentExecutionContext#retryPolicy()} at the native client layer
+     * (Built-in's {@link org.atmosphere.ai.llm.OpenAiCompatibleClient}'s
+     * {@code sendWithRetry} loop). When {@code true}, the base class skips
+     * the outer retry wrapper in {@link #execute} so we do not double-retry.
+     *
+     * <p>Default: {@code false} — framework runtimes inherit the outer
+     * wrapper, which retries on pre-stream transient failures.</p>
+     */
+    protected boolean ownsPerRequestRetry() {
+        return false;
+    }
+
+    /**
+     * Outer retry wrapper for framework runtimes that cannot hook
+     * {@link AgentExecutionContext#retryPolicy()} into their native HTTP
+     * client. When the caller supplies a non-default {@link RetryPolicy}
+     * and this subclass does not {@link #ownsPerRequestRetry()}, the base
+     * class retries {@link #doExecute} on pre-stream transient failures
+     * until the policy's {@code maxRetries} budget is exhausted.
+     *
+     * <p><b>Safety semantics:</b> we only retry when the bridge threw a
+     * {@link RuntimeException} BEFORE calling {@link StreamingSession#error(Throwable)}
+     * — i.e., the session is still in a virgin state, the client has not
+     * seen any terminal error frame, and retrying is safe. Once the
+     * session reports an error out-of-band (reactive streams path, ADK
+     * async callbacks, LC4j {@code onError}, Koog error frames), retry is
+     * aborted and the exception propagates, because the caller has
+     * already observed terminal state.</p>
+     *
+     * <p>This delivers an "at least N retries" guarantee on top of
+     * whatever retries the framework's own HTTP client performs — strictly
+     * more retries than the caller asked for, never fewer — which is the
+     * correct direction for honouring a per-request override (Correctness
+     * Invariant #7, Mode Parity).</p>
+     */
+    private void executeWithOuterRetry(C client, AgentExecutionContext context,
+                                       StreamingSession session) {
+        var policy = context.retryPolicy();
+        if (policy == null || policy.isInheritSentinel() || policy.maxRetries() <= 0
+                || ownsPerRequestRetry()) {
+            doExecute(client, context, session);
+            return;
+        }
+        int attempt = 0;
+        while (true) {
+            try {
+                doExecute(client, context, session);
+                return;
+            } catch (RuntimeException e) {
+                // Typed gate: a classified terminal failure (auth, context
+                // length, content filter, invalid request) is never retried
+                // even with budget remaining — RetryPolicy.shouldRetry
+                // consults the AiProviderException taxonomy. Unclassified
+                // RuntimeExceptions keep the historical retry-any behavior.
+                if (attempt >= policy.maxRetries() || session.hasErrored()
+                        || (e instanceof AiException classified
+                                && !policy.shouldRetry(classified, attempt))) {
+                    throw e;
+                }
+                var delay = retryDelay(policy, attempt, e);
+                attempt++;
+                lifecycleLogger.info(
+                        "{} outer-retry attempt {}/{} after {}ms (cause: {})",
+                        name(), attempt, policy.maxRetries(),
+                        delay.toMillis(), e.getMessage());
+                if (!delay.isZero() && !delay.isNegative()) {
+                    try {
+                        Thread.sleep(delay.toMillis());
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw e;
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Backoff before the next outer-retry attempt. A classified
+     * {@link AiProviderException.RateLimited} carrying the provider's
+     * {@code Retry-After} hint wins (capped at 60s so a hostile value cannot
+     * pin the worker — same cap as the HTTP-layer retry loops); otherwise
+     * the policy's exponential {@link RetryPolicy#delayForAttempt}.
+     */
+    private static java.time.Duration retryDelay(RetryPolicy policy, int attempt,
+                                                 RuntimeException e) {
+        if (e instanceof AiProviderException.RateLimited rateLimited) {
+            var hinted = rateLimited.retryAfter();
+            if (hinted.isPresent()) {
+                var capped = java.time.Duration.ofSeconds(60);
+                return hinted.get().compareTo(capped) <= 0 ? hinted.get() : capped;
+            }
+        }
+        return policy.delayForAttempt(attempt);
+    }
+
+    /**
+     * Assemble the canonical message list from an execution context:
+     * system prompt (if present) + conversation history + current user message.
+     *
+     * <p>Runtimes that need framework-specific message types can call this
+     * method first and then translate each {@link ChatMessage} to their
+     * native type.</p>
+     *
+     * @param context the execution context
+     * @return an unmodifiable list of messages in conversation order
+     */
+    protected static List<ChatMessage> assembleMessages(AgentExecutionContext context) {
+        var messages = new ArrayList<ChatMessage>();
+        if (context.systemPrompt() != null && !context.systemPrompt().isEmpty()) {
+            messages.add(ChatMessage.system(context.systemPrompt()));
+        }
+        for (var h : context.history()) {
+            messages.add(new ChatMessage(h.role(), h.content()));
+        }
+        messages.add(ChatMessage.user(context.message()));
+        return List.copyOf(messages);
+    }
+}

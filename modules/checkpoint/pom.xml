@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <parent>
+        <groupId>org.atmosphere</groupId>
+        <artifactId>atmosphere-project</artifactId>
+        <version>4.0.72-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <modelVersion>4.0.0</modelVersion>
+    <artifactId>atmosphere-checkpoint</artifactId>
+    <packaging>jar</packaging>
+    <name>atmosphere-checkpoint</name>
+    <description>Durable execution for Atmosphere agents — CheckpointStore SPI, WorkflowSnapshot, fork/resume semantics, and an opt-in bridge to CoordinationJournal</description>
+    <url>https://github.com/Atmosphere/atmosphere</url>
+
+    <properties>
+        <atmosphere.module.name>org.atmosphere.checkpoint</atmosphere.module.name>
+    </properties>
+
+    <dependencies>
+        <!-- atmosphere-ai is the SPI home for AgentRuntime / AgentSnapshot /
+             AgentExecutionContext, which the AgentPassivation helper
+             reads from and writes back to. Optional so apps that use the
+             core CheckpointStore for non-AI workflows don't pull
+             modules/ai transitively. Callers that use AgentPassivation
+             already depend on modules/ai. -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-ai</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Optional: users who bring coordinator on the classpath can use
+             the CheckpointingCoordinationJournal decorator bridge. The core
+             SPI has no dependency on the coordinator. -->
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-coordinator</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Optional: SQLite-backed persistent checkpoint store -->
+        <dependency>
+            <groupId>org.xerial</groupId>
+            <artifactId>sqlite-jdbc</artifactId>
+            <version>3.53.2.0</version>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>tools.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${jackson.version}</version>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Used directly (TypeReference in SqliteCheckpointStore), not merely
+             via databind. Optional to match — only the SQLite store needs it. -->
+        <dependency>
+            <groupId>tools.jackson.core</groupId>
+            <artifactId>jackson-core</artifactId>
+            <version>${jackson.version}</version>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Spring Boot auto-configuration for the default CheckpointStore bean
+             (AtmosphereCheckpointAutoConfiguration). Provided/optional so the
+             core SPI stays usable from non-Spring runtimes (Quarkus, plain
+             Servlet) without dragging Spring Boot onto their classpath; Spring
+             Boot apps already have it via the starter. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-autoconfigure</artifactId>
+            <version>${spring-boot.version}</version>
+            <scope>provided</scope>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j-version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>${logback-version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>

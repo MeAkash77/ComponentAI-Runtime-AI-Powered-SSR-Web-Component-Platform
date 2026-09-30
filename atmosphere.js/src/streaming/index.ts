@@ -1,0 +1,330 @@
+/*
+ * Copyright 2011-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import type { AtmosphereRequest, Subscription } from '../types';
+import type { StreamingHandlers, StreamingHandle, StreamingMessage, SessionStats, RoutingInfo, SendOptions, PolicyDenial } from './types';
+import { parseStreamingMessage } from './decoder';
+import { parsePolicyDenial } from './policy-denial';
+import { parseToolPart } from './tool-part';
+import { Atmosphere } from '../core/atmosphere';
+import { ConnectionStatus } from '../resilience';
+
+/**
+ * Creates a streaming subscription to an Atmosphere endpoint that speaks the
+ * AI streaming wire protocol.
+ *
+ * This is the framework-agnostic core. The React/Vue/Svelte hooks wrap this.
+ *
+ * ```ts
+ * import { atmosphere } from 'atmosphere.js';
+ * import { subscribeStreaming } from 'atmosphere.js/streaming';
+ *
+ * const handle = await subscribeStreaming(atmosphere, {
+ *   url: '/ai/chat',
+ *   transport: 'websocket',
+ * }, {
+ *   onStreamingText: (text) => process.stdout.write(text),
+ *   onComplete: () => console.log('\nDone!'),
+ *   onError: (err) => console.error(err),
+ * });
+ *
+ * handle.send('What is Atmosphere?');
+ * ```
+ */
+export async function subscribeStreaming(
+  atmosphere: Atmosphere,
+  request: AtmosphereRequest,
+  handlers: StreamingHandlers,
+): Promise<StreamingHandle> {
+  let sessionId: string | null = null;
+  let lastSeq = -1;
+
+  // Session stats tracking (reset between sends)
+  let streamingTextCount = 0;
+  let startTime: number | null = null;
+  let routing: RoutingInfo = {};
+
+  const connectionStatus = new ConnectionStatus({ initialTransport: request.transport });
+
+  const sub: Subscription = await atmosphere.subscribe<string>(request, connectionStatus.wrap({
+    open: () => {
+      handlers.onOpen?.();
+    },
+    close: () => {
+      handlers.onClose?.();
+    },
+    reconnect: () => {
+      handlers.onReconnect?.();
+    },
+    reopen: () => {
+      handlers.onReopen?.();
+    },
+    clientTimeout: () => {
+      handlers.onClientTimeout?.();
+    },
+    transportFailure: (reason) => {
+      handlers.onTransportFailure?.(reason);
+    },
+    failureToReconnect: () => {
+      handlers.onFailureToReconnect?.();
+    },
+    message: (response) => {
+      const raw = response.responseBody;
+      if (typeof raw !== 'string') return;
+
+      // Fire the raw passthrough first — auxiliary frames (presence,
+      // room state) ride on the same broadcaster as the streaming
+      // protocol and need to reach consumer code even when they don't
+      // parse as streaming messages.
+      handlers.onRawMessage?.(raw);
+
+      const msg = parseStreamingMessage(raw);
+      if (!msg) return;
+
+      // Track session ID from first message
+      if (!sessionId) sessionId = msg.sessionId;
+
+      // Ignore messages from different sessions (e.g., stale cache replay)
+      if (msg.sessionId !== sessionId) return;
+
+      // Dedup via sequence number
+      if (msg.seq <= lastSeq) return;
+      lastSeq = msg.seq;
+
+      // Durable crash-resume run-id capture happens universally in the transport
+      // layer (BaseTransport.captureRunId), so it covers direct subscribe()
+      // callers — the Atmosphere Console — as well as this helper.
+
+      dispatch(msg, handlers, { streamingTextCount, startTime, routing }, (tc, st, rt) => {
+        streamingTextCount = tc;
+        startTime = st;
+        routing = rt;
+      });
+    },
+    error: (err) => {
+      handlers.onError?.(err.message);
+    },
+  }));
+
+  const resetSession = () => {
+    sessionId = null;
+    lastSeq = -1;
+    streamingTextCount = 0;
+    startTime = null;
+    routing = {};
+  };
+
+  return {
+    get sessionId() {
+      return sessionId;
+    },
+    connectionStatus,
+    send(message: string | object, options?: SendOptions) {
+      // Reset tracking state for new session
+      resetSession();
+      sub.push(buildStreamingPayload(message, options));
+    },
+    resetSession,
+    async close() {
+      await sub.close();
+    },
+  };
+}
+
+/**
+ * Build the wire payload for a prompt: the bare message, or the
+ * {@code { prompt, hints }} envelope the server's cost/latency router
+ * expects when {@link SendOptions} carry routing hints.
+ *
+ * Exported so code paths that must produce the exact same bytes without
+ * going through {@link StreamingHandle#send} — chiefly an
+ * {@code request.offlineQueue} enqueue while the transport is unusable —
+ * cannot drift from the shape the handle would have pushed.
+ */
+export function buildStreamingPayload(
+  message: string | object,
+  options?: SendOptions,
+): string | object {
+  if (options && (options.maxCost !== undefined || options.maxLatencyMs !== undefined)) {
+    return { prompt: message, hints: { maxCost: options.maxCost, maxLatencyMs: options.maxLatencyMs } };
+  }
+  return message;
+}
+
+interface TrackingState {
+  streamingTextCount: number;
+  startTime: number | null;
+  routing: RoutingInfo;
+}
+
+/**
+ * Route an error message. Governance denials fire {@code onPolicyDenied}
+ * (when a handler is registered) and {@code onError}; transport errors
+ * only fire {@code onError}. Firing both keeps existing {@code onError}-only
+ * consumers working while giving new code a typed path.
+ */
+function dispatchError(
+  message: string,
+  data: Record<string, unknown> | undefined,
+  handlers: StreamingHandlers,
+): void {
+  let denial: PolicyDenial | null = null;
+
+  // Prefer a structured server payload when the AiEvent carries one —
+  // data.policyName + data.reason are the canonical keys emitted by the
+  // Java governance layer when it prefers structured over string.
+  if (data && (typeof data.policyName === 'string' || typeof data.policy === 'string')) {
+    denial = {
+      kind: (data.kind === 'guardrail') ? 'guardrail' : 'policy',
+      policyName: (data.policyName ?? data.policy) as string,
+      reason: (data.reason as string) ?? message,
+      raw: message,
+    };
+  } else {
+    denial = parsePolicyDenial(message);
+  }
+
+  if (denial) {
+    handlers.onPolicyDenied?.(denial);
+  }
+  handlers.onError?.(message);
+}
+
+function extractRouting(key: string, value: unknown, routing: RoutingInfo): boolean {
+  if (!key.startsWith('routing.')) return false;
+  const field = key.substring('routing.'.length);
+  switch (field) {
+    case 'model':
+      routing.model = value as string;
+      return true;
+    case 'cost':
+      routing.cost = value as number;
+      return true;
+    case 'latency':
+      routing.latency = value as number;
+      return true;
+    default:
+      return false;
+  }
+}
+
+function dispatch(
+  msg: StreamingMessage,
+  handlers: StreamingHandlers,
+  state: TrackingState,
+  updateState: (streamingTextCount: number, startTime: number | null, routing: RoutingInfo) => void,
+): void {
+  // Handle AiEvent format (event: "text-delta", "tool-start", etc.)
+  if (msg.event) {
+    const data = (typeof msg.data === 'object' && msg.data !== null ? msg.data : {}) as Record<string, unknown>;
+    switch (msg.event) {
+      case 'text-delta':
+        if (data.text) {
+          handlers.onStreamingText?.(data.text as string, msg.seq);
+          state.streamingTextCount++;
+          if (!state.startTime) state.startTime = Date.now();
+          updateState(state.streamingTextCount, state.startTime, state.routing);
+        }
+        break;
+      case 'progress':
+        handlers.onProgress?.(data.message as string ?? '', msg.seq);
+        break;
+      case 'complete': {
+        handlers.onComplete?.(data.summary as string | undefined);
+        const elapsed = state.startTime ? Date.now() - state.startTime : 0;
+        const stats: SessionStats = {
+          totalStreamingTexts: state.streamingTextCount,
+          elapsedMs: elapsed,
+          status: 'complete',
+          streamingTextsPerSecond: elapsed > 0 ? (state.streamingTextCount / elapsed) * 1000 : 0,
+        };
+        handlers.onSessionComplete?.(stats, { ...state.routing });
+        break;
+      }
+      case 'error': {
+        const errorMsg = data.message as string ?? 'Unknown error';
+        dispatchError(errorMsg, data as Record<string, unknown>, handlers);
+        const elapsed = state.startTime ? Date.now() - state.startTime : 0;
+        const stats: SessionStats = {
+          totalStreamingTexts: state.streamingTextCount,
+          elapsedMs: elapsed,
+          status: 'error',
+          streamingTextsPerSecond: elapsed > 0 ? (state.streamingTextCount / elapsed) * 1000 : 0,
+        };
+        handlers.onSessionComplete?.(stats, { ...state.routing });
+        break;
+      }
+      default: {
+        // Typed tool-part lifecycle for tool-start/tool-result/tool-error;
+        // null for any other event type (agent-step, entities, ...).
+        const toolPart = parseToolPart(msg.event, data);
+        if (toolPart) {
+          handlers.onToolPart?.(toolPart);
+        }
+        // Always fire onAiEvent too, so existing untyped consumers keep working.
+        handlers.onAiEvent?.(msg.event, data);
+        break;
+      }
+    }
+    return;
+  }
+
+  // Legacy format (type: "streaming-text", etc.)
+  switch (msg.type) {
+    case 'streaming-text':
+      if (msg.data !== undefined) {
+        handlers.onStreamingText?.(msg.data, msg.seq);
+        state.streamingTextCount++;
+        if (!state.startTime) state.startTime = Date.now();
+        updateState(state.streamingTextCount, state.startTime, state.routing);
+      }
+      break;
+    case 'progress':
+      if (msg.data !== undefined) handlers.onProgress?.(msg.data, msg.seq);
+      break;
+    case 'complete': {
+      handlers.onComplete?.(msg.data);
+      const elapsed = state.startTime ? Date.now() - state.startTime : 0;
+      const stats: SessionStats = {
+        totalStreamingTexts: state.streamingTextCount,
+        elapsedMs: elapsed,
+        status: 'complete',
+        streamingTextsPerSecond: elapsed > 0 ? (state.streamingTextCount / elapsed) * 1000 : 0,
+      };
+      handlers.onSessionComplete?.(stats, { ...state.routing });
+      break;
+    }
+    case 'error': {
+      dispatchError(msg.data ?? 'Unknown error', undefined, handlers);
+      const elapsed = state.startTime ? Date.now() - state.startTime : 0;
+      const stats: SessionStats = {
+        totalStreamingTexts: state.streamingTextCount,
+        elapsedMs: elapsed,
+        status: 'error',
+        streamingTextsPerSecond: elapsed > 0 ? (state.streamingTextCount / elapsed) * 1000 : 0,
+      };
+      handlers.onSessionComplete?.(stats, { ...state.routing });
+      break;
+    }
+    case 'metadata':
+      if (msg.key !== undefined) {
+        extractRouting(msg.key, msg.value, state.routing);
+        updateState(state.streamingTextCount, state.startTime, state.routing);
+        handlers.onMetadata?.(msg.key, msg.value);
+      }
+      break;
+  }
+}

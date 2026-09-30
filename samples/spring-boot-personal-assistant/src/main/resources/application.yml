@@ -1,0 +1,89 @@
+server:
+  port: 8080
+
+atmosphere:
+  # Tell the Spring Boot starter where the sample's @Coordinator / @Agent
+  # classes live. Without this the starter only scans core org.atmosphere.*
+  # packages and the crew never registers.
+  packages: org.atmosphere.samples.springboot.personalassistant
+
+  auth:
+    # The TokenValidator in PersonalAssistantApplication exists so long-term memory
+    # has a principal to key on — NOT to gate the transport. A validator bean
+    # otherwise activates AuthInterceptor, which REJECTS every connection that
+    # carries no token: the sample would refuse to open at all, which is how the
+    # 2026-08-31 e2e cross-tab-isolation run went red. Keep the validator for the
+    # admin write surface and leave the transport open; PrimaryAssistant.onReady
+    # reads the token itself, and a caller without one simply gets no memory.
+    transport-enabled: false
+
+  # Workspace the foundation primitives load from on startup. Override with
+  # --atmosphere.workspace=/path/to/workspace to point at your own OpenClaw
+  # directory. Defaults resolve to the bundled workspace under
+  # agent-workspace/.
+  workspace: classpath:agent-workspace
+
+  ai:
+    # Deep-agent harness — three surfaces, no app-wide flag needed here:
+    #   1. @Agent and @Coordinator classes are batteries-included by default
+    #      (harness() defaults to {Harness.ALL}) — the PrimaryAssistant
+    #      coordinator keeps fleet delegation on this way; harness = {} opts
+    #      an agent down to a bare loop. See ResearchAgent.
+    #   2. A plain @AiEndpoint is bare by default and opts in per endpoint:
+    #      UpstreamMcpAgent declares harness = {Harness.ALL} for its
+    #      conversation + long-term memory (facts extracted at session close,
+    #      recalled on the next connection) and prompt-cache default — it
+    #      replaced the sample's former three-class static-holder wiring.
+    #   3. The app-wide atmosphere.ai.harness.enabled flag is tri-state:
+    #      unset (this sample) defers to the annotations, true gives every
+    #      bare @AiEndpoint the full harness, false is the kill switch that
+    #      beats every annotation; atmosphere.ai.harness.exclude-paths carves
+    #      out individual endpoint paths.
+    # Per-primitive runtime state is visible in the console
+    # (/api/console/info, "harness" section).
+
+    # Any runtime adapter artifact on the classpath is picked up by
+    # AgentRuntime ServiceLoader discovery. Switching runtimes is a Maven
+    # dependency swap plus setting this to the runtime name.
+    runtime: spring-ai
+    # This proof sample keeps a deterministic keyword-router fallback that
+    # runs without LLM credentials, so we opt out of the starter's
+    # fail-fast default. Production apps should leave fail-fast on.
+    fail-fast: false
+
+  # DEMO-ONLY: open the console Workspace tab's read surfaces (plan, workspace
+  # files) without a token. The default is deny — model-written file contents
+  # are sensitive (Correctness Invariant #6); production deployments remove
+  # this and authenticate with X-Atmosphere-Auth.
+  admin:
+    workspace-read-auth-required: false
+
+  # Outbound-MCP demo: UpstreamMcpAgent connects to a remote MCP server at
+  # this URL on startup and surfaces its tools to the agent loop via
+  # McpToolsInterceptor. Default points at the bundled spring-boot-mcp-server
+  # (port 8083) so the two samples can run side-by-side. Override to test
+  # against any external MCP server (Anthropic reference servers, GitHub,
+  # filesystem, etc.).
+  mcp:
+    client:
+      endpoint: ${ATMOSPHERE_MCP_CLIENT_ENDPOINT:http://localhost:8083/atmosphere/mcp}
+
+# LLM wiring — runtime is selected by classpath. With only atmosphere-ai on
+# the default classpath, the Built-in OpenAI-compatible runtime wins. Add
+# atmosphere-langchain4j (via the runtime-langchain4j Maven profile) to swap
+# to that runtime — the @AiEndpoint code stays unchanged.
+llm:
+  mode: ${LLM_MODE:remote}
+  model: ${LLM_MODEL:gemini-2.5-flash-lite}
+  base-url: ${LLM_BASE_URL:}
+  api-key: ${LLM_API_KEY:${GEMINI_API_KEY:}}
+
+spring:
+  application:
+    name: atmosphere-personal-assistant
+  ai:
+    openai:
+      api-key: ${OPENAI_API_KEY:}
+      chat:
+        options:
+          model: ${OPENAI_MODEL:gpt-4o-mini}

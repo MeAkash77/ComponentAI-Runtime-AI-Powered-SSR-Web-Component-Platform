@@ -1,0 +1,288 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.checkpoint;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.stream.Stream;
+
+/**
+ * Default {@link CheckpointStore} backed by in-memory
+ * {@link ConcurrentHashMap}s. Suitable for development, tests, and single-JVM
+ * deployments where durability across restarts is not required.
+ *
+ * <p>Enforces a maximum snapshot count to prevent unbounded memory growth.
+ * When the limit is exceeded, the oldest snapshots (by {@code createdAt}) are
+ * evicted — except each coordination's newest snapshot (its resume anchor),
+ * which is evicted only when the cap is smaller than the number of live
+ * coordinations (logged at WARN). The default cap is
+ * {@value #DEFAULT_MAX_SNAPSHOTS}.</p>
+ */
+public final class InMemoryCheckpointStore implements CheckpointStore {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(InMemoryCheckpointStore.class);
+
+    public static final int DEFAULT_MAX_SNAPSHOTS = 10_000;
+
+    private final int maxSnapshots;
+    private final ConcurrentHashMap<CheckpointId, WorkflowSnapshot<?>> snapshots = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Set<CheckpointId>> coordIndex = new ConcurrentHashMap<>();
+    private final CopyOnWriteArrayList<CheckpointListener> listeners = new CopyOnWriteArrayList<>();
+
+    public InMemoryCheckpointStore() {
+        this(DEFAULT_MAX_SNAPSHOTS);
+    }
+
+    public InMemoryCheckpointStore(int maxSnapshots) {
+        if (maxSnapshots <= 0) {
+            throw new IllegalArgumentException("maxSnapshots must be positive, got " + maxSnapshots);
+        }
+        this.maxSnapshots = maxSnapshots;
+    }
+
+    @Override
+    public void start() {
+        // no-op for in-memory
+    }
+
+    @Override
+    public void stop() {
+        snapshots.clear();
+        coordIndex.clear();
+        listeners.clear();
+    }
+
+    @Override
+    public <S> WorkflowSnapshot<S> save(WorkflowSnapshot<S> snapshot) {
+        Objects.requireNonNull(snapshot, "snapshot must not be null");
+        // Remove stale index entry if overwriting with different coordinationId
+        var previous = snapshots.put(snapshot.id(), snapshot);
+        if (previous != null && !previous.coordinationId().equals(snapshot.coordinationId())) {
+            removeFromIndex(snapshot.id(), previous.coordinationId());
+        }
+        indexByCoordination(snapshot.id(), snapshot.coordinationId());
+        evictIfNeeded();
+        dispatch(new CheckpointEvent.Saved(snapshot.id(), snapshot.coordinationId(), Instant.now()));
+        return snapshot;
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public <S> Optional<WorkflowSnapshot<S>> load(CheckpointId id) {
+        Objects.requireNonNull(id, "id must not be null");
+        var snapshot = (WorkflowSnapshot<S>) snapshots.get(id);
+        if (snapshot != null) {
+            dispatch(new CheckpointEvent.Loaded(id, snapshot.coordinationId(), Instant.now()));
+        }
+        return Optional.ofNullable(snapshot);
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public <S> WorkflowSnapshot<S> fork(CheckpointId sourceId, S newState) {
+        Objects.requireNonNull(sourceId, "sourceId must not be null");
+        var source = (WorkflowSnapshot<S>) snapshots.get(sourceId);
+        if (source == null) {
+            throw new IllegalArgumentException("Unknown source checkpoint: " + sourceId);
+        }
+        var forked = WorkflowSnapshot.<S>builder()
+                .id(CheckpointId.random())
+                .parentId(sourceId)
+                .coordinationId(source.coordinationId())
+                .agentName(source.agentName())
+                .state(newState)
+                .metadata(source.metadata())
+                .createdAt(Instant.now())
+                .build();
+        snapshots.put(forked.id(), forked);
+        indexByCoordination(forked.id(), forked.coordinationId());
+        evictIfNeeded();
+        dispatch(new CheckpointEvent.Forked(forked.id(), sourceId, forked.coordinationId(), Instant.now()));
+        return forked;
+    }
+
+    @Override
+    public List<WorkflowSnapshot<?>> list(CheckpointQuery query) {
+        Objects.requireNonNull(query, "query must not be null");
+
+        // Use the secondary index for coordinationId queries (O(K) instead
+        // of O(N) where K = snapshots for that coordination).
+        Stream<WorkflowSnapshot<?>> stream;
+        if (query.coordinationId() != null) {
+            var ids = coordIndex.getOrDefault(query.coordinationId(), Set.of());
+            stream = ids.stream()
+                    .map(snapshots::get)
+                    .filter(Objects::nonNull);
+        } else {
+            stream = snapshots.values().stream();
+        }
+        if (query.agentName() != null) {
+            stream = stream.filter(s -> query.agentName().equals(s.agentName()));
+        }
+        if (query.since() != null) {
+            stream = stream.filter(s -> !s.createdAt().isBefore(query.since()));
+        }
+        if (query.until() != null) {
+            stream = stream.filter(s -> !s.createdAt().isAfter(query.until()));
+        }
+
+        // Stable ordering: oldest first, then by id as a tiebreaker.
+        stream = stream.sorted(
+                java.util.Comparator.comparing(WorkflowSnapshot<?>::createdAt)
+                        .thenComparing(s -> s.id().value()));
+
+        if (query.limit() > 0) {
+            stream = stream.limit(query.limit());
+        }
+        return stream.toList();
+    }
+
+    @Override
+    public boolean delete(CheckpointId id) {
+        Objects.requireNonNull(id, "id must not be null");
+        var removed = snapshots.remove(id);
+        if (removed != null) {
+            removeFromIndex(id, removed.coordinationId());
+            dispatch(new CheckpointEvent.Deleted(id, removed.coordinationId(), Instant.now()));
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    public int deleteCoordination(String coordinationId) {
+        Objects.requireNonNull(coordinationId, "coordinationId must not be null");
+        // Use the index to find all snapshots for this coordination (O(K)
+        // instead of scanning the full store).
+        var ids = coordIndex.remove(coordinationId);
+        if (ids == null || ids.isEmpty()) {
+            return 0;
+        }
+        int removed = 0;
+        for (var id : ids) {
+            var snapshot = snapshots.remove(id);
+            if (snapshot != null) {
+                dispatch(new CheckpointEvent.Deleted(id, coordinationId, Instant.now()));
+                removed++;
+            }
+        }
+        return removed;
+    }
+
+    @Override
+    public void addListener(CheckpointListener listener) {
+        Objects.requireNonNull(listener, "listener must not be null");
+        listeners.add(listener);
+    }
+
+    @Override
+    public void removeListener(CheckpointListener listener) {
+        listeners.remove(listener);
+    }
+
+    /** Current number of snapshots held (exposed for testing + diagnostics). */
+    public int size() {
+        return snapshots.size();
+    }
+
+    private void dispatch(CheckpointEvent event) {
+        for (var listener : listeners) {
+            try {
+                listener.onEvent(event);
+            } catch (RuntimeException ex) {
+                LOGGER.warn("CheckpointListener {} threw an exception handling {}",
+                        listener.getClass().getName(), event, ex);
+            }
+        }
+    }
+
+    private void indexByCoordination(CheckpointId id, String coordinationId) {
+        if (coordinationId != null) {
+            coordIndex.computeIfAbsent(coordinationId, k -> ConcurrentHashMap.newKeySet()).add(id);
+        }
+    }
+
+    private void removeFromIndex(CheckpointId id, String coordinationId) {
+        if (coordinationId != null) {
+            coordIndex.computeIfPresent(coordinationId, (k, set) -> {
+                set.remove(id);
+                return set.isEmpty() ? null : set;
+            });
+        }
+    }
+
+    private void evictIfNeeded() {
+        if (snapshots.size() <= maxSnapshots) {
+            return;
+        }
+        // Snapshot the entries, sort by createdAt ascending, evict oldest
+        // until within bounds — but never a coordination's newest snapshot
+        // (its resume anchor) while non-anchor snapshots remain, so
+        // unrelated traffic cannot delete a dormant workflow's only way
+        // back. Concurrent saves during eviction are tolerated: we only
+        // remove entries whose value has not changed since we observed it,
+        // via remove(key, value).
+        var ordered = snapshots.entrySet().stream()
+                .sorted(java.util.Map.Entry.comparingByValue(
+                        java.util.Comparator.comparing(WorkflowSnapshot<?>::createdAt)))
+                .toList();
+        // Ascending createdAt order: the last write per coordination wins,
+        // leaving each coordination's newest snapshot id — its anchor.
+        var anchorByCoordination = new java.util.HashMap<String, CheckpointId>();
+        for (var entry : ordered) {
+            anchorByCoordination.put(entry.getValue().coordinationId(), entry.getKey());
+        }
+        var anchors = new java.util.HashSet<>(anchorByCoordination.values());
+        int overflow = snapshots.size() - maxSnapshots;
+        for (var entry : ordered) {
+            if (overflow <= 0) {
+                break;
+            }
+            if (anchors.contains(entry.getKey())) {
+                continue;
+            }
+            if (snapshots.remove(entry.getKey(), entry.getValue())) {
+                removeFromIndex(entry.getKey(), entry.getValue().coordinationId());
+                overflow--;
+            }
+        }
+        if (overflow > 0) {
+            // Only anchors remain — the cap is smaller than the number of
+            // live coordinations. Bounding storage wins (Invariant #3), but
+            // loudly, because resume anchors are being lost.
+            LOGGER.warn("Checkpoint cap {} is below the number of live coordinations — "
+                    + "evicting {} resume anchor(s). Raise maxSnapshots or reap completed "
+                    + "runs via deleteCoordination().", maxSnapshots, overflow);
+            for (var entry : ordered) {
+                if (overflow <= 0) {
+                    break;
+                }
+                if (snapshots.remove(entry.getKey(), entry.getValue())) {
+                    removeFromIndex(entry.getKey(), entry.getValue().coordinationId());
+                    overflow--;
+                }
+            }
+        }
+    }
+}

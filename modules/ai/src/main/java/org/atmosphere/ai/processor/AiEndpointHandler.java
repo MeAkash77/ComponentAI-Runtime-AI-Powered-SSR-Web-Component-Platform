@@ -1,0 +1,1449 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.ai.processor;
+
+import org.atmosphere.ai.AiConfig;
+import org.atmosphere.ai.AiConversationMemory;
+import org.atmosphere.ai.AiGuardrail;
+import org.atmosphere.ai.AiInterceptor;
+import org.atmosphere.ai.AiMetrics;
+import org.atmosphere.ai.AiStreamingSession;
+import org.atmosphere.ai.AgentRuntime;
+import org.atmosphere.ai.ContextProvider;
+import org.atmosphere.ai.DefaultStreamingSession;
+import org.atmosphere.ai.PostPromptHook;
+import org.atmosphere.ai.StreamingSession;
+import org.atmosphere.ai.StreamingSessionSweeper;
+import org.atmosphere.ai.StreamingSessions;
+import org.atmosphere.ai.TracingCapturingSession;
+import org.atmosphere.ai.cache.AiResponseCacheInspector;
+import org.atmosphere.ai.approval.ApprovalRegistry;
+import org.atmosphere.ai.tool.DefaultToolRegistry;
+import org.atmosphere.ai.tool.ToolRegistry;
+import org.atmosphere.config.managed.AnnotatedLifecycle;
+import org.atmosphere.cpr.ApplicationConfig;
+import org.atmosphere.cpr.AtmosphereHandler;
+import java.security.Principal;
+
+import org.atmosphere.cpr.AtmosphereResource;
+import org.atmosphere.cpr.FrameworkConfig;
+import org.atmosphere.cpr.AtmosphereResourceHeartbeatEventListener;
+import org.atmosphere.cpr.AtmosphereResourceEvent;
+import org.atmosphere.cpr.AtmosphereResourceEventImpl;
+import org.atmosphere.cpr.AtmosphereRequest;
+import org.atmosphere.cpr.AtmosphereRequestImpl;
+import org.atmosphere.cpr.BroadcastFilter;
+import org.atmosphere.cpr.Broadcaster;
+import org.atmosphere.cpr.HeaderConfig;
+import org.atmosphere.cpr.RawMessage;
+import org.atmosphere.util.Utils;
+import org.atmosphere.handler.AbstractReflectorAtmosphereHandler;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeoutException;
+
+/**
+ * {@link AtmosphereHandler} for {@link org.atmosphere.ai.annotation.AiEndpoint @AiEndpoint}
+ * classes. Handles connect, disconnect, and message events, dispatching prompt handling
+ * to the {@code @Prompt} method on a virtual thread. Broadcast responses flow through
+ * the standard {@code AsyncIOWriter} interceptor chain.
+ */
+public class AiEndpointHandler extends AbstractReflectorAtmosphereHandler
+        implements AtmosphereResourceHeartbeatEventListener {
+
+    /**
+     * Request attribute key for the system prompt configured on the {@code @AiEndpoint}.
+     * The {@code @Prompt} method can retrieve this via
+     * {@code resource.getRequest().getAttribute(AiEndpointHandler.SYSTEM_PROMPT_ATTRIBUTE)}.
+     */
+    public static final String SYSTEM_PROMPT_ATTRIBUTE = "org.atmosphere.ai.systemPrompt";
+
+    private static final Logger logger = LoggerFactory.getLogger(AiEndpointHandler.class);
+
+    /**
+     * Request attribute prefix for path parameters extracted from the
+     * {@code @AiEndpoint} path template. For example, a path template
+     * {@code /atmosphere/chat/{room}} sets the attribute
+     * {@code org.atmosphere.ai.pathParam.room} on each request.
+     */
+    public static final String PATH_PARAM_ATTRIBUTE_PREFIX = "org.atmosphere.ai.pathParam.";
+
+    private final Object target;
+    private final Method promptMethod;
+    private final long suspendTimeout;
+    private final String systemPrompt;
+    private final String pathTemplate;
+    private final AgentRuntime runtime;
+    private final List<AiInterceptor> interceptors;
+    private final AiConversationMemory memory;
+    private final AnnotatedLifecycle lifecycle;
+    private final ToolRegistry toolRegistry;
+    private final List<AiGuardrail> guardrails;
+    private final List<ContextProvider> contextProviders;
+    private final AiMetrics metrics;
+    private final List<BroadcastFilter> broadcastFilters;
+    private final String endpointModel;
+    private final Map<Class<?>, Object> injectables;
+    private final PromptMethodInvoker promptInvoker;
+
+    /**
+     * @param target       the user's @AiEndpoint instance
+     * @param promptMethod the @Prompt-annotated method
+     * @param timeout      per-resource suspend timeout in milliseconds
+     * @param systemPrompt the system prompt from the @AiEndpoint annotation (may be empty)
+     * @param runtime    the resolved AI support implementation
+     * @param interceptors the interceptor chain
+     */
+    public AiEndpointHandler(Object target, Method promptMethod, long timeout,
+                             String systemPrompt, AgentRuntime runtime,
+                             List<AiInterceptor> interceptors) {
+        this(target, promptMethod, timeout, systemPrompt, null, runtime, interceptors,
+                null, AnnotatedLifecycle.scan(target.getClass()),
+                new DefaultToolRegistry(), List.of(), List.of(), AiMetrics.NOOP, List.of(), null);
+    }
+
+    /**
+     * @param target       the user's @AiEndpoint instance
+     * @param promptMethod the @Prompt-annotated method
+     * @param timeout      per-resource suspend timeout in milliseconds
+     * @param systemPrompt the system prompt from the @AiEndpoint annotation (may be empty)
+     * @param pathTemplate the path template from the @AiEndpoint annotation (e.g. "/chat/{room}")
+     * @param runtime    the resolved AI support implementation
+     * @param interceptors the interceptor chain
+     * @param memory       conversation memory (may be null if disabled)
+     * @param lifecycle    the shared lifecycle descriptor from {@link AnnotatedLifecycle#scan}
+     */
+    public AiEndpointHandler(Object target, Method promptMethod, long timeout,
+                             String systemPrompt, String pathTemplate,
+                             AgentRuntime runtime,
+                             List<AiInterceptor> interceptors,
+                             AiConversationMemory memory,
+                             AnnotatedLifecycle lifecycle) {
+        this(target, promptMethod, timeout, systemPrompt, pathTemplate, runtime,
+                interceptors, memory, lifecycle,
+                new DefaultToolRegistry(), List.of(), List.of(), AiMetrics.NOOP, List.of(), null);
+    }
+
+    /**
+     * Full constructor with tools, guardrails, context providers, and metrics.
+     */
+    public AiEndpointHandler(Object target, Method promptMethod, long timeout,
+                             String systemPrompt, String pathTemplate,
+                             AgentRuntime runtime,
+                             List<AiInterceptor> interceptors,
+                             AiConversationMemory memory,
+                             AnnotatedLifecycle lifecycle,
+                             ToolRegistry toolRegistry,
+                             List<AiGuardrail> guardrails,
+                             List<ContextProvider> contextProviders,
+                             AiMetrics metrics) {
+        this(target, promptMethod, timeout, systemPrompt, pathTemplate, runtime,
+                interceptors, memory, lifecycle, toolRegistry, guardrails,
+                contextProviders, metrics, List.of(), null);
+    }
+
+    /**
+     * Full constructor with broadcast filters.
+     */
+    public AiEndpointHandler(Object target, Method promptMethod, long timeout,
+                             String systemPrompt, String pathTemplate,
+                             AgentRuntime runtime,
+                             List<AiInterceptor> interceptors,
+                             AiConversationMemory memory,
+                             AnnotatedLifecycle lifecycle,
+                             ToolRegistry toolRegistry,
+                             List<AiGuardrail> guardrails,
+                             List<ContextProvider> contextProviders,
+                             AiMetrics metrics,
+                             List<BroadcastFilter> broadcastFilters) {
+        this(target, promptMethod, timeout, systemPrompt, pathTemplate, runtime,
+                interceptors, memory, lifecycle, toolRegistry, guardrails,
+                contextProviders, metrics, broadcastFilters, null);
+    }
+
+    /**
+     * Full constructor with per-endpoint model override.
+     */
+    public AiEndpointHandler(Object target, Method promptMethod, long timeout,
+                             String systemPrompt, String pathTemplate,
+                             AgentRuntime runtime,
+                             List<AiInterceptor> interceptors,
+                             AiConversationMemory memory,
+                             AnnotatedLifecycle lifecycle,
+                             ToolRegistry toolRegistry,
+                             List<AiGuardrail> guardrails,
+                             List<ContextProvider> contextProviders,
+                             AiMetrics metrics,
+                             List<BroadcastFilter> broadcastFilters,
+                             String endpointModel) {
+        this(target, promptMethod, timeout, systemPrompt, pathTemplate, runtime,
+                interceptors, memory, lifecycle, toolRegistry, guardrails,
+                contextProviders, metrics, broadcastFilters, endpointModel, Map.of());
+    }
+
+    /**
+     * Full constructor with injectable parameters for {@code @Prompt} methods.
+     * The {@code injectables} map provides additional type-to-instance mappings
+     * that are resolved by parameter type when invoking the {@code @Prompt} method.
+     * This enables modules like {@code atmosphere-coordinator} to inject custom
+     * parameters (e.g. {@code AgentFleet}) without modifying this class.
+     *
+     * @param injectables extra parameters to inject into {@code @Prompt} methods,
+     *                    keyed by parameter type
+     */
+    public AiEndpointHandler(Object target, Method promptMethod, long timeout,
+                             String systemPrompt, String pathTemplate,
+                             AgentRuntime runtime,
+                             List<AiInterceptor> interceptors,
+                             AiConversationMemory memory,
+                             AnnotatedLifecycle lifecycle,
+                             ToolRegistry toolRegistry,
+                             List<AiGuardrail> guardrails,
+                             List<ContextProvider> contextProviders,
+                             AiMetrics metrics,
+                             List<BroadcastFilter> broadcastFilters,
+                             String endpointModel,
+                             Map<Class<?>, Object> injectables) {
+        this.target = target;
+        this.promptMethod = promptMethod;
+        this.suspendTimeout = timeout;
+        this.systemPrompt = systemPrompt != null ? systemPrompt : "";
+        this.pathTemplate = pathTemplate;
+        this.runtime = runtime;
+        this.interceptors = interceptors != null ? interceptors : List.of();
+        this.memory = memory;
+        this.lifecycle = lifecycle;
+        this.toolRegistry = toolRegistry;
+        this.guardrails = guardrails != null ? guardrails : List.of();
+        this.contextProviders = contextProviders != null ? contextProviders : List.of();
+        this.metrics = metrics != null ? metrics : AiMetrics.NOOP;
+        this.broadcastFilters = broadcastFilters != null ? broadcastFilters : List.of();
+        this.endpointModel = endpointModel;
+        this.injectables = injectables != null ? Map.copyOf(injectables) : Map.of();
+        this.promptMethod.setAccessible(true);
+        // Shared dispatch seam: binds framework parameters and, when a
+        // ToolSandboxBinding claims the @Prompt method (@SandboxTool), wraps
+        // each invocation in a framework-owned sandbox scope.
+        this.promptInvoker = PromptMethodInvoker.forMethod(target, promptMethod);
+        // Register this endpoint's live re-drive context so an admin-triggered
+        // crash-resume (which starts from only a run id) can resolve the runtime
+        // and tool set for the run's endpoint path. The reconnect path has this
+        // context locally and does not need the registry.
+        if (pathTemplate != null && runtime != null) {
+            org.atmosphere.ai.resume.ResumableEndpointRegistry.register(pathTemplate, runtime,
+                    () -> toolRegistry != null
+                            ? java.util.List.copyOf(toolRegistry.allTools())
+                            : java.util.List.of());
+        }
+    }
+
+    /**
+     * Endpoint-scoped prompt caching policy from {@code @AiEndpoint.promptCache()}.
+     * Every session created by this handler applies the policy via
+     * {@link AiStreamingSession#setCachePolicy}.
+     */
+    private volatile org.atmosphere.ai.llm.CacheHint.CachePolicy cachePolicy;
+
+    /** Endpoint-scoped retry policy from {@code @AiEndpoint.retry()}. */
+    private volatile org.atmosphere.ai.RetryPolicy endpointRetryPolicy;
+
+    /** Endpoint-scoped structured-output reprompt budget from {@code @AiEndpoint.structuredOutputRetries()}. */
+    private volatile int structuredOutputRetries;
+
+    /** Endpoint-scoped per-turn tool cap from {@code @AiEndpoint.maxToolsPerRequest()}. */
+    private volatile int maxToolsPerRequest;
+
+    /**
+     * Endpoint-scoped RAG over-fetch + rerank policy resolved by the processor
+     * from {@code org.atmosphere.ai.rag.*}; {@code null} keeps the legacy
+     * fetch-k retrieval (see {@link org.atmosphere.ai.RagRetrieval}).
+     */
+    private volatile org.atmosphere.ai.RagRetrieval ragRetrieval;
+
+    /**
+     * Endpoint-scoped reply fan-out from {@code @AiEndpoint.broadcastReply()}.
+     * When {@code true}, the single reply streams to every subscriber on the
+     * per-path broadcaster (the room) instead of only the originating resource.
+     * The prompt dispatch is unchanged — it still targets the originating
+     * resource only, so the {@code @Prompt} method runs exactly once.
+     */
+    private volatile boolean broadcastReply;
+
+    /**
+     * Endpoint-scoped response cache resolved once by the processor from
+     * {@code atmosphere.ai.cache.*}. Applied to every session this handler
+     * creates so the websocket path gets the same cache the pipeline path has
+     * had (Correctness Invariant #7). Null keeps the gate closed.
+     */
+    private volatile org.atmosphere.ai.cache.ResponseCache responseCache;
+    private volatile java.time.Duration responseCacheTtl;
+
+    public void setCachePolicy(org.atmosphere.ai.llm.CacheHint.CachePolicy policy) {
+        this.cachePolicy = policy;
+    }
+
+    /**
+     * Install the endpoint-level response cache. Resolved once per application by
+     * {@link org.atmosphere.ai.cache.ResponseCacheConfig}; a null cache disables
+     * the gate.
+     */
+    public void setResponseCache(org.atmosphere.ai.cache.ResponseCache cache,
+                                 java.time.Duration ttl) {
+        this.responseCache = cache;
+        this.responseCacheTtl = ttl;
+    }
+
+    /** The endpoint-level response cache, or {@code null} when none is installed. */
+    org.atmosphere.ai.cache.ResponseCache responseCache() {
+        return responseCache;
+    }
+
+    public void setRetryPolicy(org.atmosphere.ai.RetryPolicy policy) {
+        this.endpointRetryPolicy = policy;
+    }
+
+    public void setStructuredOutputRetries(int retries) {
+        this.structuredOutputRetries = Math.max(0, retries);
+    }
+
+    public void setMaxToolsPerRequest(int maxToolsPerRequest) {
+        this.maxToolsPerRequest = Math.max(0, maxToolsPerRequest);
+    }
+
+    public void setRagRetrieval(org.atmosphere.ai.RagRetrieval ragRetrieval) {
+        this.ragRetrieval = ragRetrieval;
+    }
+
+    public void setBroadcastReply(boolean broadcastReply) {
+        this.broadcastReply = broadcastReply;
+    }
+
+    @Override
+    public void onRequest(AtmosphereResource resource) throws IOException {
+        var method = resource.getRequest().getMethod();
+
+        // WebSocket frames arrive as POST requests via SimpleHttpProtocol; the framework
+        // creates a temporary resource for each frame with the handler's default
+        // broadcaster — not the per-path broadcaster assigned during connection. We
+        // must dispatch the prompt onto the *originating* suspended resource only,
+        // never the whole per-path broadcaster — fanning out the prompt to every
+        // subscriber on the path causes one tab's prompt to be answered by every
+        // tab's @Prompt handler, including N redundant LLM calls and a leaked
+        // response stream into tabs that never asked anything.
+        //
+        // The originating resource UUID is published two ways:
+        //   • WebSocket: DefaultWebSocketProcessor stashes it on the suspended request
+        //     under SUSPENDED_ATMOSPHERE_RESOURCE_UUID; the temp request inherits via
+        //     attribute delegation to the wrapped original request.
+        //   • SSE / long-polling: the client carries it on every POST as the
+        //     X-Atmosphere-tracking-id header.
+        if ("POST".equalsIgnoreCase(method)) {
+            AtmosphereRequestImpl.Body body = resource.getRequest().body();
+            if (!body.isEmpty()) {
+                var msg = body.hasString() ? body.asString() : new String(body.asBytes());
+                var target = findOriginatingResource(resource);
+                if (target != null) {
+                    target.getBroadcaster().broadcast(msg, target);
+                } else {
+                    // Pre-fix behavior, retained as a safety net for non-conformant
+                    // clients that ship neither header. Logged so the regression
+                    // is visible rather than silent.
+                    logger.warn("Cannot identify originating resource for prompt on {}; "
+                                    + "falling back to per-path broadcast (will fan out across all "
+                                    + "subscribers — set {} or send {} header to enable targeted dispatch)",
+                            pathTemplate,
+                            ApplicationConfig.SUSPENDED_ATMOSPHERE_RESOURCE_UUID,
+                            HeaderConfig.X_ATMOSPHERE_TRACKING_ID);
+                    resolvePerPathBroadcaster(resource).broadcast(msg);
+                }
+            }
+            return;
+        }
+
+        // Initial connection: suspend the resource.
+        if (resource.transport() == AtmosphereResource.TRANSPORT.WEBSOCKET
+                || resource.transport() == AtmosphereResource.TRANSPORT.SSE
+                || resource.transport() == AtmosphereResource.TRANSPORT.LONG_POLLING) {
+            assignPerPathBroadcaster(resource);
+            registerBroadcastFilters(resource.getBroadcaster());
+            registerCacheInspector(resource.getBroadcaster());
+            resource.suspend(suspendTimeout);
+            if (!systemPrompt.isEmpty()) {
+                resource.getRequest().setAttribute(SYSTEM_PROMPT_ATTRIBUTE, systemPrompt);
+            }
+            extractPathParams(resource);
+            lifecycle.injectPathParams(target, resource, pathTemplate,
+                    resource.getAtmosphereConfig());
+            lifecycle.onReady(target, resource);
+            logger.info("Client {} connected to AI endpoint (broadcaster: {})",
+                    resource.uuid(), resource.getBroadcaster().getID());
+            // Consume the X-Atmosphere-Run-Id header that
+            // DurableSessionInterceptor stashes on reconnection: if the run
+            // is still live in the RunRegistry, replay the buffered events
+            // to THIS resource so the client catches up on what it missed
+            // mid-stream. Silent no-op when the attr is absent (fresh
+            // connection) or the run is unknown (expired or never existed).
+            reattachPendingRun(resource);
+        }
+    }
+
+    /**
+     * Consumer path for the {@code X-Atmosphere-Run-Id} header. Closes the
+     * P1 gap where the producer (run registration in {@code invokePrompt})
+     * was wired but nothing read the id back on reconnection — so reattach
+     * was half-shipped. Looks the run up in {@link RunRegistryHolder} and,
+     * when it is still live, drains its replay buffer onto this resource
+     * only (not the broadcaster — the other subscribers already saw the
+     * events live).
+     */
+    private void reattachPendingRun(AtmosphereResource resource) {
+        var registry = org.atmosphere.ai.resume.RunRegistryHolder.get();
+        var replayed = org.atmosphere.ai.resume.RunReattachSupport.replayPendingRun(
+                resource, registry);
+        if (replayed == 0) {
+            // No live run drained — the client may be reconnecting to a run that
+            // crashed (the process died, the registry is empty). When durable
+            // runs are on, re-drive it from the journal to this client.
+            maybeResumeCrashedRun(resource, registry);
+        }
+    }
+
+    /**
+     * Crash-resume consumer: when a client reconnects with a run id that is no
+     * longer live, re-drive that run from the durable journal to the reconnected
+     * client. The spine refuses a resume for a principal other than the run's
+     * owner (Correctness Invariant #6); a disabled spine or absent run id makes
+     * this a no-op. The re-drive runs on a virtual thread so the connect path is
+     * not blocked.
+     */
+    private void maybeResumeCrashedRun(AtmosphereResource resource,
+                                       org.atmosphere.ai.resume.RunRegistry registry) {
+        var spine = org.atmosphere.ai.resume.DurableRunSpineHolder.get();
+        if (!spine.enabled()) {
+            return;
+        }
+        var runId = org.atmosphere.ai.resume.RunReattachSupport.pendingRunId(resource);
+        if (runId == null || registry.lookup(runId).isPresent()) {
+            return;
+        }
+        var principal = resolveResumePrincipal(resource);
+        var tools = toolRegistry != null
+                ? java.util.List.copyOf(toolRegistry.allTools())
+                : java.util.List.<org.atmosphere.ai.tool.ToolDefinition>of();
+        var leaf = new org.atmosphere.ai.resume.RunIdStreamingSession(
+                StreamingSessions.start(resource), runId);
+        // Session tape: the resumed re-drive appends to the SAME tape run
+        // (begin is an idempotent upsert), with a RESUMED marker step first,
+        // so the run reaches a true terminal instead of dangling OPEN.
+        // Zero-cost no-op when nothing is installed.
+        var session = !org.atmosphere.ai.tape.TapeSupport.installed() ? leaf
+                : org.atmosphere.ai.tape.TapeSupport.wrap(leaf,
+                        org.atmosphere.ai.tape.TapeRunInfo.resumed(conversationId(resource),
+                                resource.uuid(), pathTemplate, resumeModel(),
+                                runtime != null ? runtime.name() : null, runId, principal));
+        var resumer = new org.atmosphere.ai.resume.DurableRunResumer(spine);
+        Thread.startVirtualThread(() -> {
+            try {
+                var status = resumer.resume(runId, principal, tools, null, runtime, session);
+                logger.info("Durable resume of run {} for resource {}: {}",
+                        runId, resource.uuid(), status);
+            } catch (RuntimeException e) {
+                logger.warn("Durable resume of run {} failed", runId, e);
+            }
+        });
+    }
+
+    /**
+     * The model a crash-resume tape run is attributed to — the same
+     * resolution the live prompt path uses (endpoint override, else the
+     * framework-wide {@link AiConfig} model).
+     */
+    private String resumeModel() {
+        if (endpointModel != null) {
+            return endpointModel;
+        }
+        var settings = AiConfig.get();
+        return settings != null ? settings.model() : null;
+    }
+
+    /** The reconnecting caller's principal, matched against the run owner on resume. */
+    private String resolveResumePrincipal(AtmosphereResource resource) {
+        if (resource.getRequest() != null) {
+            var attr = resource.getRequest().getAttribute("ai.userId");
+            if (attr != null && !attr.toString().isBlank()) {
+                return attr.toString();
+            }
+            try {
+                var principal = resource.getRequest().getUserPrincipal();
+                if (principal != null && principal.getName() != null
+                        && !principal.getName().isBlank()) {
+                    return principal.getName();
+                }
+            } catch (RuntimeException e) {
+                logger.trace("unable to resolve userPrincipal for resume", e);
+            }
+        }
+        return "anonymous";
+    }
+
+    /**
+     * Resolved owner identity per connection uuid.
+     *
+     * <p>Tomcat can fire the disconnect listener with a recycled request: the event
+     * still carries its uuid but the {@code ai.userId} attribute is gone with the
+     * request. Without this, that path called the interceptors with a null userId and
+     * {@code LongTermMemoryInterceptor.onDisconnect} returned early — dropping every
+     * fact from the conversation even when the application HAD configured an identity,
+     * on the very path a closed browser tab takes.</p>
+     *
+     * <p>Bounded by connection lifetime: {@link #forgetRunOwner} is called from
+     * {@code cleanupDisconnected}, which every disconnect path reaches (Invariant #3).
+     * Anonymous connections are never recorded — they deliberately get no memory.</p>
+     */
+    private static final Map<String, String> RUN_OWNERS = new ConcurrentHashMap<>();
+
+    /** Records the resolved owner for {@code uuid}. No-op for a blank identity. */
+    static void rememberRunOwner(String uuid, String userId) {
+        if (uuid == null || userId == null || userId.isBlank()) {
+            return;
+        }
+        RUN_OWNERS.put(uuid, userId);
+    }
+
+    /** The owner recorded at connect time, or null. */
+    static String recallRunOwner(String uuid) {
+        return uuid == null ? null : RUN_OWNERS.get(uuid);
+    }
+
+    /** Releases the entry. Called on every disconnect path so the map stays bounded. */
+    static void forgetRunOwner(String uuid) {
+        if (uuid != null) {
+            RUN_OWNERS.remove(uuid);
+        }
+    }
+
+    /**
+     * Resolve the owner identity a new run registers under, and default
+     * the {@code ai.userId} request attribute the rest of the ai module
+     * reads (ToolExecutionHelper.resolveMode, AiStreamingSession.stream)
+     * from the servlet Principal when nothing upstream set it. Apps that
+     * integrate their own auth stack set {@code ai.userId} via an
+     * AtmosphereInterceptor and the fallback no-op's.
+     *
+     * <p>A thrown {@code getUserPrincipal} (some containers ISE when the
+     * principal is not yet bound to the async/virtual-thread dispatch) is
+     * NOT the same as a null principal: null means no auth is configured,
+     * a throw means ownership is indeterminate. Registering an
+     * indeterminate run as {@code "anonymous"} would disable the reattach
+     * ownership check — any runId holder could replay the stream — so
+     * those runs register with the fail-closed
+     * {@link org.atmosphere.ai.resume.RunReattachSupport#UNRESOLVED}
+     * owner instead, which refuses every reattach.</p>
+     */
+    static String resolveRunOwner(AtmosphereResource resource) {
+        var principalUnresolvable = false;
+        if (resource.getRequest() != null
+                && resource.getRequest().getAttribute("ai.userId") == null) {
+            // Atmosphere's own AuthInterceptor validates the connection's token and
+            // publishes the resolved principal as FrameworkConfig.AUTH_PRINCIPAL. It
+            // sets neither ai.userId nor the servlet getUserPrincipal(), so before
+            // 4.0.70 an app using the framework's token auth still landed on
+            // "anonymous": every authenticated caller shared one identity, and
+            // per-user features keyed on ai.userId — long-term memory above all —
+            // silently pooled every user into a single bucket.
+            var authenticated = resource.getRequest().getAttribute(FrameworkConfig.AUTH_PRINCIPAL)
+                    instanceof Principal p ? p : null;
+            if (authenticated != null && authenticated.getName() != null
+                    && !authenticated.getName().isBlank()) {
+                resource.getRequest().setAttribute("ai.userId", authenticated.getName());
+            } else {
+                try {
+                    var principal = resource.getRequest().getUserPrincipal();
+                    if (principal != null && principal.getName() != null
+                            && !principal.getName().isBlank()) {
+                        resource.getRequest().setAttribute("ai.userId", principal.getName());
+                    }
+                } catch (RuntimeException e) {
+                    principalUnresolvable = true;
+                    logger.warn("Unable to resolve userPrincipal for {}; run registers with an "
+                            + "unresolved owner and reattach/replay will be refused. Set the "
+                            + "ai.userId request attribute via an AtmosphereInterceptor to "
+                            + "restore reattach. Cause: {}", resource.uuid(), e.toString());
+                }
+            }
+        }
+        var userIdAttr = resource.getRequest() != null
+                ? resource.getRequest().getAttribute("ai.userId") : null;
+        if (userIdAttr != null) {
+            return userIdAttr.toString();
+        }
+        return principalUnresolvable
+                ? org.atmosphere.ai.resume.RunReattachSupport.UNRESOLVED
+                : "anonymous";
+    }
+
+    @Override
+    public void onStateChange(AtmosphereResourceEvent event) throws IOException {
+        var resource = event.getResource();
+
+        if (event.isClosedByClient() || event.isClosedByApplication()) {
+            handleDisconnect(resource, event, "Client {} disconnected from AI endpoint");
+            return;
+        }
+
+        if (event.isCancelled()) {
+            handleDisconnect(resource, event, "Client {} unexpectedly disconnected from AI endpoint");
+            return;
+        }
+
+        var message = event.getMessage();
+        if (message == null) {
+            return;
+        }
+
+        // RawMessage = broadcast from StreamingSession (streaming texts, progress, complete, error).
+        // Unwrap and delegate to AbstractReflectorAtmosphereHandler which writes through
+        // the AsyncIOWriter chain (TrackMessageSizeInterceptor adds length-prefix).
+        if (message instanceof RawMessage raw) {
+            event.setMessage(raw.message());
+
+            boolean resumeOnBroadcast = resource.resumeOnBroadcast();
+            if (resumeOnBroadcast) {
+                resource.resumeOnBroadcast(false);
+                resource.getRequest().setAttribute(
+                        ApplicationConfig.RESUME_ON_BROADCAST, false);
+            }
+
+            super.onStateChange(event);
+
+            if (resumeOnBroadcast && resource.isSuspended()) {
+                resource.resume();
+            }
+            return;
+        }
+
+        // Plain String = user prompt (broadcast from onRequest POST handler).
+        // Dispatch to the @Prompt method on a virtual thread.
+        var userMessage = message.toString();
+
+        // Fast-path: route approval responses to the existing session's registry
+        // instead of creating a new session and dispatching to @Prompt. Walks
+        // every session registered for this resource (concurrent prompts on the
+        // same socket) and only short-circuits on RESOLVED; a stale/unknown ID
+        // in one overlapping session is not allowed to swallow the message
+        // before a sibling session that owns it gets a turn.
+        if (ApprovalRegistry.isApprovalMessage(userMessage)) {
+            if (AiStreamingSession.tryResolveApprovalForResource(resource.uuid(), userMessage)) {
+                logger.debug("Approval response routed for resource {}", resource.uuid());
+                return;
+            }
+            // Not ours. Behind a load balancer the reviewer's answer routinely
+            // lands on a node that isn't parking the run, so hand it to the
+            // cluster relay: every node tries it against its own registries and
+            // the owner completes the future. A no-op unless the relay is
+            // installed, and the message is never re-published by a receiving
+            // node, so an id nobody owns cannot bounce around the cluster.
+            if (org.atmosphere.ai.approval.ClusterApprovalRelay.publish(userMessage)) {
+                logger.debug("Approval not local to resource {}; relayed to the cluster",
+                        resource.uuid());
+                return;
+            }
+            // Cross-session fallback deliberately not used here: scanning all
+            // active sessions weakens approval ownership guarantees. Without a
+            // relay installed, an approval whose resource UUID changed after a
+            // transport reconnect times out and the new session must re-trigger
+            // the tool call.
+            logger.warn("Approval message with no pending approval for resource {}", resource.uuid());
+            return;
+        }
+
+        // Multi-modal input: when inbound decoding is enabled, an uploaded
+        // image / audio / file arrives as a {"type":"content",...} envelope.
+        // Decode it into the accompanying text prompt plus typed Content parts;
+        // the parts are stashed on the session below so the @Prompt method's
+        // session.stream(text) threads them onto the model request (e.g. the
+        // OpenAI image_url block). Off by default and byte-identical to the
+        // text-only path when disabled or when the frame is a plain prompt.
+        var multiModal = org.atmosphere.ai.MultiModalInput.decode(userMessage);
+        var promptText = multiModal.text();
+
+        // Snapshot business.* request attributes so the VT dispatch below
+        // can re-apply them on the virtual-thread's own MDC. MDC is
+        // thread-local — setting it on the servlet thread does nothing for
+        // logs produced by the VT. Apply + clear is wrapped around the VT
+        // body (see promptThread below).
+        var businessMdc = snapshotBusinessMdc(resource);
+        if (multiModal.parts().isEmpty()) {
+            logger.info("Received prompt from {}: {}", resource.uuid(), promptText);
+        } else {
+            logger.info("Received multi-modal prompt from {} ({} part(s)): {}",
+                    resource.uuid(), multiModal.parts().size(), promptText);
+        }
+
+        // Per-client by default: the reply streams back only to the resource
+        // that sent the prompt. When the endpoint opts into broadcastReply, the
+        // single reply instead fans out to every subscriber on the per-path
+        // broadcaster (the room). Either way the prompt was already dispatched
+        // to this one originating resource (see onRequest), so the @Prompt
+        // method — and the LLM call inside it — runs exactly once.
+        var delegate = broadcastReply
+                ? StreamingSessions.startRoomBroadcast(resource)
+                : StreamingSessions.start(resource);
+        var settings = AiConfig.get();
+        var model = endpointModel != null ? endpointModel
+                : (settings != null ? settings.model() : null);
+
+        // Wrap with TracingCapturingSession for top-level observability.
+        // This captures metrics for ALL session usage paths (stream(), send(), complete()).
+        StreamingSession traced = delegate;
+        if (metrics != AiMetrics.NOOP) {
+            traced = new TracingCapturingSession(delegate, metrics, model);
+        }
+
+        // Session tape: wrap the traced leaf so the tape becomes
+        // AiStreamingSession's delegate and records everything crossing the
+        // session boundary post-decorator (runtime writes, chain-originated
+        // events, @Prompt-body sends, handler error/timeout routing). Run
+        // identity is late-bound — bindRun fires right after setRunId below.
+        // Zero-cost no-op when nothing is installed.
+        if (org.atmosphere.ai.tape.TapeSupport.installed()) {
+            traced = org.atmosphere.ai.tape.TapeSupport.wrap(traced,
+                    org.atmosphere.ai.tape.TapeRunInfo.endpoint(conversationId(resource),
+                            resource.uuid(), pathTemplate, model,
+                            runtime != null ? runtime.name() : null));
+        }
+
+        var responseType = injectables.get(Class.class) instanceof Class<?> c ? c : null;
+        // Append grounded facts to the END of the system prompt via
+        // FactResolver. Appending (not prepending) keeps the stable
+        // persona/skills text a byte-identical prefix across turns so
+        // provider prompt-prefix caches keep hitting while volatile facts
+        // (time.now changes every minute) ride in a trailing block.
+        // DefaultFactResolver supplies time.now + time.timezone; apps can
+        // install a richer resolver via FactResolverHolder.install(). Every
+        // turn pays one resolver call per endpoint — no ThreadLocal, no
+        // per-@AiTool wiring.
+        var effectivePrompt = appendResolvedFacts(systemPrompt, resource);
+        var session = new AiStreamingSession(traced, runtime,
+                effectivePrompt, model, interceptors, resource, memory,
+                toolRegistry, guardrails, contextProviders, metrics, responseType);
+        AiStreamingSession.registerActive(session);
+
+        // Thread the decoded multi-modal parts into the session so the next
+        // stream(text) call (typically from the @Prompt method) encodes them
+        // onto the outbound model request. No-op when the frame was plain text.
+        if (!multiModal.parts().isEmpty()) {
+            session.setPendingInputParts(multiModal.parts());
+        }
+
+        // Propagate endpoint-scoped cache / retry policies from @AiEndpoint.
+        if (cachePolicy != null) {
+            session.setCachePolicy(cachePolicy);
+        }
+        if (responseCache != null) {
+            session.setResponseCache(responseCache, responseCacheTtl);
+        }
+        if (endpointRetryPolicy != null) {
+            session.setRetryPolicy(endpointRetryPolicy);
+        }
+        if (structuredOutputRetries > 0) {
+            session.setStructuredOutputRetries(structuredOutputRetries);
+        }
+        if (maxToolsPerRequest > 0) {
+            session.setMaxToolsPerRequest(maxToolsPerRequest);
+        }
+        if (ragRetrieval != null) {
+            session.setRagRetrieval(ragRetrieval);
+        }
+
+        // Publish the handler's injectables map (AgentFleet, AgentIdentity,
+        // AgentState, ...) onto the session so @AiTool methods can declare
+        // these types as parameters — no ThreadLocal shim required.
+        // Include the live AtmosphereResource so tools can reach request
+        // attributes (user id, session id) without a separate accessor.
+        var codeExec = org.atmosphere.ai.code.CodeExecSupport.shared();
+        boolean codeExecEnabled = codeExec.isEnabled();
+        if (!injectables.isEmpty() || resource != null || codeExecEnabled) {
+            var toolScope = new java.util.LinkedHashMap<Class<?>, Object>(injectables);
+            if (resource != null) {
+                toolScope.putIfAbsent(AtmosphereResource.class, resource);
+            }
+            // Provision a lazy, session-scoped sandbox for the code_exec tool and
+            // bind its teardown to this session's terminal path (Invariants #1/#2).
+            // No container is started unless the model actually calls code_exec.
+            if (codeExecEnabled) {
+                var sandbox = codeExec.install(session, session.sessionId());
+                if (sandbox != null) {
+                    toolScope.put(org.atmosphere.ai.code.CodeSandbox.class, sandbox);
+                }
+            }
+            // Harness FILESYSTEM: the processor registered a per-agent
+            // provider (the conversation id is unknown at registration time);
+            // scope it here so built-in file tools and user @AiTool methods
+            // declaring AgentFileSystem both receive the store rooted at
+            // files/{conversationId}/ — the same conversation identity the
+            // memory path uses (ai.conversationId attribute, else the
+            // resource uuid). Non-fatal on failure: the tools then report
+            // "no agent filesystem is bound" instead of breaking dispatch.
+            if (injectables.get(org.atmosphere.ai.fs.AgentFileSystemProvider.class)
+                    instanceof org.atmosphere.ai.fs.AgentFileSystemProvider fsProvider) {
+                try {
+                    toolScope.putIfAbsent(org.atmosphere.ai.fs.AgentFileSystem.class,
+                            fsProvider.forConversation(conversationId(resource)));
+                } catch (RuntimeException e) {
+                    logger.warn("Agent filesystem not scoped for resource {}: {}",
+                            resource.uuid(), e.getMessage());
+                }
+            }
+            session.setInjectables(toolScope);
+        }
+
+        // Set pre-stream hook so journal cards emit before LLM starts
+        if (injectables.get(PostPromptHook.class) instanceof PostPromptHook hook) {
+            session.setPreStreamHook(hook);
+        }
+
+        // Register this run with the process-wide RunRegistry so a
+        // reconnecting client can look up the live AgentResumeHandle via the
+        // X-Atmosphere-Run-Id header (Primitive #8 — now with a real
+        // producer rather than a published-but-dead API).
+        // Cancelling the handle via RunRegistry (or admin plane) must
+        // actually interrupt the @Prompt virtual thread; we close over
+        // promptThreadRef after it's started below.
+        var promptThreadRef = new java.util.concurrent.atomic.AtomicReference<Thread>();
+        var runExecutionHandle = new org.atmosphere.ai.ExecutionHandle.Settable(() -> {
+            var t = promptThreadRef.get();
+            if (t != null) {
+                t.interrupt();
+            }
+        });
+        var runUserId = resolveRunOwner(resource);
+        rememberRunOwner(resource.uuid(), runUserId);
+        var handle = org.atmosphere.ai.resume.RunRegistryHolder.get().register(
+                pathTemplate, runUserId, resource.uuid(), runExecutionHandle);
+        session.setRunId(handle.runId());
+        // Late-bind the tape run to the registry-minted identity so the taped
+        // run joins the RunRegistry / EffectJournal runId (provenance). The
+        // setRunId metadata frame above buffered pre-bind and is re-keyed here.
+        if (traced instanceof org.atmosphere.ai.tape.TapeRecordingSession tape) {
+            tape.bindRun(handle.runId(), runUserId);
+        }
+
+        // Durable-execution spine: when an operator has opted in (a journal is
+        // resolved), install the per-run scope — the single-writer lease plus
+        // the journal binding — BEFORE the @Prompt body dispatches, so the
+        // journaled tool-memo and LLM-round seams record (or, on a re-drive,
+        // replay) against it. Disabled by default: beginDrive returns empty and
+        // the seams take their byte-identical non-durable path.
+        var durableSpine = org.atmosphere.ai.resume.DurableRunSpineHolder.get();
+        var durableScope = durableSpine.beginDrive(handle.runId(), runUserId, pathTemplate);
+
+        // Producer side of the reattach wire: wrap the outgoing session so
+        // every text / complete / error event the @Prompt method emits also
+        // lands in the run's replay buffer. Without this, RunReattachSupport
+        // has nothing to drain on reconnect — the reattach primitive was
+        // half-shipped (consumer wired, producer not). See
+        // RunEventCapturingSession javadoc.
+        var capturingSession = new org.atmosphere.ai.resume.RunEventCapturingSession(
+                session, handle.replayBuffer());
+
+        // Single terminal flag for the durable spine: set true only when the
+        // @Prompt body returned normally, read in finally so completeDrive runs
+        // exactly once on every exit path (success, error, Error, timeout-via-
+        // interrupt) — releasing the lease and marking the run terminal.
+        final boolean[] durableSuccess = {false};
+        var promptThread = Thread.startVirtualThread(() -> {
+            // Apply business.* MDC on the VT so every log record emitted
+            // during the turn (pipeline / runtime / tool calls) carries the
+            // tenant/customer/session tags. Clear in finally — otherwise
+            // the VT pool leaks keys across turns.
+            businessMdc.forEach(org.slf4j.MDC::put);
+            try {
+                invokePrompt(promptText, capturingSession, resource);
+                runExecutionHandle.complete();
+                durableSuccess[0] = true;
+            } catch (Exception e) {
+                Throwable cause = e;
+                if (e instanceof java.lang.reflect.InvocationTargetException ite
+                        && ite.getCause() != null) {
+                    cause = ite.getCause();
+                }
+                if (cause instanceof Error err) {
+                    runExecutionHandle.completeExceptionally(err);
+                    throw err;
+                }
+                logger.error("Error invoking @Prompt method", cause);
+                // Route the terminal error through the capturing session so
+                // the replay buffer records the failure envelope — a
+                // reconnecting client must be able to tell the turn
+                // terminated in error, not just see the partial text and
+                // hang waiting for a complete frame that never arrives.
+                capturingSession.error(cause);
+                runExecutionHandle.completeExceptionally(cause);
+            } finally {
+                durableScope.ifPresent(c -> durableSpine.completeDrive(c, durableSuccess[0]));
+                businessMdc.keySet().forEach(org.slf4j.MDC::remove);
+            }
+        });
+        promptThreadRef.set(promptThread);
+
+        if (suspendTimeout > 0) {
+            Thread.startVirtualThread(() -> {
+                try {
+                    if (!promptThread.join(Duration.ofMillis(suspendTimeout))) {
+                        logger.warn("@Prompt method timed out after {}ms for client {}",
+                                suspendTimeout, resource.uuid());
+                        promptThread.interrupt();
+                        if (!capturingSession.isClosed()) {
+                            // Terminal timeout flows through the capturing
+                            // session so the replay buffer captures the
+                            // error frame — otherwise reconnecting clients
+                            // see partial streams with no terminator.
+                            capturingSession.error(new TimeoutException(
+                                    "Prompt processing timed out after " + suspendTimeout + "ms"));
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+    }
+
+    /**
+     * Framework-scoped FactResolver resolution. Same template as
+     * {@code CoordinatorProcessor.resolveJournal} /
+     * {@code BroadcasterFactory.lookup} — the resolver is tied to the
+     * {@link org.atmosphere.cpr.AtmosphereFramework} instance through its
+     * properties map, not a process-wide static, so multi-framework JVMs
+     * and tests stay isolated.
+     */
+    private org.atmosphere.ai.facts.FactResolver resolveFactResolver(AtmosphereResource resource) {
+        // 1. Framework-property bridge (Spring/Quarkus/CDI auto-config writes here).
+        if (resource != null && resource.getAtmosphereConfig() != null) {
+            var bridged = resource.getAtmosphereConfig().properties()
+                    .get(org.atmosphere.ai.facts.FactResolver.FACT_RESOLVER_PROPERTY);
+            if (bridged instanceof org.atmosphere.ai.facts.FactResolver fr) {
+                return fr;
+            }
+        }
+        // 2. ServiceLoader — plain servlet / embedded / Quarkus native deployments.
+        try {
+            var loaded = java.util.ServiceLoader.load(org.atmosphere.ai.facts.FactResolver.class)
+                    .findFirst();
+            if (loaded.isPresent()) {
+                return loaded.get();
+            }
+        } catch (java.util.ServiceConfigurationError | RuntimeException e) {
+            logger.debug("FactResolver ServiceLoader lookup failed: {}", e.getMessage());
+        }
+        // 3. Legacy process-wide holder — kept for tests that install per-test
+        //    resolvers and for libraries that set a resolver before any framework
+        //    instance exists. New code should use the framework-property bridge.
+        var held = org.atmosphere.ai.facts.FactResolverHolder.get();
+        if (held != null) {
+            return held;
+        }
+        // 4. Zero-dep default.
+        return new org.atmosphere.ai.facts.DefaultFactResolver();
+    }
+
+    /**
+     * Snapshot {@code business.*} request attributes into a map the VT
+     * dispatch below re-applies onto its own SLF4J MDC. Returning a
+     * snapshot (instead of mutating MDC directly) avoids the
+     * servlet-thread-vs-VT mismatch: MDC is thread-local, so calls made
+     * on the servlet thread would never reach the VT's log records.
+     *
+     * <p>Keys are the {@link org.atmosphere.ai.business.BusinessMetadata}
+     * constants; unknown event-kind strings are normalized via
+     * {@link org.atmosphere.ai.business.BusinessMetadata.EventKind#fromWire(String)}
+     * so downstream consumers see a canonical value.</p>
+     */
+    private java.util.Map<String, String> snapshotBusinessMdc(AtmosphereResource resource) {
+        if (resource == null || resource.getRequest() == null) {
+            return java.util.Map.of();
+        }
+        var req = resource.getRequest();
+        var snapshot = new java.util.LinkedHashMap<String, String>();
+        for (var key : java.util.List.of(
+                org.atmosphere.ai.business.BusinessMetadata.TENANT_ID,
+                org.atmosphere.ai.business.BusinessMetadata.CUSTOMER_ID,
+                org.atmosphere.ai.business.BusinessMetadata.CUSTOMER_SEGMENT,
+                org.atmosphere.ai.business.BusinessMetadata.SESSION_ID,
+                org.atmosphere.ai.business.BusinessMetadata.SESSION_CURRENCY,
+                org.atmosphere.ai.business.BusinessMetadata.EVENT_SUBJECT)) {
+            if (req.getAttribute(key) instanceof String s && !s.isBlank()) {
+                snapshot.put(key, s);
+            }
+        }
+        if (req.getAttribute(org.atmosphere.ai.business.BusinessMetadata.EVENT_KIND)
+                instanceof String kind && !kind.isBlank()) {
+            // Normalize through the enum so OTHER is emitted on unknown wire
+            // strings rather than leaking whatever free-form value came in.
+            snapshot.put(org.atmosphere.ai.business.BusinessMetadata.EVENT_KIND,
+                    org.atmosphere.ai.business.BusinessMetadata.EventKind.fromWire(kind).wireName());
+        }
+        return snapshot;
+    }
+
+    /**
+     * Resolve the live {@link org.atmosphere.ai.facts.FactResolver} and append
+     * its output as a {@code facts} block to the END of the base system prompt
+     * (cache-prefix contract — see
+     * {@link org.atmosphere.ai.facts.FactResolver.FactBundle#appendToSystemPrompt(String)}:
+     * volatile facts at the front would change the first tokens of every
+     * request and defeat provider prompt-prefix caches framework-wide).
+     * Framework-scoped resolution mirrors {@code CoordinatorProcessor.resolveJournal}
+     * — check {@code framework.properties()}, then {@link java.util.ServiceLoader},
+     * then {@link org.atmosphere.ai.facts.FactResolverHolder} (legacy), then
+     * {@link org.atmosphere.ai.facts.DefaultFactResolver}. Returns the
+     * original prompt unchanged when the bundle is empty so this never
+     * regresses the text path when the feature is not in use.
+     */
+    private String appendResolvedFacts(String basePrompt, AtmosphereResource resource) {
+        var resolver = resolveFactResolver(resource);
+        if (resolver == null) {
+            return basePrompt != null ? basePrompt : "";
+        }
+        String userId = null;
+        if (resource != null && resource.getRequest() != null) {
+            var att = resource.getRequest().getAttribute("ai.userId");
+            if (att instanceof String s && !s.isBlank()) {
+                userId = s;
+            }
+        }
+        // Derive agentId from the endpoint path template — "/atmosphere/agent/{name}"
+        // for @Agent-registered endpoints. Null when the handler is a plain
+        // @AiEndpoint at a custom path, in which case downstream resolvers
+        // treat the request as agent-unscoped.
+        String agentId = null;
+        if (pathTemplate != null && pathTemplate.startsWith("/atmosphere/agent/")) {
+            var rest = pathTemplate.substring("/atmosphere/agent/".length());
+            var slash = rest.indexOf('/');
+            agentId = slash < 0 ? rest : rest.substring(0, slash);
+            if (agentId.isBlank()) {
+                agentId = null;
+            }
+        }
+        var req = new org.atmosphere.ai.facts.FactResolver.FactRequest(
+                userId, resource != null ? resource.uuid() : null,
+                agentId,
+                java.util.Set.of(
+                        org.atmosphere.ai.facts.FactKeys.TIME_NOW,
+                        org.atmosphere.ai.facts.FactKeys.TIME_TIMEZONE,
+                        org.atmosphere.ai.facts.FactKeys.USER_ID));
+        org.atmosphere.ai.facts.FactResolver.FactBundle bundle;
+        try {
+            bundle = resolver.resolve(req);
+        } catch (RuntimeException e) {
+            logger.warn("FactResolver {} failed; proceeding without facts: {}",
+                    resolver.getClass().getName(), e.getMessage());
+            return basePrompt != null ? basePrompt : "";
+        }
+        if (bundle == null || bundle.facts().isEmpty()) {
+            return basePrompt != null ? basePrompt : "";
+        }
+        return bundle.appendToSystemPrompt(basePrompt);
+    }
+
+    private void handleDisconnect(AtmosphereResource resource, AtmosphereResourceEvent event,
+                                   String logMessage) {
+        // Tomcat can fire the async error/cancel listener with a recycled request
+        // after the async context has been torn down. When that happens the
+        // AtmosphereResourceEvent has already been stripped of its resource and
+        // the event.getResource() we threaded through is null — but the event
+        // still carries the UUID it was created with, so the memory, session
+        // and tape state keyed by that UUID stays reclaimable (Invariant #3).
+        // The request attributes are gone with the recycled request, so the
+        // interceptor callback sees a null userId on this path.
+        if (resource == null) {
+            var uuid = event instanceof AtmosphereResourceEventImpl impl ? impl.uuid() : null;
+            if (uuid == null) {
+                logger.debug("handleDisconnect invoked after resource recycled with no uuid — skipping "
+                        + "memory/session cleanup (event.isClosedByClient={}, isCancelled={})",
+                        event.isClosedByClient(), event.isCancelled());
+            } else {
+                logger.debug("handleDisconnect invoked after resource recycled — reclaiming session "
+                        + "state for uuid {} (event.isClosedByClient={}, isCancelled={})",
+                        uuid, event.isClosedByClient(), event.isCancelled());
+                cleanupDisconnected(recallRunOwner(uuid), uuid);
+            }
+            lifecycle.onDisconnect(target, event);
+            return;
+        }
+        var ownerAtDisconnect = disconnectUserId(resource);
+        if (ownerAtDisconnect == null) {
+            ownerAtDisconnect = recallRunOwner(resource.uuid());
+        }
+        cleanupDisconnected(ownerAtDisconnect, resource.uuid());
+        lifecycle.onDisconnect(target, event);
+        logger.info(logMessage, resource.uuid());
+    }
+
+    /**
+     * The {@code ai.userId} request attribute, or null when the request is
+     * already gone. A resource whose request has been recycled must not NPE
+     * the disconnect path.
+     */
+    private static String disconnectUserId(AtmosphereResource resource) {
+        try {
+            var request = resource.getRequest();
+            if (request == null) {
+                return null;
+            }
+            var userId = request.getAttribute("ai.userId");
+            return userId != null ? userId.toString() : null;
+        } catch (RuntimeException e) {
+            logger.trace("unable to resolve ai.userId on disconnect", e);
+            return null;
+        }
+    }
+
+    /**
+     * Reclaim every piece of per-connection state keyed by the resource UUID.
+     * Shared by the normal disconnect path and the recycled-resource path so
+     * both reclaim identically (Invariant #7). Interceptors are notified
+     * BEFORE memory is cleared so they can extract facts from history.
+     */
+    private void cleanupDisconnected(String userIdStr, String uuid) {
+        notifyInterceptorsOnDisconnect(userIdStr, uuid);
+        forgetRunOwner(uuid);
+        if (memory != null) {
+            memory.clear(uuid);
+        }
+        DefaultStreamingSession.cleanupResource(uuid);
+        AiStreamingSession.removeAllForResource(uuid);
+        // Session tape: cancel-mark every open taped run of this resource
+        // (reconnects get a fresh uuid, so this never races a live run). The
+        // writer drains already-queued steps before CANCELLED lands. No-op
+        // when nothing is installed.
+        org.atmosphere.ai.tape.TapeSupport.resourceDisconnected(uuid);
+    }
+
+    /**
+     * Notify interceptors of disconnect BEFORE memory is cleared so they can
+     * extract facts from conversation history.
+     */
+    private void notifyInterceptorsOnDisconnect(String userIdStr, String conversationId) {
+        if (interceptors.isEmpty()) {
+            return;
+        }
+        var history = memory != null
+                ? memory.getHistory(conversationId)
+                : List.<org.atmosphere.ai.llm.ChatMessage>of();
+        for (var interceptor : interceptors) {
+            try {
+                interceptor.onDisconnect(userIdStr, conversationId, history);
+            } catch (Exception e) {
+                logger.error("AiInterceptor.onDisconnect failed: {}",
+                        interceptor.getClass().getName(), e);
+            }
+        }
+    }
+
+    /**
+     * Framework teardown: stop the shared streaming-session TTL sweeper
+     * (symmetric with its lazy start on session registration — Invariant #1).
+     * Idempotent, and the sweeper restarts on the next registration, so
+     * multiple endpoint handlers being destroyed in any order is safe.
+     */
+    @Override
+    public void destroy() {
+        StreamingSessionSweeper.shutdown();
+        super.destroy();
+    }
+
+    private void invokePrompt(String message, StreamingSession session, AtmosphereResource resource)
+            throws InvocationTargetException, IllegalAccessException {
+        // Parameter binding and the optional @SandboxTool scope live in
+        // PromptMethodInvoker, shared with the A2A / AG-UI bridges so every
+        // invocation mode dispatches @Prompt identically (Invariant #7).
+        promptInvoker.invoke(message, session, resource, injectables);
+    }
+
+    /**
+     * The conversation identity the harness filesystem scopes by — the same
+     * derivation {@code AiStreamingSession.stream} uses for
+     * {@code AiRequest.conversationId()}: the {@code ai.conversationId}
+     * request attribute wins, else the resource uuid.
+     */
+    private static String conversationId(AtmosphereResource resource) {
+        try {
+            var request = resource.getRequest();
+            if (request != null
+                    && request.getAttribute("ai.conversationId") instanceof String s
+                    && !s.isBlank()) {
+                return s;
+            }
+        } catch (RuntimeException e) {
+            logger.trace("unable to resolve ai.conversationId attribute", e);
+        }
+        return resource.uuid();
+    }
+
+    // visible for testing
+    Object target() {
+        return target;
+    }
+
+    Method promptMethod() {
+        return promptMethod;
+    }
+
+    long suspendTimeout() {
+        return suspendTimeout;
+    }
+
+    String systemPrompt() {
+        return systemPrompt;
+    }
+
+    AgentRuntime runtime() {
+        return runtime;
+    }
+
+    List<AiInterceptor> interceptors() {
+        return interceptors;
+    }
+
+    AiConversationMemory memory() {
+        return memory;
+    }
+
+    AnnotatedLifecycle lifecycle() {
+        return lifecycle;
+    }
+
+    ToolRegistry toolRegistry() {
+        return toolRegistry;
+    }
+
+    List<AiGuardrail> guardrails() {
+        return guardrails;
+    }
+
+    List<ContextProvider> contextProviders() {
+        return contextProviders;
+    }
+
+    org.atmosphere.ai.RagRetrieval ragRetrieval() {
+        return ragRetrieval;
+    }
+
+    AiMetrics metrics() {
+        return metrics;
+    }
+
+    List<BroadcastFilter> broadcastFilters() {
+        return broadcastFilters;
+    }
+
+    String endpointModel() {
+        return endpointModel;
+    }
+
+    boolean broadcastReply() {
+        return broadcastReply;
+    }
+
+    org.atmosphere.ai.llm.CacheHint.CachePolicy cachePolicy() {
+        return cachePolicy;
+    }
+
+    /**
+     * Registers a {@link org.atmosphere.cache.BroadcasterCacheInspector} that
+     * only allows {@link RawMessage}-based broadcasts (AI streaming responses)
+     * to be cached. Plain String broadcasts (user prompts routed internally
+     * from WebSocket frames) are excluded to prevent stale prompt replay on
+     * new connections.
+     */
+    private void registerCacheInspector(Broadcaster broadcaster) {
+        var cache = broadcaster.getBroadcasterConfig().getBroadcasterCache();
+        if (cache != null) {
+            cache.inspector(new AiResponseCacheInspector(false));
+        }
+    }
+
+    /**
+     * Registers configured broadcast filters on the broadcaster, guarding
+     * against double-registration.
+     */
+    private void registerBroadcastFilters(Broadcaster broadcaster) {
+        if (broadcastFilters.isEmpty()) {
+            return;
+        }
+        var config = broadcaster.getBroadcasterConfig();
+        var existing = config.filters();
+        for (var filter : broadcastFilters) {
+            var alreadyRegistered = false;
+            for (var ef : existing) {
+                if (ef.getClass().equals(filter.getClass())) {
+                    alreadyRegistered = true;
+                    break;
+                }
+            }
+            if (!alreadyRegistered) {
+                config.addFilter(filter);
+            }
+        }
+    }
+
+    /**
+     * Resolves the originating suspended {@link AtmosphereResource} for a
+     * prompt POST. WebSocket frames arrive as freshly-built temp resources; SSE
+     * and long-polling carry the suspended UUID via the
+     * {@link HeaderConfig#X_ATMOSPHERE_TRACKING_ID} header. We try the
+     * WebSocket-suspended attribute first (set by
+     * {@code DefaultWebSocketProcessor}) and fall back to the tracking-id
+     * header. Returns {@code null} when neither is present so the caller can
+     * decide whether to fall back to broadcast-all or refuse.
+     */
+    private AtmosphereResource findOriginatingResource(AtmosphereResource resource) {
+        var req = resource.getRequest();
+        var factory = resource.getAtmosphereConfig().resourcesFactory();
+        var suspendedUuid = req.getAttribute(ApplicationConfig.SUSPENDED_ATMOSPHERE_RESOURCE_UUID);
+        if (suspendedUuid instanceof String s && !s.isEmpty()) {
+            var found = factory.findResource(s);
+            if (found.isPresent()) {
+                return found.get();
+            }
+        }
+        var headerUuid = req.getHeader(HeaderConfig.X_ATMOSPHERE_TRACKING_ID);
+        if (headerUuid != null && !headerUuid.isEmpty() && !"0".equals(headerUuid)) {
+            var found = factory.findResource(headerUuid);
+            if (found.isPresent()) {
+                return found.get();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Resolves the correct broadcaster for a WebSocket frame dispatch. When the
+     * path template contains parameters, the suspended resource's per-path
+     * broadcaster is looked up by request URI. Falls back to the resource's
+     * current broadcaster when no path template is configured.
+     */
+    private Broadcaster resolvePerPathBroadcaster(AtmosphereResource resource) {
+        if (pathTemplate != null && pathTemplate.contains("{")) {
+            var requestUri = resource.getRequest().getRequestURI();
+            if (requestUri != null) {
+                var factory = resource.getAtmosphereConfig().getBroadcasterFactory();
+                var broadcaster = factory.lookup(requestUri, false);
+                if (broadcaster != null) {
+                    return broadcaster;
+                }
+            }
+        }
+        return resource.getBroadcaster();
+    }
+
+    /**
+     * The concrete request path, resolved the same way on every transport.
+     *
+     * <p>{@code getRequestURI()} is populated by the WebSocket / SSE / long-polling
+     * paths but NOT by WebTransport: {@code ReactorNettyTransportServer} fills
+     * {@code pathInfo} from the HTTP/3 CONNECT {@code :path}. Reading only the URI
+     * therefore yielded the empty string for every WebTransport client, so
+     * {@link #assignPerPathBroadcaster} bailed and every room shared one broadcaster
+     * with an empty id, and {@link #extractPathParams} never set a value so
+     * {@code @PathParam} injected null.</p>
+     *
+     * <p>{@link Utils#pathInfo} is the framework's transport-agnostic resolver
+     * (servletPath + pathInfo) and is what {@code PathParamIntrospector} already
+     * uses; the URI is kept as the first choice so no existing behaviour shifts.</p>
+     */
+    private static String resolvePath(AtmosphereRequest request) {
+        var uri = request.getRequestURI();
+        if (uri != null && !uri.isEmpty()) {
+            return uri;
+        }
+        return Utils.pathInfo(request);
+    }
+
+    /**
+     * When the path template contains {@code {param}} placeholders, each unique
+     * request path (e.g. {@code /classroom/math} vs {@code /classroom/code})
+     * gets its own {@link org.atmosphere.cpr.Broadcaster}. This provides
+     * per-path message isolation — messages broadcast in one room stay in that room.
+     */
+    private void assignPerPathBroadcaster(AtmosphereResource resource) {
+        if (pathTemplate == null || !pathTemplate.contains("{")) {
+            return;
+        }
+        var requestUri = resolvePath(resource.getRequest());
+        if (requestUri == null || requestUri.isEmpty() || requestUri.equals(pathTemplate)) {
+            return;
+        }
+        var factory = resource.getAtmosphereConfig().getBroadcasterFactory();
+        var broadcaster = factory.lookup(requestUri, true);
+        resource.setBroadcaster(broadcaster);
+    }
+
+    /**
+     * Extracts path parameters from the request URI by matching it against the
+     * {@link #pathTemplate}. Each {@code {param}} placeholder is resolved and
+     * stored as a request attribute under the key
+     * {@code org.atmosphere.ai.pathParam.<name>}.
+     */
+    private void extractPathParams(AtmosphereResource resource) {
+        if (pathTemplate == null || !pathTemplate.contains("{")) {
+            return;
+        }
+        var requestUri = resolvePath(resource.getRequest());
+        if (requestUri == null || requestUri.isEmpty()) {
+            return;
+        }
+        var templateParts = pathTemplate.split("/");
+        var uriParts = requestUri.split("/");
+        var len = Math.min(templateParts.length, uriParts.length);
+        for (var i = 0; i < len; i++) {
+            var tpl = templateParts[i];
+            if (tpl.startsWith("{") && tpl.endsWith("}")) {
+                var name = tpl.substring(1, tpl.length() - 1);
+                resource.getRequest().setAttribute(PATH_PARAM_ATTRIBUTE_PREFIX + name, uriParts[i]);
+            }
+        }
+    }
+
+    /**
+     * Convenience method for {@link AiInterceptor} implementations to retrieve
+     * a path parameter set by this handler.
+     *
+     * @param resource the current atmosphere resource
+     * @param name     the parameter name (e.g. "room")
+     * @return the parameter value, or {@code null} if not present
+     */
+    public static String pathParam(AtmosphereResource resource, String name) {
+        return (String) resource.getRequest().getAttribute(PATH_PARAM_ATTRIBUTE_PREFIX + name);
+    }
+
+    @Override
+    public void onHeartbeat(AtmosphereResourceEvent event) {
+        if (lifecycle != null) {
+            lifecycle.onHeartbeat(target, event);
+        }
+    }
+}

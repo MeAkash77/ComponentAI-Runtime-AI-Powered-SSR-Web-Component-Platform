@@ -1,0 +1,232 @@
+# Atmosphere CLI
+
+Run samples, scaffold projects, and explore the Atmosphere framework from your terminal.
+
+## Quick Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Atmosphere/atmosphere/main/cli/install.sh | sh
+```
+
+Or with Homebrew:
+
+```bash
+brew install Atmosphere/tap/atmosphere
+```
+
+## Usage
+
+### Interactive Install (recommended)
+
+```bash
+atmosphere install              # Browse all samples, pick one
+atmosphere install --tag ai     # Filter to AI samples
+atmosphere install --category tools
+```
+
+The interactive picker shows samples grouped by category with descriptions. Pick a number, then choose to:
+1. **Run it now** — downloads the pre-built JAR and starts it
+2. **Install source code** — clones the sample source into your current directory
+
+If [fzf](https://github.com/junegunn/fzf) is installed, you get a fuzzy-search picker instead of the numbered menu.
+
+### List Samples
+
+```bash
+atmosphere list                # All samples
+atmosphere list --tag ai       # AI samples only
+atmosphere list --category tools
+```
+
+### Run a Sample
+
+```bash
+atmosphere run spring-boot-chat
+atmosphere run spring-boot-ai-chat --env LLM_API_KEY=your-key
+atmosphere run spring-boot-dentist-agent --port 9090
+```
+
+The CLI downloads pre-built JARs from GitHub Releases and caches them in `~/.atmosphere/cache/`.
+
+### Create a New Project
+
+```bash
+atmosphere new my-chat-app
+atmosphere new my-ai-app --template ai-chat
+atmosphere new my-fleet --template multi-agent
+atmosphere new my-classroom --template classroom
+
+# Swap the AI runtime by injecting the matching adapter dependency
+atmosphere new my-ai-app --template ai-chat --runtime langchain4j
+atmosphere new my-ai-app --template ai-chat --runtime spring-ai
+atmosphere new my-ai-app --template ai-chat --runtime adk
+atmosphere new my-kotlin-ai --template ai-chat --runtime embabel
+
+# Force-swap: strip every pre-pinned adapter before injecting the chosen one
+atmosphere new my-ai-app --template ai-tools --runtime spring-ai --force
+
+# Scaffold an AI template with a commented, opt-in model-routing config block
+atmosphere new my-ai-app --template ai-chat --routing
+```
+
+Available templates: `chat`, `one-dep-agent`, `ai-chat`, `ai-tools`, `mcp-server`, `rag`, `agent`, `multi-agent`, `classroom`, `ms-governance`, `coding-agent`, `guarded-agent`, `assistant`, `browser-agent`, `classic-rooms`. Each template sparse-clones the matching sample from `cli/samples.json` into a directory you name.
+
+Available runtimes (`--runtime`): `builtin` (default — no extra deps), `spring-ai`, `langchain4j`, `adk`, `koog`, `semantic-kernel`, `agentscope`, `anthropic`, `cohere`, `crewai`, `embabel`, `spring-ai-alibaba`. The CLI appends the matching adapter dependencies (and any required repository, such as Embabel's release repository) to the scaffolded `pom.xml` — Atmosphere's `AgentRuntime` SPI then picks the highest-priority runtime present, so transparent templates like `ai-chat` swap runtime adapters without code changes. `spring-ai-alibaba` currently targets the Spring Boot 3.5 profile (`-Pspring-boot3`); `embabel` builds on the default Spring Boot 4 profile.
+
+`--force` (only valid with `--runtime`) wipes every adapter dep declared in `cli/runtime-overlays.json` from the scaffolded `pom.xml` *before* injecting the chosen overlay. This makes the swap deterministic on samples that already pin a non-default adapter (e.g. `ai-tools` ships with `atmosphere-langchain4j`) — without `--force`, both adapters would land on the classpath and the SPI resolver would pick one based on `ServiceLoader` iteration order. Note: samples whose Java code imports a specific provider's API directly (e.g. `OpenAiStreamingChatModel`) will still need manual edits after force-swap; transparent templates (`ai-chat`, `multi-agent`) work end-to-end with no code changes.
+
+`--routing` (off by default) appends a **commented, ready-to-uncomment** `atmosphere.ai.routing.*` block to the scaffolded project's `src/main/resources/application.yml`. The block (`enabled`, `default-model`, `content-rules[].{keywords, model, base-url, api-key}`) mirrors the routing example in `modules/ai/README.md`, so uncommenting it and filling in keys enables content-based model routing without any extra wiring. Because the injected block stays commented, the scaffold is byte-identical to a non-routing scaffold until you opt in. It is only valid for the AI templates that ship an `application.yml`: `ai-chat`, `ai-tools`, `rag`, `multi-agent`, `classroom`, `ms-governance`, `coding-agent`, `assistant`, and `browser-agent`. Passing `--routing` with any other template (including `chat`, `mcp-server`, `guarded-agent`, and `agent`, whose scaffolds ship `.properties`/`.yaml` rather than a `.yml`) is rejected with an error that the flag *requires an AI template*. If the target `application.yml` already contains a `routing:` block, the existing one is left untouched.
+
+### 10-minute enterprise agent path
+
+Use this path when the goal is a production-shaped JVM agent rather than a
+minimal chat demo:
+
+```bash
+atmosphere new support-agent --template ai-tools --runtime builtin
+cd support-agent
+export LLM_API_KEY=...
+mvn spring-boot:run
+```
+
+The Spring Boot starter already brings in `atmosphere-admin`, so the generated
+app has the dashboard, `/api/admin/runtimes`, audit log, A2A flow viewer, and
+governance decision endpoints on the classpath. Then harden the control plane:
+
+1. Turn on mutating admin operations only behind auth:
+   `atmosphere.admin.http-write-enabled=true` plus a `ControlAuthorizer`.
+2. Move proprietary documents into the `rag` template when retrieval is needed;
+   it chunks documents with `RagChunker` before embedding them.
+3. Pick the runtime by capability, not by brand. For portable tools and HITL,
+   use a runtime that declares `TOOL_CALLING` and `TOOL_APPROVAL` in
+   `modules/ai/README.md`.
+
+Or with npx (zero install):
+
+```bash
+npx create-atmosphere-app my-chat-app
+npx create-atmosphere-app my-ai-app --template ai-chat
+```
+
+### Sample Info
+
+```bash
+atmosphere info spring-boot-ai-chat
+```
+
+### Import a Skill from GitHub
+
+Turn any skill file into a running Atmosphere agent:
+
+```bash
+# From Anthropic's official skills
+atmosphere import https://github.com/anthropics/skills/blob/main/skills/frontend-design/SKILL.md
+
+# From Antigravity community (1,200+ skills)
+atmosphere import https://github.com/sickn33/antigravity-awesome-skills/blob/main/skills/customer-support/SKILL.md
+
+# From a local file
+atmosphere import ./my-skill.md
+
+# Custom project name
+atmosphere import --name my-agent https://github.com/anthropics/skills/blob/main/skills/pdf/SKILL.md
+
+# Headless agent (A2A/MCP only, no WebSocket UI)
+atmosphere import --headless https://example.com/SKILL.md --trust
+```
+
+The import command:
+- Downloads the skill file (GitHub blob URLs auto-normalized to raw)
+- Parses YAML frontmatter for `name:` and `description:`
+- Extracts `## Tools` sections → generates `@AiTool` method stubs
+- Scaffolds a complete Spring Boot project
+- Places the skill at `META-INF/skills/{name}/SKILL.md` for auto-discovery
+
+### Skills Registry
+
+Browse and run curated skills from [atmosphere-skills](https://github.com/Atmosphere/atmosphere-skills):
+
+```bash
+atmosphere skills list                # List all skills
+atmosphere skills search medical      # Search by keyword
+atmosphere skills run dentist-agent   # Scaffold and run
+```
+
+### Trusted Sources
+
+Remote imports are restricted to trusted GitHub organizations by default:
+
+| Trusted Source | Repository |
+|---------------|-----------|
+| `Atmosphere/*` | [atmosphere-skills](https://github.com/Atmosphere/atmosphere-skills) |
+| `anthropics/skills` | [Official Anthropic skills](https://github.com/anthropics/skills) |
+| `sickn33/antigravity-awesome-skills` | [1,200+ community skills](https://github.com/sickn33/antigravity-awesome-skills) |
+| `K-Dense-AI/*` | [Scientific/research skills](https://github.com/K-Dense-AI/claude-scientific-skills) |
+| `agentskills/*` | [Agent Skills spec](https://github.com/agentskills/agentskills) |
+
+To import from an untrusted source, use `--trust`:
+
+```bash
+atmosphere import --trust https://example.com/custom/SKILL.md
+```
+
+### Import Plugins
+
+The `import` command supports plugins for custom project scaffolding targets. Plugins are shell scripts at `~/.atmosphere/plugins/import-<target>.sh`:
+
+```bash
+atmosphere import --target kotlin https://example.com/SKILL.md   # uses import-kotlin.sh
+atmosphere plugins                                                # list installed plugins
+```
+
+## Available Templates
+
+Every template sparse-clones the matching sample from `cli/samples.json` into the directory you name, then rewrites the cloned `pom.xml` so its parent (`org.atmosphere:atmosphere-project`) resolves from Maven Central instead of the reactor root — the resulting project compiles standalone with `mvn compile` / `mvn spring-boot:run`.
+
+| Template | Source sample | Description |
+|---|---|---|
+| `chat` (default) | `spring-boot-chat` | Real-time WebSocket chat with rooms, observability, integration tests |
+| `one-dep-agent` | `spring-boot-one-dep-agent` | Minimal proof: one Atmosphere dependency + a single `@Agent` class is a running keyless streaming chat app |
+| `ai-chat` | `spring-boot-ai-chat` | AI streaming chat (Spring AI / LangChain4j / Gemini / Ollama) with structured-output demo |
+| `ai-tools` ⭐ | `spring-boot-ai-tools` | Enterprise starter: `@AiTool` function calling, HITL approval, cost metering, audit listener |
+| `mcp-server` | `spring-boot-mcp-server` | MCP server exposing tools, resources, and prompts to AI agents |
+| `rag` ⭐ | `spring-boot-rag-chat` | RAG agent with chunked vector-store ingestion and explicit document-search tools |
+| `agent` | `spring-boot-dentist-agent` | `@Agent` skill-file driven (the Dr. Molar demo); implied when `--skill-file` is passed |
+| `coding-agent` ⭐ | `spring-boot-coding-agent` | Sandbox SPI + Git clone + AgentResumeHandle reattach; reads files and proposes patches |
+| `guarded-agent` ⭐ | `spring-boot-guarded-email-agent` | Plan-and-Verify (Meijer) — refuses unsafe LLM-emitted plans before any tool fires |
+| `ms-governance` ⭐ | `spring-boot-ms-governance-chat` | Governance demo: policy admission, decision viewer, kill switch, write-gated admin endpoints |
+| `assistant` | `spring-boot-personal-assistant` | Long-lived memory-bearing assistant: AgentState + AgentWorkspace + AgentIdentity + ProtocolBridge |
+| `multi-agent` | `spring-boot-multi-agent-startup-team` | A `@Coordinator` (CEO) dispatching to 4 `@Agent` specialists over A2A |
+| `classroom` | `spring-boot-ai-classroom` | Shared streaming AI responses across web + Expo React Native clients |
+| `browser-agent` | `spring-boot-browser-agent` | Code-as-action agent — the model writes Playwright that drives a headless browser in an isolated sandbox container; screenshots stream to the Console live (requires Docker) |
+| `classic-rooms` | `spring-boot-team-rooms` | Atmosphere's classic annotations with no AI on the classpath: one templated `@ManagedService` per room, a global redaction `@BroadcasterFilterService`, presence via `@BroadcasterListenerService`, a bounded replay `@BroadcasterCacheService`, and a 429 rate limiter as an `@AtmosphereInterceptorService` |
+
+⭐ marks the five **flagship enterprise templates** — the canonical agent
+shapes most teams reach for first. Each one is a real sample with a working
+backend, a working frontend, and end-to-end tests; pick the one whose use
+case is closest to yours and substitute model/data accordingly. See
+[samples/README.md#flagship-enterprise-templates](../samples/README.md#flagship-enterprise-templates)
+for the full breakdown.
+
+## Requirements
+
+- **Java 21+** — `brew install openjdk@21` or [SDKMAN](https://sdkman.io)
+- **Maven 3.9+** — automatically on PATH via Homebrew/SDKMAN, or use the `mvnw` wrapper shipped with samples
+- **Git** — for the sparse-checkout used by `atmosphere new` and `atmosphere install`
+- **JBang** — only needed for `atmosphere compose` (skill-file driven multi-agent scaffolding); not required for `atmosphere new`
+
+## Architecture
+
+```
+cli/
+├── atmosphere          # POSIX shell CLI script
+├── samples.json        # Sample registry with metadata
+├── install.sh          # curl | sh installer
+├── npx/                # create-atmosphere-app npm package
+│   ├── package.json
+│   └── index.js
+└── homebrew/
+    └── atmosphere.rb   # Homebrew formula (for Atmosphere/homebrew-tap)
+```
+
+`atmosphere run` downloads sample fat JARs from GitHub Releases on first use and caches them in `~/.atmosphere/cache/v{version}/`. `atmosphere new` and `atmosphere install` use `git sparse-checkout` to fetch just the requested sample directory from `Atmosphere/atmosphere@main`. The release workflow (`.github/workflows/release-4x.yml`) stamps pinned versions across `cli/atmosphere`, `cli/samples.json`, `cli/npx/package.json`, and `cli/homebrew/atmosphere.rb` via `scripts/update-doc-versions.sh` before publishing a GitHub Release.

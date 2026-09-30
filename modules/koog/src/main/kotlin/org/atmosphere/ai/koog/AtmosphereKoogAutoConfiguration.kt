@@ -1,0 +1,138 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.ai.koog
+
+import ai.koog.prompt.executor.clients.openai.OpenAIClientSettings
+import ai.koog.prompt.executor.clients.openai.OpenAIModels
+import ai.koog.prompt.executor.llms.MultiLLMPromptExecutor
+import ai.koog.prompt.executor.model.PromptExecutor
+import ai.koog.prompt.llm.LLMProvider
+import ai.koog.prompt.llm.LLModel
+import org.atmosphere.ai.AiConfig
+import org.slf4j.LoggerFactory
+import org.springframework.beans.factory.annotation.Value
+import org.springframework.boot.autoconfigure.AutoConfiguration
+import org.springframework.boot.autoconfigure.condition.ConditionalOnClass
+
+/**
+ * Auto-configuration that wires a Koog [PromptExecutor] into [KoogAgentRuntime]
+ * from environment variables, using Koog 1.0's stable `OpenAILLMClient`.
+ *
+ * Two modes:
+ *  - **OpenAI** (no base URL, OpenAI-shaped model id): talks to `api.openai.com`;
+ *    the model is resolved from [OpenAIModels].
+ *  - **OpenAI-compatible** (`atmosphere.koog.base-url` / `LLM_BASE_URL` set, or
+ *    derived by [AiConfig.resolveBaseUrl] from mode/model when neither is):
+ *    points the same client at any OpenAI-compatible endpoint. This is the
+ *    supported path for Gemini — Koog 1.0's native Google client ships only on
+ *    the beta track (`1.0.0-beta-preview7`, incompatible with stable `1.0.0`) —
+ *    via Google's OpenAI surface
+ *    (`https://generativelanguage.googleapis.com/v1beta/openai`). The requested
+ *    `model` id is used verbatim with GPT-4o's capability profile, so any
+ *    OpenAI-compatible model name (e.g. `gemini-2.5-flash`) works.
+ *
+ * Users needing a non-OpenAI-compatible Koog client (Anthropic, Bedrock,
+ * Ollama) build their own [PromptExecutor] and inject it via
+ * [KoogAgentRuntime.setPromptExecutor].
+ */
+@AutoConfiguration
+@ConditionalOnClass(name = ["ai.koog.prompt.executor.model.PromptExecutor"])
+open class AtmosphereKoogAutoConfiguration {
+
+    companion object {
+        private val logger = LoggerFactory.getLogger(AtmosphereKoogAutoConfiguration::class.java)
+
+        /**
+         * The endpoint the executor will talk to, or `""` to use Koog's own
+         * OpenAI client defaults.
+         *
+         * A configured [baseUrl] always wins — that is what lets `LLM_BASE_URL`
+         * point at vLLM or LM Studio. With nothing configured, resolution is
+         * delegated to [AiConfig.resolveBaseUrl], the same resolver the built-in
+         * runtime uses, so mode and model steer the endpoint identically across
+         * runtimes: `local` yields loopback Ollama and a remote non-OpenAI model
+         * id (`gemini-*`, ...) yields Gemini's OpenAI-compatible surface.
+         *
+         * Deriving Gemini here rather than hard-coding it in a sample's YAML is
+         * load-bearing. A configured URL out-ranks mode, so a sample that
+         * defaults `atmosphere.koog.base-url` to the Gemini URL makes
+         * `LLM_MODE=local` unreachable and a keyless local run silently dials
+         * Google. With the default left blank, both quickstarts work.
+         *
+         * An OpenAI endpoint collapses back to `""` so the native branch keeps
+         * Koog's own client settings and its [OpenAIModels] catalogue.
+         */
+        internal fun resolveEndpoint(baseUrl: String, mode: String, model: String): String {
+            if (baseUrl.isNotBlank()) {
+                return baseUrl
+            }
+            val derived = AiConfig.resolveBaseUrl(mode, null, model)
+            return if (derived == AiConfig.OPENAI_ENDPOINT) "" else derived
+        }
+    }
+
+    @org.springframework.context.annotation.Bean
+    open fun koogAgentRuntime(
+        @Value("\${atmosphere.koog.model:\${LLM_MODEL:gpt-4o}}") modelName: String,
+        @Value("\${atmosphere.koog.api-key:\${LLM_API_KEY:\${OPENAI_API_KEY:}}}") apiKey: String,
+        @Value("\${atmosphere.koog.base-url:\${LLM_BASE_URL:}}") baseUrl: String,
+        @Value("\${llm.mode:\${LLM_MODE:}}") mode: String
+    ): KoogAgentRuntime {
+        // A locally served backend (Ollama, vLLM, LM Studio) needs no credential,
+        // so a blank key says nothing about whether a model is reachable. Keying
+        // only on the key returned a runtime with no PromptExecutor, and the
+        // failure surfaced far away — the first agent turn died with
+        // "PromptExecutor not configured" long after startup logged only a warning.
+        val local = mode.equals("local", ignoreCase = true)
+        if (apiKey.isBlank() && !local) {
+            logger.warn("No API key configured for Koog and llm.mode is not 'local'. "
+                + "Set LLM_API_KEY / OPENAI_API_KEY, or LLM_MODE=local for a local backend.")
+            return KoogAgentRuntime()
+        }
+
+        // The local server ignores the credential but the client still requires a
+        // non-blank one, so send a placeholder rather than failing to construct.
+        val resolvedApiKey = if (apiKey.isBlank()) "not-needed-for-local" else apiKey
+
+        val resolvedBaseUrl = resolveEndpoint(baseUrl, mode, modelName)
+
+        val executor: PromptExecutor
+        val model: LLModel
+
+        if (resolvedBaseUrl.isBlank()) {
+            executor = MultiLLMPromptExecutor(AtmosphereOpenAILLMClient(resolvedApiKey))
+            model = OpenAIModels.models.firstOrNull { it.id == modelName } ?: OpenAIModels.Chat.GPT4o
+            logger.info("Koog runtime configured: model '{}' via OpenAILLMClient (api.openai.com)", model.id)
+        } else {
+            // OpenAI-compatible endpoint (e.g. Gemini). Koog joins baseUrl with the
+            // chatCompletionsPath, so the base must include the version segment and
+            // the path drops the default "v1/" prefix.
+            val settings = OpenAIClientSettings(
+                baseUrl = resolvedBaseUrl.trimEnd('/'),
+                chatCompletionsPath = "chat/completions"
+            )
+            executor = MultiLLMPromptExecutor(AtmosphereOpenAILLMClient(resolvedApiKey, settings))
+            val template = OpenAIModels.Chat.GPT4o
+            model = LLModel(LLMProvider.OpenAI, modelName, template.capabilities,
+                template.contextLength, template.maxOutputTokens)
+            logger.info("Koog runtime configured: model '{}' via OpenAILLMClient ({})", model.id, resolvedBaseUrl)
+        }
+
+        KoogAgentRuntime.setPromptExecutor(executor)
+        KoogAgentRuntime.setDefaultModel(model)
+        return KoogAgentRuntime()
+    }
+}

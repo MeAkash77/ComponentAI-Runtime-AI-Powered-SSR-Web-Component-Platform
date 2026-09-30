@@ -1,0 +1,294 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.util;
+
+import org.atmosphere.cpr.ApplicationConfig;
+import org.atmosphere.cpr.AtmosphereConfig;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * Factory to create {@link ExecutorService} for Atmosphere components.
+ * Uses Virtual Threads (JDK 21+) by default for unlimited scalability.
+ *
+ * @author Jeanfrancois Arcand
+ */
+public class ExecutorsFactory {
+
+    private final static Logger logger = LoggerFactory.getLogger(ExecutorsFactory.class);
+    public final static int DEFAULT_ASYNC_THREAD = 200;
+    public final static int DEFAULT_MESSAGE_THREAD = -1;
+    public final static int DEFAULT_KEEP_ALIVE = 30;
+
+    public final static String ASYNC_WRITE_THREAD_POOL = "asyncWriteService";
+    public final static String SCHEDULER_THREAD_POOL = "scheduler";
+    public final static String BROADCASTER_THREAD_POOL = "executorService";
+
+    public final static class AtmosphereThreadFactory implements ThreadFactory {
+        private final AtomicInteger count = new AtomicInteger();
+        private final boolean shared;
+        private final String name;
+
+        public AtmosphereThreadFactory(boolean shared, String name) {
+            this.shared = shared;
+            this.name = name;
+        }
+
+        @Override
+        public Thread newThread(final Runnable runnable) {
+            Thread t = new Thread(runnable, (shared ? "Atmosphere-Shared-" : name) + count.getAndIncrement());
+            t.setDaemon(true);
+            return t;
+        }
+    }
+
+    /**
+     * Create an {@link ExecutorService} to be used for dispatching messages.
+     * Uses Virtual Threads by default for unlimited scalability.
+     */
+    public static ExecutorService getMessageDispatcher(final AtmosphereConfig config, final String name) {
+        final boolean shared = config.framework().isShareExecutorServices();
+        
+        if (!shared || config.properties().get(BROADCASTER_THREAD_POOL) == null) {
+            boolean useVirtualThreads = config.getInitParameter(ApplicationConfig.USE_VIRTUAL_THREADS, true);
+            ExecutorService service;
+
+            if (useVirtualThreads) {
+                // An operator who explicitly bounded processing concurrency
+                // must get that bound — silently ignoring it in the default
+                // VT mode turns a configured backpressure limit into
+                // unbounded concurrency (registre#7).
+                int bound = explicitBound(config,
+                        ApplicationConfig.BROADCASTER_MESSAGE_PROCESSING_THREADPOOL_MAXSIZE);
+                if (bound > 0) {
+                    logger.info("Using Virtual Threads for message dispatching bounded to {} "
+                            + "concurrent tasks ({} is set)", bound,
+                            ApplicationConfig.BROADCASTER_MESSAGE_PROCESSING_THREADPOOL_MAXSIZE);
+                    service = boundedVirtualThreadExecutor(bound, shared, name + "-DispatchOp-");
+                } else {
+                    logger.info("Using Virtual Threads for message dispatching (unlimited scalability)");
+                    service = Executors.newVirtualThreadPerTaskExecutor();
+                }
+            } else {
+                // Traditional thread pool only when virtual threads explicitly disabled
+                int threads = config.getInitParameter(
+                    ApplicationConfig.BROADCASTER_MESSAGE_PROCESSING_THREADPOOL_MAXSIZE, 
+                    DEFAULT_MESSAGE_THREAD
+                );
+                
+                if (threads == -1) {
+                    logger.info("Using cached thread pool for message dispatching");
+                    service = Executors.newCachedThreadPool(
+                        new AtmosphereThreadFactory(shared, name + "-DispatchOp-")
+                    );
+                } else {
+                    logger.info("Using fixed thread pool ({} threads) for message dispatching", threads);
+                    service = Executors.newFixedThreadPool(threads,
+                        new AtmosphereThreadFactory(shared, name + "-DispatchOp-")
+                    );
+                }
+                
+                configureThreadPool(service, config);
+            }
+
+            if (shared) {
+                config.properties().put(BROADCASTER_THREAD_POOL, service);
+            }
+            return service;
+        } else {
+            return (ExecutorService) config.properties().get(BROADCASTER_THREAD_POOL);
+        }
+    }
+
+    /**
+     * Create an {@link ExecutorService} for async I/O operations.
+     * Uses Virtual Threads by default - perfect for I/O-bound work.
+     */
+    public static ExecutorService getAsyncOperationExecutor(final AtmosphereConfig config, final String name) {
+        final boolean shared = config.framework().isShareExecutorServices();
+
+        if (!shared || config.properties().get(ASYNC_WRITE_THREAD_POOL) == null) {
+            boolean useVirtualThreads = config.getInitParameter(ApplicationConfig.USE_VIRTUAL_THREADS, true);
+            ExecutorService service;
+
+            if (useVirtualThreads) {
+                // Same contract as the message dispatcher: an explicitly
+                // configured async-write bound is honored in VT mode
+                // (registre#7).
+                int bound = explicitBound(config,
+                        ApplicationConfig.BROADCASTER_ASYNC_WRITE_THREADPOOL_MAXSIZE);
+                if (bound > 0) {
+                    logger.info("Using Virtual Threads for async I/O bounded to {} "
+                            + "concurrent tasks ({} is set)", bound,
+                            ApplicationConfig.BROADCASTER_ASYNC_WRITE_THREADPOOL_MAXSIZE);
+                    service = boundedVirtualThreadExecutor(bound, shared, name + "-AsyncOp-");
+                } else {
+                    logger.info("Using Virtual Threads for async I/O (unlimited scalability)");
+                    service = Executors.newVirtualThreadPerTaskExecutor();
+                }
+            } else {
+                // Traditional thread pool only when virtual threads explicitly disabled
+                int threads = config.getInitParameter(
+                    ApplicationConfig.BROADCASTER_ASYNC_WRITE_THREADPOOL_MAXSIZE,
+                    DEFAULT_ASYNC_THREAD
+                );
+                
+                if (threads == -1) {
+                    logger.info("Using cached thread pool for async I/O");
+                    service = Executors.newCachedThreadPool(
+                        new AtmosphereThreadFactory(shared, name + "-AsyncOp-")
+                    );
+                } else {
+                    logger.info("Using fixed thread pool ({} threads) for async I/O", threads);
+                    service = Executors.newFixedThreadPool(threads,
+                        new AtmosphereThreadFactory(shared, name + "-AsyncOp-")
+                    );
+                }
+                
+                configureThreadPool(service, config);
+            }
+
+            if (shared) {
+                config.properties().put(ASYNC_WRITE_THREAD_POOL, service);
+            }
+            return service;
+        } else {
+            return (ExecutorService) config.properties().get(ASYNC_WRITE_THREAD_POOL);
+        }
+    }
+
+    /**
+     * Create a {@link ScheduledExecutorService} for scheduled tasks.
+     */
+    public static ScheduledExecutorService getScheduler(final AtmosphereConfig config) {
+        final boolean shared = config.framework().isShareExecutorServices();
+
+        if (!shared || config.properties().get(SCHEDULER_THREAD_POOL) == null) {
+            int threads = config.getInitParameter(
+                ApplicationConfig.SCHEDULER_THREADPOOL_MAXSIZE,
+                Runtime.getRuntime().availableProcessors()
+            );
+            
+            logger.info("Creating scheduler with {} threads", threads);
+            ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(threads, new ThreadFactory() {
+                private final AtomicInteger count = new AtomicInteger();
+
+                @Override
+                public Thread newThread(final Runnable runnable) {
+                    Thread t = new Thread(runnable, "Atmosphere-Scheduler-" + count.getAndIncrement());
+                    t.setDaemon(true);
+                    return t;
+                }
+            });
+
+            if (shared) {
+                config.properties().put(SCHEDULER_THREAD_POOL, scheduler);
+            }
+
+            configureThreadPool(scheduler, config);
+            return scheduler;
+        } else {
+            return (ScheduledExecutorService) config.properties().get(SCHEDULER_THREAD_POOL);
+        }
+    }
+
+    /**
+     * The pool bound the operator explicitly configured for {@code key}, or
+     * {@code -1} when the parameter is absent or non-positive (unbounded /
+     * cached semantics). Only an explicit init-param counts — defaults never
+     * introduce a bound in virtual-thread mode.
+     */
+    private static int explicitBound(AtmosphereConfig config, String key) {
+        var raw = config.getInitParameter(key);
+        if (raw == null || raw.isBlank()) {
+            return -1;
+        }
+        try {
+            var bound = Integer.parseInt(raw.trim());
+            return bound > 0 ? bound : -1;
+        } catch (NumberFormatException e) {
+            logger.warn("Ignoring non-numeric value '{}' for {}", raw, key);
+            return -1;
+        }
+    }
+
+    /**
+     * A fixed pool of virtual worker threads: the operator's configured
+     * concurrency bound is honored while tasks still run on virtual threads
+     * (cheap blocking). Excess tasks queue, matching the platform-thread
+     * fixed-pool semantics the same knob configures with virtual threads
+     * disabled.
+     */
+    private static ExecutorService boundedVirtualThreadExecutor(int bound, boolean shared,
+                                                                String name) {
+        return Executors.newFixedThreadPool(bound, Thread.ofVirtual()
+                .name(shared ? "Atmosphere-Shared-" : name, 0)
+                .factory());
+    }
+
+    private static void configureThreadPool(ExecutorService service, AtmosphereConfig config) {
+        if (service instanceof ThreadPoolExecutor executor) {
+            int keepAlive = config.getInitParameter(
+                ApplicationConfig.EXECUTORFACTORY_KEEP_ALIVE,
+                DEFAULT_KEEP_ALIVE
+            );
+            executor.setKeepAliveTime(keepAlive, TimeUnit.SECONDS);
+            executor.allowCoreThreadTimeOut(
+                config.getInitParameter(ApplicationConfig.ALLOW_CORE_THREAD_TIMEOUT, true)
+            );
+        }
+    }
+
+    public static void reset(AtmosphereConfig config) {
+        shutdown(config, ASYNC_WRITE_THREAD_POOL);
+        shutdown(config, SCHEDULER_THREAD_POOL);
+        shutdown(config, BROADCASTER_THREAD_POOL);
+    }
+    
+    /** Property suffix marking a pool as externally owned (skip shutdown). */
+    public static final String EXTERNAL_MARKER = ".external";
+
+    private static void shutdown(AtmosphereConfig config, String poolName) {
+        ExecutorService service = (ExecutorService) config.properties().get(poolName);
+        if (service != null) {
+            // Skip shutdown for externally-owned pools (container-managed executors)
+            var external = config.properties().get(poolName + EXTERNAL_MARKER);
+            if (Boolean.TRUE.equals(external)) {
+                logger.debug("Skipping shutdown of external executor for {}", poolName);
+            } else {
+                service.shutdown();
+                try {
+                    if (!service.awaitTermination(5, TimeUnit.SECONDS)) {
+                        service.shutdownNow();
+                    }
+                } catch (InterruptedException e) {
+                    service.shutdownNow();
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+        config.properties().remove(poolName);
+        config.properties().remove(poolName + EXTERNAL_MARKER);
+    }
+}

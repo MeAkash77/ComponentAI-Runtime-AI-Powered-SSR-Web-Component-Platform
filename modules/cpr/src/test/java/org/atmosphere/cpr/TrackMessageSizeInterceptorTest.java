@@ -1,0 +1,206 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.cpr;
+
+import org.atmosphere.client.TrackMessageSizeInterceptor;
+import org.atmosphere.interceptor.TrackMessageSizeB64Interceptor;
+import org.atmosphere.websocket.WebSocket;
+import org.atmosphere.websocket.WebSocketProcessor;
+
+import jakarta.servlet.ServletConfig;
+import jakarta.servlet.ServletContext;
+import jakarta.servlet.ServletException;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.Map;
+
+import static org.mockito.Mockito.mock;
+
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+public class TrackMessageSizeInterceptorTest {
+
+    private static final String PADDING_TEXT;
+
+    static {
+        StringBuilder whitespace = new StringBuilder();
+        for (int i = 0; i < 2048; i++) {
+            whitespace.append(" ");
+        }
+
+        PADDING_TEXT = whitespace.toString();
+    }
+
+    private AtmosphereFramework framework;
+
+    @BeforeEach
+    public void create() throws Throwable {
+        framework = new AtmosphereFramework();
+        framework.setAsyncSupport(new AsynchronousProcessor(framework.getAtmosphereConfig()) {
+            @Override
+            public Action service(AtmosphereRequest req, AtmosphereResponse res) throws IOException, ServletException {
+                return action(req, res);
+            }
+        });
+        framework.init(new ServletConfig() {
+            @Override
+            public String getServletName() {
+                return "void";
+            }
+
+            @Override
+            public ServletContext getServletContext() {
+                return mock(ServletContext.class);
+            }
+
+            @Override
+            public String getInitParameter(String name) {
+                return null;
+            }
+
+            @Override
+            public Enumeration<String> getInitParameterNames() {
+                return null;
+            }
+        });
+    }
+
+    @AfterEach
+    public void destroy() throws Throwable {
+        framework.destroy();
+    }
+
+    @Test
+    public void testTrackMessageSizeEnabled() throws Exception {
+        testTrackMessageSize(true, new TrackMessageSizeInterceptor(), "7|yoComet11|yoWebSocket");
+    }
+
+    @Test
+    public void testTrackMessageSizeDisabled() throws Exception {
+        testTrackMessageSize(false, new TrackMessageSizeInterceptor(), "yoCometyoWebSocket");
+    }
+
+    @Test
+    public void testTrackMessageSizeForPaddingMessage() throws Exception {
+        testTrackMessageSize(true, new TrackMessageSizeInterceptor(), null, PADDING_TEXT, PADDING_TEXT);
+    }
+
+    @Test
+    public void testTrackMessageSizeB64Enabled() throws Exception {
+        testTrackMessageSize(true, new TrackMessageSizeB64Interceptor(), "12|eW9Db21ldA==16|eW9XZWJTb2NrZXQ=");
+    }
+
+    @Test
+    public void testTrackMessageSizeB64Disabled() throws Exception {
+        testTrackMessageSize(false, new TrackMessageSizeB64Interceptor(), "yoCometyoWebSocket");
+    }
+
+    @Test
+    public void testTrackMessageB64AlreadyEncoded() throws Exception {
+        testTrackMessageSize(true, new TrackMessageSizeB64Interceptor(), "1|X", "", "1|X");
+    }
+
+    @Test
+    public void testTrackMessageAlreadyEncoded() throws Exception {
+        testTrackMessageSize(true, new TrackMessageSizeInterceptor(), "1|X", "", "1|X");
+    }
+
+    private void testTrackMessageSize(boolean enabled, AtmosphereInterceptor icp, String expected) throws Exception {
+        testTrackMessageSize(enabled, icp, "yoComet", "yoWebSocket", expected);
+    }
+
+    private void testTrackMessageSize(boolean enabled, AtmosphereInterceptor icp, String bodyMessage, String websocketMessage, String expected) throws Exception {
+        ByteArrayOutputStream b = new ByteArrayOutputStream();
+        final WebSocket w = new ArrayBaseWebSocket(b);
+        final WebSocketProcessor processor = WebSocketProcessorFactory.getDefault()
+                .getWebSocketProcessor(framework);
+
+        framework.interceptor(icp);
+        framework.addAtmosphereHandler("/*", new AtmosphereHandler() {
+
+            @Override
+            public void onRequest(AtmosphereResource resource) throws IOException {
+                resource.getResponse().write(resource.getRequest().getReader().readLine());
+            }
+
+            @Override
+            public void onStateChange(AtmosphereResourceEvent event) throws IOException {
+                event.getResource().write(event.getMessage().toString().getBytes());
+            }
+
+            @Override
+            public void destroy() {
+            }
+        });
+
+        Map<String, String> reqheaders = new HashMap<String, String>();
+        if (enabled) {
+            reqheaders.put(HeaderConfig.X_ATMOSPHERE_TRACKMESSAGESIZE, "true");
+        }
+        AtmosphereRequestImpl.Builder requestBuilder = new AtmosphereRequestImpl.Builder()
+                .destroyable(false)
+                .headers(reqheaders)
+                .pathInfo("/a");
+
+        if (bodyMessage != null) {
+            requestBuilder.body(bodyMessage);
+        }
+
+        AtmosphereRequest request = requestBuilder.build();
+
+        processor.open(w, request, AtmosphereResponseImpl.newInstance(framework.getAtmosphereConfig(), request, w));
+        processor.invokeWebSocketProtocol(w, websocketMessage);
+        assertEquals(expected, b.toString());
+    }
+
+    public final class ArrayBaseWebSocket extends WebSocket {
+
+        private final OutputStream outputStream;
+
+        public ArrayBaseWebSocket(OutputStream outputStream) {
+            super(framework.getAtmosphereConfig());
+            this.outputStream = outputStream;
+        }
+
+        @Override
+        public boolean isOpen() {
+            return true;
+        }
+
+        @Override
+        public WebSocket write(String s) throws IOException {
+            outputStream.write(s.getBytes());
+            return this;
+        }
+
+        @Override
+        public WebSocket write(byte[] b, int offset, int length) throws IOException {
+            outputStream.write(b, offset, length);
+            return this;
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+}

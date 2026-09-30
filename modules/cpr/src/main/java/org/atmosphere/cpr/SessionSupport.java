@@ -1,0 +1,82 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.cpr;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import jakarta.servlet.http.HttpSession;
+import jakarta.servlet.http.HttpSessionEvent;
+import jakarta.servlet.http.HttpSessionListener;
+
+/**
+ * An {@link HttpSessionListener} that cleans up {@link org.atmosphere.cpr.AtmosphereResource}s
+ * associated with an HTTP session when that session is destroyed.
+ */
+public class SessionSupport implements HttpSessionListener {
+
+    private final Logger logger = LoggerFactory.getLogger(SessionSupport.class);
+
+    // Quite ugly, but gives hints about current state of Session Support.
+    static boolean initializationHint;
+
+    public SessionSupport() {
+        initializationHint = true;
+    }
+
+    @Override
+    public void sessionCreated(HttpSessionEvent se) {
+        logger.trace("Session created");
+    }
+
+    @Override
+    public void sessionDestroyed(HttpSessionEvent se) {
+        logger.trace("Session destroyed");
+        try {
+            HttpSession s = se.getSession();
+            BroadcasterFactory f = lookupBroadcasterFactory(s);
+            if (f != null) {
+                for (Broadcaster b : f.lookupAll()) {
+                    for (AtmosphereResource r : b.getAtmosphereResources()) {
+                        if (r.session(false) != null && r.session().getId().equals(s.getId())) {
+                            ((AtmosphereResourceImpl) r).session(null);
+                        }
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            logger.warn("", t);
+        }
+    }
+
+    private static BroadcasterFactory lookupBroadcasterFactory(HttpSession session) {
+        try {
+            var ctx = session.getServletContext();
+            if (ctx != null) {
+                var fw = (AtmosphereFramework) ctx.getAttribute(AtmosphereFramework.FRAMEWORK_ATTRIBUTE);
+                if (fw != null) {
+                    return fw.getBroadcasterFactory();
+                }
+            }
+        } catch (Exception e) {
+            // Fall through to deprecated path
+        }
+        // Backward compatibility for environments that don't store the framework attribute
+        @SuppressWarnings("removal")
+        BroadcasterFactory fallback = Universe.broadcasterFactory();
+        return fallback;
+    }
+}

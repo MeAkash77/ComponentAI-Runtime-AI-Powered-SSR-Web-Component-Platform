@@ -1,0 +1,107 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.coordinator.annotation;
+
+import org.atmosphere.ai.preset.Harness;
+import org.atmosphere.coordinator.journal.JournalFormat;
+
+import java.lang.annotation.Documented;
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+/**
+ * Marks a class as an Atmosphere Coordinator — an agent that manages a
+ * {@link Fleet} of other agents. Subsumes {@code @Agent}: the
+ * {@link CoordinatorProcessor} handles base agent setup internally,
+ * then adds fleet wiring.
+ *
+ * <pre>{@code
+ * @Coordinator(name = "ceo", skillFile = "prompts/ceo-skill.md")
+ * @Fleet({
+ *     @AgentRef(type = ResearchAgent.class),
+ *     @AgentRef(value = "finance", version = "2.0.0")
+ * })
+ * public class CeoCoordinator {
+ *
+ *     @Prompt
+ *     public void onPrompt(String message, AgentFleet fleet, StreamingSession session) {
+ *         var research = fleet.agent("research").call("web_search", Map.of("query", message));
+ *         session.stream("Synthesize: " + research.text());
+ *     }
+ * }
+ * }</pre>
+ */
+@Target(ElementType.TYPE)
+@Retention(RetentionPolicy.RUNTIME)
+@Documented
+public @interface Coordinator {
+
+    /** Coordinator name. Used in the registration path and protocol metadata. */
+    String name();
+
+    /**
+     * Classpath resource path to the skill file (.md). The entire file becomes
+     * the system prompt. A {@code ## Guardrails} section is also enforced as an
+     * admission {@code ScopePolicy} with the same precedence as on
+     * {@code @Agent}: the skill's guardrails win, an optional {@code scopeTier}
+     * frontmatter hint picks the tier ({@code none} opts out entirely), and a
+     * {@code @AgentScope} annotation on the class is the fallback when the
+     * skill declares no guardrails.
+     */
+    String skillFile() default "";
+
+    /** Human-readable description. Used in Agent Card metadata. */
+    String description() default "";
+
+    /** Coordinator version for Agent Card metadata. */
+    String version() default "1.0.0";
+
+    /**
+     * Harness features attached to this coordinator. Like {@code @Agent} —
+     * which this annotation subsumes — a coordinator is batteries-included
+     * by default: a declared fleet almost always wants the
+     * {@code delegate_task} tool and the governed dispatch edge, so
+     * {@link Harness#ALL} is the default. Opt down with {@code harness = {}}
+     * (bare loop) or narrow to specific features
+     * ({@code harness = {Harness.DELEGATION}}). The app-wide kill switch
+     * ({@code org.atmosphere.ai.harness.enabled=false}) and
+     * {@code exclude-paths} beat this attribute.
+     */
+    Harness[] harness() default {Harness.ALL};
+
+    /**
+     * Target Java type for structured output from the coordinator's LLM synthesis.
+     * When set to a type other than {@code Void.class}, the framework wraps the
+     * streaming session with a {@code StructuredOutputCapturingSession} that
+     * parses the LLM JSON response into the specified type and emits
+     * {@code EntityStart}, {@code StructuredField}, and {@code EntityComplete} events.
+     *
+     * @see org.atmosphere.ai.annotation.AiEndpoint#responseAs()
+     */
+    Class<?> responseAs() default Void.class;
+
+    /**
+     * Journal format to auto-emit as a tool card after the {@code @Prompt} method completes.
+     * When set, the framework renders the coordination journal using the specified format
+     * and emits it as a {@code ToolStart}/{@code ToolResult} event pair.
+     *
+     * <p>Defaults to {@code JournalFormat.class} (disabled). Use
+     * {@code JournalFormat.Markdown.class} or a custom implementation.</p>
+     */
+    Class<? extends JournalFormat> journalFormat() default JournalFormat.class;
+}

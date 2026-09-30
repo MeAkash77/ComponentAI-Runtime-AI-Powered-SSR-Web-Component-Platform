@@ -1,0 +1,1610 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.mcp.runtime;
+
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
+import org.atmosphere.cpr.AtmosphereConfig;
+import org.atmosphere.cpr.AtmosphereFramework;
+import org.atmosphere.cpr.AtmosphereResource;
+import org.atmosphere.cpr.Broadcaster;
+import org.atmosphere.cpr.BroadcasterFactory;
+import org.atmosphere.mcp.protocol.JsonRpc;
+import org.atmosphere.mcp.protocol.Mcp2026;
+import org.atmosphere.mcp.protocol.McpInputContext;
+import org.atmosphere.mcp.protocol.McpInputRequiredException;
+import org.atmosphere.mcp.protocol.McpMethod;
+import org.atmosphere.mcp.registry.McpRegistry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.lang.reflect.InvocationTargetException;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+/**
+ * Core MCP protocol handler. Processes incoming JSON-RPC messages and dispatches
+ * to the appropriate MCP method handler (initialize, tools/list, tools/call, etc.).
+ */
+public final class McpProtocolHandler {
+
+    private static final Logger logger = LoggerFactory.getLogger(McpProtocolHandler.class);
+    private static final ObjectMapper mapper = new ObjectMapper();
+
+    /**
+     * The latest MCP spec revision this server speaks.
+     * <p>Bumped to {@code 2025-11-25} (icons, EnumSchema, URL-mode elicitation,
+     * standards-based ElicitResult, OIDC discovery hooks, JSON Schema 2020-12
+     * default dialect). Version negotiation: if the client requests a revision
+     * we know about ({@link #SUPPORTED_VERSIONS}), we respond with theirs;
+     * otherwise we respond with the latest we speak and let the client decide
+     * whether to proceed.</p>
+     */
+    public static final String PROTOCOL_VERSION = "2025-11-25";
+
+    /**
+     * Revisions this server understands, newest first. Used during the
+     * initialize handshake to honor clients pinned to older specs.
+     */
+    public static final List<String> SUPPORTED_VERSIONS = List.of(
+            "2025-11-25",
+            "2025-06-18",
+            "2025-03-26",
+            "2024-11-05"
+    );
+
+    /**
+     * Init-parameter (SEP-2549) setting the {@code ttlMs} cache hint, in
+     * milliseconds, advertised on the stateless {@code 2026-07-28} cacheable
+     * results ({@code server/discover}, {@code tools/list}, {@code resources/list},
+     * {@code resources/read}, {@code prompts/list}). Defaults to {@code 0} —
+     * clients revalidate every time — which is the safe choice because the
+     * registry can be mutated at runtime. A deployment with a static catalog may
+     * raise it to let shared gateways cache list results.
+     */
+    public static final String CACHE_TTL_INIT_PARAM = "org.atmosphere.mcp.cacheTtlMs";
+
+    /**
+     * Init-param selecting the SEP-2549 {@code cacheScope} advertised on the
+     * stateless dialect's cacheable results. Defaults to {@code private}: a
+     * shared cache must not serve one caller's catalog or resource read to
+     * another once visibility depends on the principal or tenant. Set it to
+     * {@code public} only for a static catalog that every caller sees
+     * identically; even then, a request carrying an authenticated principal is
+     * still answered with {@code private}.
+     */
+    public static final String CACHE_SCOPE_INIT_PARAM = "org.atmosphere.mcp.cacheScope";
+
+    private final String serverName;
+    private final String serverVersion;
+    private final McpRegistry registry;
+    private final AtmosphereConfig config;
+    private final List<String> guardrails;
+    private final long cacheTtlMs;
+    private final boolean publicCacheScope;
+    private final McpAuthorization authorization;
+    private final McpTaskManager taskManager = new McpTaskManager();
+    private volatile McpTracing tracing;
+
+    // Protocol dialects (plugin/adapter pattern). The session model and the
+    // stateless 2026-07-28 model run side by side; the per-request dialect is
+    // selected in handleSingleMessage from the presence of a _meta protocol
+    // version. Both delegate tool/resource/prompt execution back to the shared
+    // handlers below, so the two can never diverge on what a tool returns.
+    private final ProtocolDialect sessionDialect = new SessionDialect(this);
+    private final ProtocolDialect statelessDialect = new StatelessDialect(this);
+
+    // Per-invocation multi-round-trip input (SEP-2322), made available to a
+    // tool handler that injects an McpInputContext parameter. Set and cleared
+    // around each tool execution in runToolWithPrincipal — on whatever thread
+    // runs the tool (the request thread for a sync call, the task's virtual
+    // thread for a long-running call), so each invocation sees only its own.
+    private static final ThreadLocal<McpInputContext> CURRENT_INPUT =
+            ThreadLocal.withInitial(McpInputContext::empty);
+
+    // Per-invocation server→client request surface (sampling, roots,
+    // elicitation), made available to a tool handler that injects an
+    // McpServerContext parameter. Bound around each tool execution on the
+    // thread that runs the tool, exactly like CURRENT_INPUT, and cleared on
+    // every terminal path so one invocation can never see another's session.
+    private static final ThreadLocal<McpServerContext> CURRENT_SERVER_CONTEXT =
+            ThreadLocal.withInitial(McpServerContext::empty);
+
+    public McpProtocolHandler(String serverName, String serverVersion,
+                              McpRegistry registry, AtmosphereConfig config) {
+        this(serverName, serverVersion, registry, config, List.of());
+    }
+
+    public McpProtocolHandler(String serverName, String serverVersion,
+                              McpRegistry registry, AtmosphereConfig config,
+                              List<String> guardrails) {
+        this.serverName = serverName;
+        this.serverVersion = serverVersion;
+        this.registry = registry;
+        this.config = config;
+        this.guardrails = guardrails != null ? List.copyOf(guardrails) : List.of();
+        this.cacheTtlMs = resolveCacheTtl(config);
+        this.publicCacheScope = resolvePublicCacheScope(config);
+        this.authorization = McpAuthorization.from(config);
+    }
+
+    /**
+     * The OAuth resource-server authorization glue (RFC 9728), resolved from
+     * config. Disabled unless configured — see {@link McpAuthorization}.
+     */
+    public McpAuthorization authorization() {
+        return authorization;
+    }
+
+    /**
+     * Resolve the SEP-2549 cache-TTL hint from {@link #CACHE_TTL_INIT_PARAM},
+     * defaulting to {@code 0} (no caching) when unset, blank, or unparseable.
+     */
+    private static long resolveCacheTtl(AtmosphereConfig config) {
+        if (config == null) {
+            return 0L;
+        }
+        String raw;
+        try {
+            raw = config.getInitParameter(CACHE_TTL_INIT_PARAM);
+        } catch (RuntimeException e) {
+            logger.trace("Could not read {}; defaulting cache TTL to 0", CACHE_TTL_INIT_PARAM, e);
+            return 0L;
+        }
+        if (raw == null || raw.isBlank()) {
+            return 0L;
+        }
+        try {
+            return Math.max(0L, Long.parseLong(raw.trim()));
+        } catch (NumberFormatException e) {
+            logger.warn("Invalid {} '{}'; defaulting to 0 (no caching)", CACHE_TTL_INIT_PARAM, raw);
+            return 0L;
+        }
+    }
+
+    /**
+     * Resolve {@link #CACHE_SCOPE_INIT_PARAM}: {@code true} only for an explicit
+     * {@code public}; unset, blank, {@code private} or anything else keeps the
+     * fail-closed {@code private} default.
+     */
+    private static boolean resolvePublicCacheScope(AtmosphereConfig config) {
+        if (config == null) {
+            return false;
+        }
+        String raw;
+        try {
+            raw = config.getInitParameter(CACHE_SCOPE_INIT_PARAM);
+        } catch (RuntimeException e) {
+            logger.trace("Could not read {}; defaulting cacheScope to private",
+                    CACHE_SCOPE_INIT_PARAM, e);
+            return false;
+        }
+        if (raw == null || raw.isBlank()) {
+            return false;
+        }
+        var value = raw.trim();
+        if (Mcp2026.CACHE_SCOPE_PUBLIC.equalsIgnoreCase(value)) {
+            logger.info("MCP stateless results advertise cacheScope=public ({}); "
+                    + "authenticated requests still get private", CACHE_SCOPE_INIT_PARAM);
+            return true;
+        }
+        if (!Mcp2026.CACHE_SCOPE_PRIVATE.equalsIgnoreCase(value)) {
+            logger.warn("Invalid {} '{}'; defaulting to private", CACHE_SCOPE_INIT_PARAM, raw);
+        }
+        return false;
+    }
+
+    /**
+     * Set the optional MCP tracing instance for OpenTelemetry instrumentation.
+     */
+    public void setTracing(McpTracing tracing) {
+        this.tracing = tracing;
+    }
+
+    /**
+     * Return the optional MCP tracing instance, or {@code null} if none is set.
+     */
+    public McpTracing tracing() {
+        return tracing;
+    }
+
+    // Accessors for the protocol dialects. Package-private: the dialects live in
+    // this package and build their own discovery/capability views from these.
+    McpRegistry registry() {
+        return registry;
+    }
+
+    String serverName() {
+        return serverName;
+    }
+
+    String serverVersion() {
+        return serverVersion;
+    }
+
+    List<String> guardrails() {
+        return guardrails;
+    }
+
+    /** The SEP-2549 {@code ttlMs} cache hint advertised on cacheable results. */
+    long cacheTtlMs() {
+        return cacheTtlMs;
+    }
+
+    /**
+     * The SEP-2549 {@code cacheScope} for a cacheable result served to
+     * {@code resource}: {@code public} only when the deployment opted in via
+     * {@link #CACHE_SCOPE_INIT_PARAM} and the request is anonymous.
+     */
+    String cacheScopeFor(AtmosphereResource resource) {
+        if (publicCacheScope && resolvePrincipal(resource) == null) {
+            return Mcp2026.CACHE_SCOPE_PUBLIC;
+        }
+        return Mcp2026.CACHE_SCOPE_PRIVATE;
+    }
+
+    /**
+     * Handle an incoming message from an MCP client.
+     * Returns the JSON-RPC response to send back, or null for notifications.
+     */
+    public String handleMessage(AtmosphereResource resource, String message) {
+        try {
+            var node = mapper.readTree(message);
+
+            // MCP 2025-06-18 dropped JSON-RPC batching. Reject batches outright
+            // with INVALID_REQUEST so a non-conforming client gets a clear
+            // diagnostic instead of partial-success ambiguity.
+            if (node.isArray()) {
+                return serialize(JsonRpc.Response.error(null, JsonRpc.INVALID_REQUEST,
+                        "JSON-RPC batching is not supported (removed in MCP 2025-06-18)"));
+            }
+
+            return handleSingleMessage(resource, node);
+        } catch (JacksonException e) {
+            logger.warn("Failed to parse JSON-RPC message", e);
+            return serialize(JsonRpc.Response.error(null, JsonRpc.PARSE_ERROR,
+                    "Invalid JSON: " + e.getMessage()));
+        } catch (Exception e) {
+            logger.error("Error handling MCP message", e);
+            return serialize(JsonRpc.Response.error(null, JsonRpc.INTERNAL_ERROR,
+                    e.getMessage()));
+        }
+    }
+
+    private String handleSingleMessage(AtmosphereResource resource, JsonNode node) {
+        var method = node.has("method") ? node.get("method").stringValue() : null;
+        var id = node.has("id") ? node.get("id") : null;
+
+        // Response envelope (no method, has id, has result|error) — this is
+        // a client reply to a server-initiated request such as
+        // elicitation/create. Route it back to the waiting future on the
+        // session and return null (no further response from the server).
+        if (method == null && id != null && !id.isNull()
+                && (node.has("result") || node.has("error"))) {
+            var session = (McpSession) resource.getRequest()
+                    .getAttribute(McpSession.ATTRIBUTE_KEY);
+            if (session != null) {
+                var requestId = id.isString() ? id.stringValue() : id.toString();
+                if (!session.completeServerRequest(requestId, node)) {
+                    logger.debug("Received response for unknown server request id={} on session {}",
+                            requestId, session.sessionId());
+                }
+            }
+            return null;
+        }
+
+        if (method == null) {
+            return serialize(JsonRpc.Response.error(idValue(id),
+                    JsonRpc.INVALID_REQUEST, "Missing method"));
+        }
+
+        // Notifications (no id) — don't send a response
+        if (id == null || id.isNull()) {
+            handleNotification(resource, method, node.get("params"));
+            return null;
+        }
+
+        var idVal = idValue(id);
+        var ctx = McpRequestContext.from(resource, idVal, method, node.get("params"));
+        return serialize(dialectFor(ctx).dispatch(ctx));
+    }
+
+    /**
+     * Select the protocol dialect for a request. A {@code _meta} protocol
+     * version is the signal that the client speaks the stateless
+     * {@code 2026-07-28} model — legacy clients negotiate via the
+     * {@code initialize} handshake and never set it. {@code server/discover} is
+     * the stateless entry point even before the client has pinned a version.
+     */
+    private ProtocolDialect dialectFor(McpRequestContext ctx) {
+        if (ctx.protocolVersion() != null || McpMethod.SERVER_DISCOVER.equals(ctx.method())) {
+            return statelessDialect;
+        }
+        return sessionDialect;
+    }
+
+    /**
+     * Session-model ({@code 2024-11-05 … 2025-11-25}) method dispatch, extracted
+     * verbatim from the original monolithic switch so {@link SessionDialect} can
+     * own it as a peer of {@link StatelessDialect}. Behavior is unchanged.
+     */
+    JsonRpc.Response dispatchSession(AtmosphereResource resource, Object idVal,
+                                     String method, JsonNode params) {
+        return switch (method) {
+            case McpMethod.INITIALIZE -> handleInitialize(resource, idVal, params);
+            case McpMethod.PING -> JsonRpc.Response.success(idVal, Map.of());
+            case McpMethod.TOOLS_LIST -> handleToolsList(idVal);
+            case McpMethod.TOOLS_CALL -> handleToolsCall(resource, idVal, params);
+            case McpMethod.RESOURCES_LIST -> handleResourcesList(idVal);
+            case McpMethod.RESOURCES_READ -> handleResourcesRead(idVal, params);
+            case McpMethod.RESOURCES_TEMPLATES_LIST -> handleResourceTemplatesList(idVal);
+            case McpMethod.COMPLETION_COMPLETE -> handleCompletion(idVal, params);
+            case McpMethod.RESOURCES_SUBSCRIBE -> handleResourcesSubscribe(resource, idVal, params);
+            case McpMethod.RESOURCES_UNSUBSCRIBE -> handleResourcesUnsubscribe(resource, idVal, params);
+            case McpMethod.PROMPTS_LIST -> handlePromptsList(idVal);
+            case McpMethod.PROMPTS_GET -> handlePromptsGet(idVal, params);
+            case McpMethod.TASKS_GET -> handleTasksGet(idVal, params);
+            case McpMethod.TASKS_RESULT -> handleTasksResult(idVal, params);
+            case McpMethod.TASKS_LIST -> handleTasksList(idVal, params);
+            case McpMethod.TASKS_CANCEL -> handleTasksCancel(idVal, params);
+            default -> JsonRpc.Response.error(idVal, JsonRpc.METHOD_NOT_FOUND,
+                    "Unknown method: " + method);
+        };
+    }
+
+    // ── Lifecycle ────────────────────────────────────────────────────────
+
+    @SuppressWarnings("unchecked")
+    private JsonRpc.Response handleInitialize(AtmosphereResource resource, Object id, JsonNode params) {
+        var session = getOrCreateSession(resource);
+
+        // Honor the version the client asked for if we know it; otherwise
+        // fall back to our latest. Clients that don't recognize the response
+        // version are expected to disconnect (per spec).
+        String negotiatedVersion = PROTOCOL_VERSION;
+        if (params != null) {
+            var clientInfo = params.get("clientInfo");
+            var capabilities = params.get("capabilities");
+            var requested = params.get("protocolVersion");
+            if (requested != null && requested.isString()) {
+                var asked = requested.stringValue();
+                if (SUPPORTED_VERSIONS.contains(asked)) {
+                    negotiatedVersion = asked;
+                }
+            }
+            session.setClientInfo(
+                    clientInfo != null && clientInfo.has("name") ? clientInfo.get("name").stringValue() : "unknown",
+                    clientInfo != null && clientInfo.has("version") ? clientInfo.get("version").stringValue() : "unknown",
+                    capabilities != null ? mapper.convertValue(capabilities, Map.class) : Map.of()
+            );
+            session.setProtocolVersion(negotiatedVersion);
+        }
+
+        var serverCapabilities = new LinkedHashMap<String, Object>();
+        if (!registry.tools().isEmpty()) {
+            serverCapabilities.put("tools", Map.of("listChanged", true));
+        }
+        if (!registry.resources().isEmpty()) {
+            serverCapabilities.put("resources", Map.of("subscribe", true, "listChanged", true));
+        }
+        if (!registry.prompts().isEmpty()) {
+            serverCapabilities.put("prompts", Map.of("listChanged", true));
+        }
+        // completion/complete (2025-06-18+) — only when something can answer it.
+        if (registry.hasCompletions()) {
+            serverCapabilities.put("completions", Map.of());
+        }
+        // MCP 2025-11-25 (experimental): advertise task support for the
+        // request types we accept task-augmentation on. Tools/call is the
+        // only one we support today; sampling/elicitation augmentation is
+        // a future iteration.
+        serverCapabilities.put("tasks", Map.of(
+                "list", Map.of(),
+                "cancel", Map.of(),
+                "requests", Map.of("tools", Map.of("call", Map.of()))
+        ));
+
+        var serverInfo = new LinkedHashMap<String, Object>();
+        serverInfo.put("name", serverName);
+        serverInfo.put("version", serverVersion);
+        if (!guardrails.isEmpty()) {
+            serverInfo.put("guardrails", guardrails);
+        }
+
+        var result = new LinkedHashMap<String, Object>();
+        result.put("protocolVersion", negotiatedVersion);
+        result.put("capabilities", serverCapabilities);
+        result.put("serverInfo", serverInfo);
+
+        logger.info("MCP client initialized: {} v{}", session.clientName(), session.clientVersion());
+        return JsonRpc.Response.success(id, result);
+    }
+
+    private void handleNotification(AtmosphereResource resource, String method, JsonNode params) {
+        switch (method) {
+            case McpMethod.INITIALIZED -> {
+                var session = getOrCreateSession(resource);
+                session.markInitialized();
+                logger.debug("MCP session fully initialized for resource {}", resource.uuid());
+            }
+            case McpMethod.CANCELLED -> {
+                var requestId = params != null && params.has("requestId")
+                        ? params.get("requestId").stringValue() : "unknown";
+                logger.debug("MCP client cancelled request {} for resource {}",
+                        requestId, resource.uuid());
+            }
+            default -> logger.trace("Ignoring unknown notification: {}", method);
+        }
+    }
+
+    // ── Tools ────────────────────────────────────────────────────────────
+
+    JsonRpc.Response handleToolsList(Object id) {
+        var toolList = new ArrayList<Map<String, Object>>();
+        for (var entry : registry.tools().values()) {
+            var tool = new LinkedHashMap<String, Object>();
+            tool.put("name", entry.name());
+            registry.toolMetadata(entry.name()).ifPresent(meta -> {
+                if (!meta.title().isEmpty()) {
+                    tool.put("title", meta.title());
+                }
+                if (!meta.iconUrl().isEmpty()) {
+                    // MCP 2025-11-25: icons is an array of objects with src/sizes/type.
+                    // We expose a single-icon shorthand here; consumers needing
+                    // multiple sizes/srcsets can register the metadata directly.
+                    tool.put("icons", List.of(Map.of("src", meta.iconUrl())));
+                }
+                if (!meta.meta().isEmpty()) {
+                    tool.put("_meta", meta.meta());
+                }
+            });
+            if (!entry.description().isEmpty()) {
+                tool.put("description", entry.description());
+            }
+            tool.put("inputSchema", McpRegistry.inputSchema(entry));
+            registry.toolOutputSchema(entry.name())
+                    .ifPresent(schema -> tool.put("outputSchema", schema));
+            registry.toolAnnotations(entry.name())
+                    .map(McpRegistry.ToolAnnotations::toWire)
+                    .filter(wire -> !wire.isEmpty())
+                    .ifPresent(wire -> tool.put("annotations", wire));
+            toolList.add(tool);
+        }
+        return JsonRpc.Response.success(id, Map.of("tools", toolList));
+    }
+
+    JsonRpc.Response handleToolsCall(AtmosphereResource resource, Object id, JsonNode params) {
+        if (params == null || !params.has("name")) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS, "Missing tool name");
+        }
+        var toolName = params.get("name").stringValue();
+        var toolOpt = registry.tool(toolName);
+        if (toolOpt.isEmpty()) {
+            return JsonRpc.Response.error(id, JsonRpc.METHOD_NOT_FOUND,
+                    "Unknown tool: " + toolName);
+        }
+
+        var tool = toolOpt.get();
+        var arguments = params.has("arguments") ? params.get("arguments") : null;
+
+        // Governance policy gate runs BEFORE the task branch so it is shared by
+        // the synchronous call path AND the task-augmented path — a long-running
+        // tool cannot bypass policy by being run as a task. Previously the
+        // params.task branch returned early into acceptToolCallAsTask before this
+        // check, so a session-dialect client could invoke an otherwise-denied
+        // tool by adding "task":{} to tools/call (Correctness Invariant #6
+        // Security and #7 Mode Parity — the stateless dialect already gates first).
+        var denial = checkToolPolicy(id, toolName, arguments);
+        if (denial != null) {
+            return denial;
+        }
+
+        // Task-augmented call (MCP 2025-11-25 experimental). When the
+        // requestor includes params.task, we accept the task, return a
+        // CreateTaskResult immediately, and run the underlying tool
+        // off-thread so subsequent tasks/get / tasks/result poll it.
+        if (params.has("task")) {
+            return acceptToolCallAsTask(resource, id, tool, params);
+        }
+
+        int argCount = arguments != null ? arguments.size() : 0;
+        var principalName = resolvePrincipal(resource);
+
+        // Bind the server→client request surface for the duration of this
+        // invocation so an @McpTool that injects an McpServerContext can issue
+        // sampling / roots / elicitation against the calling client's session.
+        bindServerContext(resource);
+        try {
+            if (tracing != null) {
+                return tracing.traced("tool", toolName, argCount,
+                        () -> executeToolCall(id, tool, arguments, principalName));
+            }
+            return executeToolCall(id, tool, arguments, principalName);
+        } catch (IllegalArgumentException e) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS, e.getMessage());
+        } catch (InvocationTargetException e) {
+            var cause = e.getCause() != null ? e.getCause() : e;
+            logger.warn("Tool {} invocation failed", toolName, cause);
+            return JsonRpc.Response.success(id, Map.of(
+                    "content", List.of(Map.of("type", "text", "text", cause.getMessage())),
+                    "isError", true
+            ));
+        } catch (Exception e) {
+            logger.warn("Tool {} invocation failed", toolName, e);
+            return JsonRpc.Response.success(id, Map.of(
+                    "content", List.of(Map.of("type", "text", "text",
+                            "Tool invocation failed: " + e.getMessage())),
+                    "isError", true
+            ));
+        } finally {
+            CURRENT_SERVER_CONTEXT.remove();
+        }
+    }
+
+    /**
+     * Bind {@link #CURRENT_SERVER_CONTEXT} to the session behind {@code
+     * resource} for the duration of a tool invocation on this thread. A
+     * request with no session (stateless dialect) binds the empty context, so
+     * a tool that injects {@link McpServerContext} always receives a non-null
+     * handle whose {@code can*} predicates report the truth.
+     */
+    private void bindServerContext(AtmosphereResource resource) {
+        McpSession session = null;
+        if (resource != null && resource.getRequest() != null) {
+            session = (McpSession) resource.getRequest().getAttribute(McpSession.ATTRIBUTE_KEY);
+        }
+        CURRENT_SERVER_CONTEXT.set(session == null
+                ? McpServerContext.empty()
+                : new McpServerContext(this, session));
+    }
+
+    /**
+     * Consult the MCP governance plane (if atmosphere-ai is on the classpath)
+     * before dispatching a tool. MS-schema YAML rules over {@code tool_name}
+     * fire for MCP invocations the same way they do for first-party
+     * {@code @AiTool} dispatches (partial OWASP Agentic Top-10 A08 coverage).
+     * Returns the JSON-RPC denial response, or {@code null} when admitted —
+     * shared by the synchronous call path and the stateless task path so a
+     * long-running tool cannot bypass policy by being run as a task.
+     */
+    JsonRpc.Response checkToolPolicy(Object id, String toolName, JsonNode arguments) {
+        var framework = config != null ? config.framework() : null;
+        var previewArgs = jsonNodeToPreview(arguments);
+        var gateOutcome = McpPolicyGateway.admit(framework, toolName, previewArgs);
+        if (gateOutcome instanceof McpPolicyGateway.Outcome.Denied denied) {
+            logger.warn("MCP tool '{}' denied by policy '{}': {}",
+                    toolName, denied.policyName(), denied.reason());
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_REQUEST,
+                    "Tool '" + toolName + "' denied by policy '" + denied.policyName()
+                            + "': " + denied.reason());
+        }
+        return null;
+    }
+
+    /**
+     * Materialize a long-running {@code tools/call} as a durable task on the
+     * stateless {@code 2026-07-28} transport (SEP-2663). Creates the task,
+     * dispatches the tool on a virtual thread, and returns the handle
+     * immediately. The caller (the stateless dialect) has already run policy
+     * admission via {@link #checkToolPolicy}. The eventual {@code CallToolResult}
+     * is stored on the task and surfaced through {@code tasks/get}.
+     */
+    McpTask startToolTask(AtmosphereResource resource, McpRegistry.ToolEntry tool, JsonNode params) {
+        var arguments = params != null && params.has("arguments") ? params.get("arguments") : null;
+        var principal = resolvePrincipal(resource);
+        var task = taskManager.create(McpTaskManager.DEFAULT_TTL_MS);
+        Thread.startVirtualThread(() -> runToolIntoTask(task, tool, arguments, principal));
+        return task;
+    }
+
+    private void runToolIntoTask(McpTask task, McpRegistry.ToolEntry tool,
+                                 JsonNode arguments, String principal) {
+        var run = runToolWithPrincipal(tool, arguments, principal, McpInputContext.empty());
+        applyRunToTask(task, tool, arguments, principal, McpInputContext.empty(), run);
+    }
+
+    /**
+     * Apply a {@link ToolRun} outcome to a task. A {@code needsInput} outcome
+     * parks the task in {@code input_required} with a {@link TaskResumption}
+     * continuation (SEP-2663 + SEP-2322), so {@code tasks/update} can resume it;
+     * otherwise the task completes or fails. The {@code input} carried in is the
+     * responses the tool saw on this run, which become the accumulated base for
+     * the next round.
+     */
+    private void applyRunToTask(McpTask task, McpRegistry.ToolEntry tool, JsonNode arguments,
+                                String principal, McpInputContext input, ToolRun run) {
+        if (run.needsInput()) {
+            task.resumption(new TaskResumption(tool, arguments, principal,
+                    input.responses(), run.inputRequests()));
+            task.transition(McpTask.Status.INPUT_REQUIRED, "Awaiting client input");
+            return;
+        }
+        task.resumption(null);
+        if (run.paramError() != null) {
+            task.fail(errorCallResult(run.paramError()), run.paramError());
+            return;
+        }
+        var resMap = run.callResult();
+        var isError = resMap.get("isError") instanceof Boolean b && b;
+        if (isError) {
+            task.fail(resMap, "Tool reported isError=true");
+        } else {
+            task.complete(resMap, "Tool completed");
+        }
+    }
+
+    /**
+     * Resume an {@code input_required} task (SEP-2663 {@code tasks/update}) with
+     * the client's {@code newResponses}. Merges them onto the responses gathered
+     * in prior rounds, flips the task back to {@code working}, and re-runs the
+     * tool off-thread — which may complete it, fail it, or park it in
+     * {@code input_required} again for further input. Returns {@code false} when
+     * the task has no continuation (not awaiting input).
+     */
+    boolean resumeTask(McpTask task, Map<String, Object> newResponses) {
+        var prev = task.resumption();
+        if (prev == null) {
+            return false;
+        }
+        var merged = new LinkedHashMap<String, Object>(prev.accumulated());
+        if (newResponses != null) {
+            merged.putAll(newResponses);
+        }
+        var input = new McpInputContext(merged);
+        task.transition(McpTask.Status.WORKING, "Resuming with client input");
+        Thread.startVirtualThread(() -> {
+            var run = runToolWithPrincipal(prev.tool(), prev.arguments(), prev.principal(), input);
+            applyRunToTask(task, prev.tool(), prev.arguments(), prev.principal(), input, run);
+        });
+        return true;
+    }
+
+    /**
+     * Outcome of a tool invocation through {@link #runToolWithPrincipal}: exactly
+     * one of {@code callResult} (the {@code CallToolResult} map, success or
+     * tool-level error), {@code inputRequests} (the handler paused for input,
+     * SEP-2322), or {@code paramError} (invalid arguments → {@code -32602}).
+     */
+    record ToolRun(Map<String, Object> callResult, Map<String, Object> inputRequests, String paramError) {
+        boolean needsInput() {
+            return inputRequests != null;
+        }
+    }
+
+    /**
+     * Run a tool for the stateless transport with a multi-round-trip input
+     * context (SEP-2322), resolving the principal from the live request.
+     */
+    ToolRun runToolCall(AtmosphereResource resource, McpRegistry.ToolEntry tool,
+                        JsonNode arguments, McpInputContext input) {
+        return runToolWithPrincipal(tool, arguments, resolvePrincipal(resource), input);
+    }
+
+    /**
+     * Invoke a tool with {@code input} bound to the per-invocation
+     * {@link McpInputContext} (so a handler that injects one sees the client's
+     * accumulated responses). A handler that needs more input throws
+     * {@link McpInputRequiredException}; we surface that as {@code inputRequests}
+     * rather than a failure so the dialect can return an {@code InputRequiredResult}.
+     */
+    private ToolRun runToolWithPrincipal(McpRegistry.ToolEntry tool, JsonNode arguments,
+                                         String principal, McpInputContext input) {
+        CURRENT_INPUT.set(input == null ? McpInputContext.empty() : input);
+        try {
+            int argCount = arguments != null ? arguments.size() : 0;
+            // Keep the tool span (SEP-414/observability) on this path too.
+            var resp = tracing != null
+                    ? tracing.traced("tool", tool.name(), argCount,
+                            () -> executeToolCall(null, tool, arguments, principal))
+                    : executeToolCall(null, tool, arguments, principal);
+            // executeToolCall returns a success envelope on a normal return.
+            @SuppressWarnings("unchecked")
+            var callResult = (Map<String, Object>) resp.result();
+            return new ToolRun(callResult, null, null);
+        } catch (InvocationTargetException e) {
+            if (e.getCause() instanceof McpInputRequiredException ire) {
+                return new ToolRun(null, ire.inputRequests(), null);
+            }
+            var cause = e.getCause() != null ? e.getCause() : e;
+            logger.warn("MCP tool invocation failed", cause);
+            return new ToolRun(errorCallResult(cause.getMessage()), null, null);
+        } catch (McpInputRequiredException ire) {
+            // A dynamic (lambda) handler throws directly, not via reflection.
+            return new ToolRun(null, ire.inputRequests(), null);
+        } catch (IllegalArgumentException e) {
+            return new ToolRun(null, null, e.getMessage());
+        } catch (Exception e) {
+            logger.warn("MCP tool invocation failed", e);
+            return new ToolRun(errorCallResult("Tool invocation failed: " + e.getMessage()), null, null);
+        } finally {
+            CURRENT_INPUT.remove();
+        }
+    }
+
+    private static Map<String, Object> errorCallResult(String message) {
+        return Map.of("content", List.of(Map.of("type", "text",
+                "text", message != null ? message : "error")), "isError", true);
+    }
+
+    private JsonRpc.Response executeToolCall(Object id,
+                                              McpRegistry.ToolEntry tool,
+                                              JsonNode arguments,
+                                              String principalName) throws Exception {
+        try {
+            Object result;
+            if (tool.isDynamic()) {
+                var argMap = bindArgumentsAsMap(tool.params(), arguments);
+                var handler = tool.handler();
+                // Handlers that implement IdentityAwareToolHandler receive the
+                // authenticated caller's principal; plain ToolHandler lambdas
+                // keep the single-arg shape. AdminMcpBridge uses the
+                // identity-aware form to gate writes through
+                // ControlAuthorizer.authorize with a real principal instead
+                // of null.
+                if (handler instanceof McpRegistry.IdentityAwareToolHandler aware) {
+                    result = aware.execute(argMap, principalName);
+                } else {
+                    result = handler.execute(argMap);
+                }
+            } else {
+                var args = bindArguments(tool.method(), tool.params(), arguments);
+                result = tool.method().invoke(tool.instance(), args);
+            }
+
+            return JsonRpc.Response.success(id, toolResult(tool.name(), result));
+        } catch (InvocationTargetException e) {
+            throw e;
+        }
+    }
+
+    /**
+     * Shape a tool's return value into a {@code CallToolResult}. MCP 2025-06-18
+     * added {@code structuredContent}, which the schema types as a JSON
+     * <em>object</em>: a typed result that serializes to an object is emitted
+     * both as structured content and as the legacy serialized-JSON text block;
+     * arrays and scalars stay text-only. A tool that declared an
+     * {@code outputSchema} must return an object carrying the schema's
+     * required properties (a JSON-object String counts); anything else is
+     * reported as a tool error rather than sent as non-conforming output.
+     */
+    private Map<String, Object> toolResult(String toolName, Object result) {
+        var declared = registry.toolOutputSchema(toolName);
+        String text;
+        JsonNode structured = null;
+        if (result instanceof String str) {
+            text = str;
+            if (declared.isPresent()) {
+                try {
+                    var parsed = mapper.readTree(str);
+                    if (parsed != null && parsed.isObject()) {
+                        structured = parsed;
+                    }
+                } catch (JacksonException e) {
+                    logger.debug("Tool '{}' declared an outputSchema but returned non-JSON text",
+                            toolName, e);
+                }
+            }
+        } else {
+            text = mapper.writeValueAsString(result);
+            if (result != null) {
+                var tree = mapper.valueToTree(result);
+                if (tree instanceof JsonNode node && node.isObject()) {
+                    structured = node;
+                }
+            }
+        }
+        if (declared.isPresent()) {
+            var problem = outputSchemaViolation(declared.get(), structured);
+            if (problem != null) {
+                logger.warn("Tool '{}' result does not match its outputSchema: {}", toolName, problem);
+                return errorCallResult("Tool '" + toolName
+                        + "' returned a result that does not match its outputSchema: " + problem);
+            }
+        }
+        var resultMap = new LinkedHashMap<String, Object>();
+        if (structured != null) {
+            resultMap.put("structuredContent", structured);
+        }
+        resultMap.put("content", List.of(Map.of("type", "text", "text", text)));
+        resultMap.put("isError", false);
+        return resultMap;
+    }
+
+    /**
+     * Top-level conformance check of structured output against a declared
+     * {@code outputSchema}: the value must be an object and carry every
+     * {@code required} property. Returns a description of the first
+     * violation, or {@code null} when it conforms.
+     */
+    private static String outputSchemaViolation(Map<String, Object> schema, JsonNode structured) {
+        if (structured == null || !structured.isObject()) {
+            return "expected a JSON object";
+        }
+        if (schema.get("required") instanceof List<?> required) {
+            for (var name : required) {
+                if (!structured.has(String.valueOf(name))) {
+                    return "missing required property '" + name + "'";
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Resolve the authenticated caller for the current MCP tool
+     * invocation. Reads the servlet {@link java.security.Principal} first
+     * (Spring Security / Jakarta Security), then falls back to the
+     * {@code ai.userId} request attribute that the AI pipeline sets.
+     * Returns {@code null} for anonymous requests — downstream authorizer
+     * decides whether to admit them.
+     */
+    private static String resolvePrincipal(AtmosphereResource resource) {
+        if (resource == null || resource.getRequest() == null) {
+            return null;
+        }
+        var req = resource.getRequest();
+        var principal = req.getUserPrincipal();
+        if (principal != null && principal.getName() != null
+                && !principal.getName().isBlank()) {
+            return principal.getName();
+        }
+        var attr = req.getAttribute("ai.userId");
+        if (attr instanceof String s && !s.isBlank()) {
+            return s;
+        }
+        return null;
+    }
+
+    // ── Tasks (durable requests, MCP 2025-11-25 experimental) ────────────
+
+    /**
+     * Accept a task-augmented {@code tools/call}. Immediately returns a
+     * {@code CreateTaskResult} envelope and dispatches the actual tool
+     * execution to a virtual thread. The eventual outcome is stored on the
+     * task and surfaced via {@code tasks/result}.
+     */
+    private JsonRpc.Response acceptToolCallAsTask(AtmosphereResource resource, Object id,
+                                                   McpRegistry.ToolEntry tool, JsonNode params) {
+        var taskParams = params.get("task");
+        long requestedTtl = taskParams != null && taskParams.has("ttl")
+                ? taskParams.get("ttl").asLong(McpTaskManager.DEFAULT_TTL_MS)
+                : McpTaskManager.DEFAULT_TTL_MS;
+        var task = taskManager.create(requestedTtl);
+        var arguments = params.has("arguments") ? params.get("arguments") : null;
+        var principal = resolvePrincipal(resource);
+
+        // Snapshot the initial (working) envelope before dispatching the worker
+        // so a fast-completing synchronous tool can't flip the status to
+        // completed/failed before this method returns. CreateTaskResult per
+        // MCP 2025-11-25 is the *initial* state; clients poll tasks/get for
+        // the eventual outcome.
+        var initialEnvelope = task.toWire();
+
+        Thread.startVirtualThread(() -> {
+            // Mode parity (#7): a task-augmented call must give the tool the
+            // same server→client surface the synchronous call gets, bound on
+            // the worker thread that actually runs it and cleared in finally.
+            bindServerContext(resource);
+            try {
+                var underlying = executeToolCall(id, tool, arguments, principal);
+                if (underlying.error() == null && underlying.result() instanceof Map<?, ?> rawMap) {
+                    @SuppressWarnings("unchecked")
+                    var resMap = (Map<String, Object>) rawMap;
+                    var isError = resMap.get("isError") instanceof Boolean b && b;
+                    if (isError) {
+                        task.fail(resMap, "Tool reported isError=true");
+                    } else {
+                        task.complete(resMap, "Tool completed");
+                    }
+                } else {
+                    var msg = underlying.error() != null ? underlying.error().message() : "Unknown failure";
+                    task.fail(Map.of(
+                            "content", List.of(Map.of("type", "text", "text",
+                                    "Tool execution failed: " + msg)),
+                            "isError", true
+                    ), msg);
+                }
+            } catch (Exception e) {
+                logger.warn("Async tool execution threw", e);
+                task.fail(Map.of(
+                        "content", List.of(Map.of("type", "text", "text",
+                                "Tool threw: " + e.getMessage())),
+                        "isError", true
+                ), e.getMessage());
+            } finally {
+                CURRENT_SERVER_CONTEXT.remove();
+            }
+        });
+
+        return JsonRpc.Response.success(id, Map.of("task", initialEnvelope));
+    }
+
+    private JsonRpc.Response handleTasksGet(Object id, JsonNode params) {
+        if (params == null || !params.has("taskId")) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS, "Missing taskId");
+        }
+        var taskId = params.get("taskId").stringValue();
+        var task = taskManager.get(taskId);
+        if (task.isEmpty()) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS,
+                    "Failed to retrieve task: Task not found");
+        }
+        return JsonRpc.Response.success(id, task.get().toWire());
+    }
+
+    private JsonRpc.Response handleTasksResult(Object id, JsonNode params) {
+        if (params == null || !params.has("taskId")) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS, "Missing taskId");
+        }
+        var taskId = params.get("taskId").stringValue();
+        var taskOpt = taskManager.get(taskId);
+        if (taskOpt.isEmpty()) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS,
+                    "Failed to retrieve task: Task not found");
+        }
+        var task = taskOpt.get();
+        try {
+            // Spec: tasks/result blocks until the task reaches a terminal
+            // status. The wall-clock cap is enforced at task.ttlMs(): if the
+            // task does not complete within its TTL the get() times out.
+            var resultMap = task.result().get(task.ttlMs(), TimeUnit.MILLISECONDS);
+            var withMeta = new LinkedHashMap<String, Object>(resultMap);
+            withMeta.merge("_meta", Map.of(
+                    "io.modelcontextprotocol/related-task",
+                    Map.of("taskId", task.taskId())), (a, b) -> a);
+            return JsonRpc.Response.success(id, withMeta);
+        } catch (TimeoutException te) {
+            return JsonRpc.Response.error(id, JsonRpc.INTERNAL_ERROR,
+                    "tasks/result timed out after " + task.ttlMs() + "ms");
+        } catch (Exception e) {
+            return JsonRpc.Response.error(id, JsonRpc.INTERNAL_ERROR,
+                    "tasks/result failed: " + e.getMessage());
+        }
+    }
+
+    private JsonRpc.Response handleTasksList(Object id, JsonNode params) {
+        String cursor = params != null && params.has("cursor") && params.get("cursor").isString()
+                ? params.get("cursor").stringValue() : null;
+        var page = taskManager.list(cursor, 100);
+        return JsonRpc.Response.success(id, page.toWire());
+    }
+
+    private JsonRpc.Response handleTasksCancel(Object id, JsonNode params) {
+        if (params == null || !params.has("taskId")) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS, "Missing taskId");
+        }
+        var taskId = params.get("taskId").stringValue();
+        var existing = taskManager.get(taskId);
+        if (existing.isEmpty()) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS,
+                    "Failed to retrieve task: Task not found");
+        }
+        if (existing.get().status().isTerminal()) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS,
+                    "Cannot cancel task: already in terminal status '"
+                            + existing.get().status().wireValue() + "'");
+        }
+        var cancelled = taskManager.cancel(taskId, "Cancelled by request");
+        return JsonRpc.Response.success(id, cancelled.get().toWire());
+    }
+
+    /** Visible-for-testing: lets tests peek at task state. */
+    public McpTaskManager taskManager() {
+        return taskManager;
+    }
+
+    // ── Elicitation (server → client request, MCP 2025-06-18) ────────────
+
+    /**
+     * Issue an {@code elicitation/create} request to the client behind
+     * {@code session} and return a future that completes with the client's
+     * response envelope. The response payload follows MCP {@code ElicitResult}
+     * shape: {@code {action: "accept|decline|cancel", content: {...}}}.
+     *
+     * <p>Server-initiated MCP elicitation (spec 2025-06-18). This is an opt-in
+     * extension point with no default in-tree caller; invoke it from your own
+     * {@code @McpTool} handler. The wire shape tracks the MCP elicitation spec
+     * and may change by 2026-Q4 as that specification stabilizes.</p>
+     *
+     * <p>Failure modes:</p>
+     * <ul>
+     *   <li>Client did not advertise the {@code elicitation} capability at
+     *       initialize time → the future fails with
+     *       {@link IllegalStateException} immediately.</li>
+     *   <li>Client never replies → caller's responsibility to apply a
+     *       timeout (e.g. {@link CompletableFuture#orTimeout}) and call
+     *       {@link McpSession#cancelServerRequest} on expiry.</li>
+     * </ul>
+     *
+     * @param session       the MCP session to elicit through (typically obtained
+     *                      from a {@code @McpTool} handler's resource attribute)
+     * @param message       human-readable prompt shown to the user
+     * @param requestedSchema JSON Schema describing the expected response shape
+     * @return future resolving to the {@code result}/{@code error} JSON envelope
+     */
+    public CompletableFuture<JsonNode> elicit(McpSession session, String message,
+                                              Map<String, Object> requestedSchema) {
+        var params = new LinkedHashMap<String, Object>();
+        params.put("message", message);
+        params.put("requestedSchema", requestedSchema != null ? requestedSchema : Map.of());
+        return issueServerRequest(session, McpMethod.ELICITATION_CREATE, "elicitation", params);
+    }
+
+    // ── Sampling and roots (server → client requests) ────────────────────
+
+    /**
+     * Issue a {@code sampling/createMessage} request to the client behind
+     * {@code session}: the server asks the client to run an LLM completion on
+     * its behalf and returns a future completing with the client's
+     * {@code CreateMessageResult} envelope.
+     *
+     * <p>Sampling is a <em>client</em> capability per the MCP spec — the client
+     * declares it at initialize and owns the model, the sampling parameters,
+     * and any human-in-the-loop review. This method therefore refuses to issue
+     * the request unless the client advertised {@code sampling}, rather than
+     * assuming support (Correctness Invariant #5, Runtime Truth).</p>
+     *
+     * <p>Reachable from an {@code @McpTool} handler by declaring an
+     * {@link McpServerContext} parameter — see
+     * {@link McpServerContext#sample(List, Map)}.</p>
+     *
+     * @param session  the MCP session to sample through
+     * @param messages the conversation to complete, in MCP
+     *                 {@code SamplingMessage} shape
+     *                 ({@code {role, content:{type,text}}})
+     * @param options  extra {@code CreateMessageRequest} fields
+     *                 ({@code systemPrompt}, {@code maxTokens},
+     *                 {@code modelPreferences}, ...); may be {@code null}
+     * @return future resolving to the {@code result}/{@code error} JSON envelope
+     */
+    public CompletableFuture<JsonNode> sample(McpSession session,
+                                              List<Map<String, Object>> messages,
+                                              Map<String, Object> options) {
+        if (messages == null || messages.isEmpty()) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException(
+                    "sampling/createMessage requires at least one message"));
+        }
+        var params = new LinkedHashMap<String, Object>();
+        if (options != null) {
+            params.putAll(options);
+        }
+        // messages is the one field the caller cannot override via options.
+        params.put("messages", messages);
+        return issueServerRequest(session, McpMethod.SAMPLING_CREATE_MESSAGE, "sampling", params);
+    }
+
+    /**
+     * Issue a {@code roots/list} request to the client behind {@code session},
+     * returning a future completing with the client's {@code ListRootsResult}
+     * envelope ({@code {roots:[{uri,name}]}}).
+     *
+     * <p>Like sampling, {@code roots} is a client-declared capability: the
+     * request is refused when the client did not advertise it.</p>
+     *
+     * @param session the MCP session to query
+     * @return future resolving to the {@code result}/{@code error} JSON envelope
+     */
+    public CompletableFuture<JsonNode> listRoots(McpSession session) {
+        return issueServerRequest(session, McpMethod.ROOTS_LIST, "roots", Map.of());
+    }
+
+    /**
+     * Shared server→client request issuance: capability gate, bounded pending
+     * slot, JSON-RPC envelope, and enqueue onto the session's notification
+     * queue (which the SSE GET stream drains). Every failure path completes the
+     * returned future exceptionally and leaves no reserved slot behind
+     * (Correctness Invariant #2).
+     *
+     * @param session          the session to issue through
+     * @param method           the JSON-RPC method name
+     * @param requiredCapability the client capability key that must have been
+     *                         advertised at initialize
+     * @param params           the request params object
+     */
+    private CompletableFuture<JsonNode> issueServerRequest(McpSession session, String method,
+                                                           String requiredCapability,
+                                                           Map<String, Object> params) {
+        if (session == null) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException(
+                    method + " requires an active McpSession"));
+        }
+        var caps = session.clientCapabilities();
+        if (caps == null || !caps.containsKey(requiredCapability)) {
+            return CompletableFuture.failedFuture(new IllegalStateException(
+                    "Client did not advertise the '" + requiredCapability
+                            + "' capability at initialize. Cannot issue " + method + "."));
+        }
+
+        var requestId = UUID.randomUUID().toString();
+        var request = new LinkedHashMap<String, Object>();
+        request.put("jsonrpc", "2.0");
+        request.put("id", requestId);
+        request.put("method", method);
+        request.put("params", params != null ? params : Map.of());
+
+        var future = new CompletableFuture<JsonNode>();
+        if (!session.tryRegisterServerRequest(requestId, future)) {
+            return CompletableFuture.failedFuture(new IllegalStateException(
+                    "Session " + session.sessionId() + " already has "
+                            + McpSession.MAX_PENDING_SERVER_REQUESTS
+                            + " server-initiated requests in flight; refusing " + method));
+        }
+
+        try {
+            session.addPendingNotification(mapper.writeValueAsString(request));
+        } catch (Exception e) {
+            session.cancelServerRequest(requestId, e);
+            return CompletableFuture.failedFuture(e);
+        }
+        return future;
+    }
+
+    /**
+     * The server context bound to the tool invocation running on this thread,
+     * or a context with no session when the call arrived on a path that has no
+     * live {@link McpSession} (the stateless {@code 2026-07-28} dialect). An
+     * {@code @McpTool} method receives this by declaring an
+     * {@link McpServerContext} parameter.
+     */
+    McpServerContext currentServerContext() {
+        return CURRENT_SERVER_CONTEXT.get();
+    }
+
+    // ── Resources ────────────────────────────────────────────────────────
+
+    JsonRpc.Response handleResourcesList(Object id) {
+        var resourceList = new ArrayList<Map<String, Object>>();
+        // Templates are not concrete resources: they are listed by
+        // resources/templates/list and addressed by a matching URI.
+        for (var entry : registry.concreteResources().values()) {
+            var res = new LinkedHashMap<String, Object>();
+            res.put("uri", entry.uri());
+            if (!entry.name().isEmpty()) {
+                res.put("name", entry.name());
+            }
+            registry.resourceMetadata(entry.uri()).ifPresent(meta -> {
+                if (!meta.title().isEmpty()) {
+                    res.put("title", meta.title());
+                }
+                if (!meta.iconUrl().isEmpty()) {
+                    res.put("icons", List.of(Map.of("src", meta.iconUrl())));
+                }
+                if (!meta.meta().isEmpty()) {
+                    res.put("_meta", meta.meta());
+                }
+            });
+            if (!entry.description().isEmpty()) {
+                res.put("description", entry.description());
+            }
+            res.put("mimeType", entry.mimeType());
+            resourceList.add(res);
+        }
+        return JsonRpc.Response.success(id, Map.of("resources", resourceList));
+    }
+
+    /**
+     * {@code resources/templates/list} (MCP 2024-11-05+): every registered
+     * resource whose URI is an RFC 6570 template.
+     */
+    JsonRpc.Response handleResourceTemplatesList(Object id) {
+        var templates = new ArrayList<Map<String, Object>>();
+        for (var entry : registry.resourceTemplates().values()) {
+            var t = new LinkedHashMap<String, Object>();
+            t.put("uriTemplate", entry.uri());
+            t.put("name", entry.name().isEmpty() ? entry.uri() : entry.name());
+            registry.resourceMetadata(entry.uri()).ifPresent(meta -> {
+                if (!meta.title().isEmpty()) {
+                    t.put("title", meta.title());
+                }
+                if (!meta.iconUrl().isEmpty()) {
+                    t.put("icons", List.of(Map.of("src", meta.iconUrl())));
+                }
+                if (!meta.meta().isEmpty()) {
+                    t.put("_meta", meta.meta());
+                }
+            });
+            if (!entry.description().isEmpty()) {
+                t.put("description", entry.description());
+            }
+            t.put("mimeType", entry.mimeType());
+            templates.add(t);
+        }
+        return JsonRpc.Response.success(id, Map.of("resourceTemplates", templates));
+    }
+
+    /**
+     * {@code completion/complete} (MCP 2025-06-18+): argument autocompletion
+     * for a prompt ({@code ref/prompt}) or a resource template
+     * ({@code ref/resource}). Unknown references and malformed params are
+     * {@code -32602}; a known reference with no completion source for the
+     * argument answers an empty list.
+     */
+    JsonRpc.Response handleCompletion(Object id, JsonNode params) {
+        var ref = params != null ? params.get("ref") : null;
+        var argument = params != null ? params.get("argument") : null;
+        if (ref == null || !ref.isObject() || !ref.has("type") || !ref.get("type").isString()
+                || argument == null || !argument.isObject()
+                || !argument.has("name") || !argument.get("name").isString()) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS,
+                    "completion/complete requires ref.type and argument.name");
+        }
+        var refType = ref.get("type").stringValue();
+        var refKey = McpRegistry.REF_PROMPT.equals(refType) ? "name" : "uri";
+        if (!ref.has(refKey) || !ref.get(refKey).isString()) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS,
+                    "completion ref of type '" + refType + "' requires '" + refKey + "'");
+        }
+        var refName = ref.get(refKey).stringValue();
+        var value = argument.has("value") && argument.get("value").isString()
+                ? argument.get("value").stringValue() : "";
+        var context = new LinkedHashMap<String, String>();
+        var ctxArgs = params.path("context").path("arguments");
+        if (ctxArgs.isObject()) {
+            for (var name : ctxArgs.propertyNames()) {
+                var v = ctxArgs.get(name);
+                if (v != null && v.isString()) {
+                    context.put(name, v.stringValue());
+                }
+            }
+        }
+        try {
+            var completion = registry.complete(refType, refName,
+                    argument.get("name").stringValue(), value, context);
+            if (completion.isEmpty()) {
+                return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS,
+                        "Unknown completion reference: " + refType + " " + refName);
+            }
+            var c = completion.get();
+            var body = new LinkedHashMap<String, Object>();
+            body.put("values", c.values());
+            body.put("total", c.total());
+            body.put("hasMore", c.hasMore());
+            return JsonRpc.Response.success(id, Map.of("completion", body));
+        } catch (IllegalArgumentException e) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS, e.getMessage());
+        } catch (Exception e) {
+            logger.warn("Completion for {} {} failed", refType, refName, e);
+            return JsonRpc.Response.error(id, JsonRpc.INTERNAL_ERROR,
+                    "Completion failed: " + e.getMessage());
+        }
+    }
+
+    JsonRpc.Response handleResourcesRead(Object id, JsonNode params) {
+        if (params == null || !params.has("uri")) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS, "Missing resource URI");
+        }
+        var uri = params.get("uri").stringValue();
+        var resolved = registry.resolveResource(uri);
+        if (resolved.isEmpty()) {
+            return JsonRpc.Response.error(id, JsonRpc.METHOD_NOT_FOUND,
+                    "Unknown resource: " + uri);
+        }
+
+        var res = resolved.get().entry();
+        var arguments = withTemplateVariables(
+                params.has("arguments") ? params.get("arguments") : null,
+                resolved.get().variables());
+        int argCount = arguments != null ? arguments.size() : 0;
+
+        try {
+            if (tracing != null) {
+                return tracing.traced("resource", uri, argCount,
+                        () -> executeResourceRead(id, res, uri, arguments));
+            }
+            return executeResourceRead(id, res, uri, arguments);
+        } catch (IllegalArgumentException e) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS, e.getMessage());
+        } catch (Exception e) {
+            logger.warn("Resource {} read failed", uri, e);
+            return JsonRpc.Response.error(id, JsonRpc.INTERNAL_ERROR,
+                    "Resource read failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Merge URI-template variables into the read's arguments. The variables
+     * come from the URI being read, so they win over a same-named explicit
+     * argument.
+     */
+    private static JsonNode withTemplateVariables(JsonNode arguments, Map<String, String> variables) {
+        if (variables.isEmpty()) {
+            return arguments;
+        }
+        var merged = mapper.createObjectNode();
+        if (arguments != null && arguments.isObject()) {
+            merged.setAll((tools.jackson.databind.node.ObjectNode) arguments);
+        }
+        variables.forEach(merged::put);
+        return merged;
+    }
+
+    private JsonRpc.Response executeResourceRead(Object id, McpRegistry.ResourceEntry res,
+                                                  String uri, JsonNode arguments) throws Exception {
+        Object result;
+        if (res.isDynamic()) {
+            var argMap = bindArgumentsAsMap(res.params(), arguments);
+            result = res.handler().read(argMap);
+        } else {
+            var args = bindArguments(res.method(), res.params(), arguments);
+            result = res.method().invoke(res.instance(), args);
+        }
+        var text = result instanceof String s ? s : mapper.writeValueAsString(result);
+
+        return JsonRpc.Response.success(id, Map.of(
+                "contents", List.of(Map.of(
+                        "uri", uri,
+                        "mimeType", res.mimeType(),
+                        "text", text
+                ))
+        ));
+    }
+
+    private JsonRpc.Response handleResourcesSubscribe(AtmosphereResource resource,
+                                                       Object id, JsonNode params) {
+        if (params == null || !params.has("uri")) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS, "Missing resource URI");
+        }
+        var uri = params.get("uri").stringValue();
+        if (registry.resolveResource(uri).isEmpty()) {
+            return JsonRpc.Response.error(id, JsonRpc.METHOD_NOT_FOUND,
+                    "Unknown resource: " + uri);
+        }
+        var session = getOrCreateSession(resource);
+        session.addSubscription(uri);
+        logger.debug("Client subscribed to resource: {}", uri);
+        return JsonRpc.Response.success(id, Map.of());
+    }
+
+    private JsonRpc.Response handleResourcesUnsubscribe(AtmosphereResource resource,
+                                                         Object id, JsonNode params) {
+        if (params == null || !params.has("uri")) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS, "Missing resource URI");
+        }
+        var uri = params.get("uri").stringValue();
+        var session = getOrCreateSession(resource);
+        session.removeSubscription(uri);
+        logger.debug("Client unsubscribed from resource: {}", uri);
+        return JsonRpc.Response.success(id, Map.of());
+    }
+
+    // ── Prompts ──────────────────────────────────────────────────────────
+
+    JsonRpc.Response handlePromptsList(Object id) {
+        var promptList = new ArrayList<Map<String, Object>>();
+        for (var entry : registry.prompts().values()) {
+            var prompt = new LinkedHashMap<String, Object>();
+            prompt.put("name", entry.name());
+            registry.promptMetadata(entry.name()).ifPresent(meta -> {
+                if (!meta.title().isEmpty()) {
+                    prompt.put("title", meta.title());
+                }
+                if (!meta.iconUrl().isEmpty()) {
+                    prompt.put("icons", List.of(Map.of("src", meta.iconUrl())));
+                }
+                if (!meta.meta().isEmpty()) {
+                    prompt.put("_meta", meta.meta());
+                }
+            });
+            if (!entry.description().isEmpty()) {
+                prompt.put("description", entry.description());
+            }
+            var args = new ArrayList<Map<String, Object>>();
+            for (var param : entry.params()) {
+                var arg = new LinkedHashMap<String, Object>();
+                arg.put("name", param.name());
+                if (!param.description().isEmpty()) {
+                    arg.put("description", param.description());
+                }
+                arg.put("required", param.required());
+                args.add(arg);
+            }
+            if (!args.isEmpty()) {
+                prompt.put("arguments", args);
+            }
+            promptList.add(prompt);
+        }
+        return JsonRpc.Response.success(id, Map.of("prompts", promptList));
+    }
+
+    JsonRpc.Response handlePromptsGet(Object id, JsonNode params) {
+        if (params == null || !params.has("name")) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS, "Missing prompt name");
+        }
+        var promptName = params.get("name").stringValue();
+        var promptOpt = registry.prompt(promptName);
+        if (promptOpt.isEmpty()) {
+            return JsonRpc.Response.error(id, JsonRpc.METHOD_NOT_FOUND,
+                    "Unknown prompt: " + promptName);
+        }
+
+        var prompt = promptOpt.get();
+        var arguments = params.has("arguments") ? params.get("arguments") : null;
+        int argCount = arguments != null ? arguments.size() : 0;
+
+        try {
+            if (tracing != null) {
+                return tracing.traced("prompt", promptName, argCount,
+                        () -> executePromptGet(id, prompt, arguments));
+            }
+            return executePromptGet(id, prompt, arguments);
+        } catch (IllegalArgumentException e) {
+            return JsonRpc.Response.error(id, JsonRpc.INVALID_PARAMS, e.getMessage());
+        } catch (Exception e) {
+            logger.warn("Prompt {} get failed", promptName, e);
+            return JsonRpc.Response.error(id, JsonRpc.INTERNAL_ERROR,
+                    "Prompt get failed: " + e.getMessage());
+        }
+    }
+
+    private JsonRpc.Response executePromptGet(Object id, McpRegistry.PromptEntry prompt,
+                                               JsonNode arguments) throws Exception {
+        Object result;
+        if (prompt.isDynamic()) {
+            var argMap = bindArgumentsAsMap(prompt.params(), arguments);
+            result = prompt.handler().get(argMap);
+        } else {
+            var args = bindArguments(prompt.method(), prompt.params(), arguments);
+            result = prompt.method().invoke(prompt.instance(), args);
+        }
+
+        // Result should be a List of maps with "role" and "content"
+        Object messages;
+        if (result instanceof List<?> list) {
+            messages = list;
+        } else {
+            messages = List.of(Map.of("role", "user",
+                    "content", Map.of("type", "text", "text", String.valueOf(result))));
+        }
+
+        return JsonRpc.Response.success(id, Map.of(
+                "description", prompt.description(),
+                "messages", messages
+        ));
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────
+
+    /**
+     * Shared JSON-RPC binder (registre#27): parameter binding, primitive
+     * conversion, and injectable resolution delegate to the protocol-common
+     * {@link org.atmosphere.protocol.ParameterBinder} instead of a
+     * hand-rolled copy of the same logic. MCP contributes only its
+     * injectable predicate and resolver.
+     */
+    private final org.atmosphere.protocol.ParameterBinder parameterBinder =
+            new org.atmosphere.protocol.ParameterBinder(
+                    McpRegistry::isInjectableType, this::resolveInjectable);
+
+    private static List<org.atmosphere.protocol.ParameterBinder.ParamInfo> paramInfos(
+            List<McpRegistry.ParamEntry> paramEntries) {
+        return paramEntries.stream()
+                .map(p -> new org.atmosphere.protocol.ParameterBinder.ParamInfo(
+                        p.name(), p.description(), p.required(), p.type()))
+                .toList();
+    }
+
+    private Object[] bindArguments(java.lang.reflect.Method method,
+                                   List<McpRegistry.ParamEntry> paramEntries,
+                                   JsonNode arguments) {
+        return parameterBinder.bindArguments(method, paramInfos(paramEntries), arguments);
+    }
+
+    /**
+     * Resolve framework-injectable types for @McpTool method parameters.
+     */
+    private Object resolveInjectable(Class<?> type, String topic) {
+        if (type == McpInputContext.class) {
+            return CURRENT_INPUT.get();
+        }
+        if (type == McpServerContext.class) {
+            return CURRENT_SERVER_CONTEXT.get();
+        }
+        if (type == AtmosphereConfig.class) {
+            return config;
+        }
+        if (type == BroadcasterFactory.class) {
+            return config.getBroadcasterFactory();
+        }
+        if (type == AtmosphereFramework.class) {
+            return config.framework();
+        }
+        if (type == Broadcaster.class) {
+            if (topic == null) {
+                throw new IllegalArgumentException(
+                        "Broadcaster injection requires a 'topic' @McpParam argument");
+            }
+            return config.getBroadcasterFactory().lookup(topic, true);
+        }
+        // StreamingSession — create a BroadcasterStreamingSession wrapping the topic's Broadcaster
+        try {
+            var streamingSessionClass = Class.forName("org.atmosphere.ai.StreamingSession");
+            if (streamingSessionClass.isAssignableFrom(type)) {
+                if (topic == null) {
+                    throw new IllegalArgumentException(
+                            "StreamingSession injection requires a 'topic' @McpParam argument");
+                }
+                var broadcaster = config.getBroadcasterFactory().lookup(topic, true);
+                // Use StreamingSessions.start(Broadcaster) via reflection to avoid hard compile dependency
+                var factoryClass = Class.forName("org.atmosphere.ai.StreamingSessions");
+                var startMethod = factoryClass.getMethod("start", Broadcaster.class);
+                return startMethod.invoke(null, broadcaster);
+            }
+        } catch (ClassNotFoundException ex) {
+            logger.trace("atmosphere-ai not on classpath — fall through", ex);
+        } catch (Exception e) {
+            throw new IllegalStateException("Failed to create StreamingSession for topic " + topic, e);
+        }
+        throw new IllegalArgumentException("Unsupported injectable type: " + type.getName());
+    }
+
+    /**
+     * Flatten the incoming arguments JSON to a {@code Map<String, Object>}
+     * suitable for audit preview via {@link McpPolicyGateway#admit}. Values
+     * are coerced to primitives / strings; this is a best-effort snapshot,
+     * not a full type-bound binding — it's only used by the governance
+     * audit trail, not the tool executor.
+     */
+    private static Map<String, Object> jsonNodeToPreview(JsonNode arguments) {
+        if (arguments == null || !arguments.isObject()) {
+            return Map.of();
+        }
+        var map = new LinkedHashMap<String, Object>();
+        for (var field : arguments.properties()) {
+            map.put(field.getKey(), mapper.convertValue(field.getValue(), Object.class));
+        }
+        return map;
+    }
+
+    /**
+     * Bind JSON arguments to a Map for dynamic (lambda-based) handlers.
+     */
+    private Map<String, Object> bindArgumentsAsMap(List<McpRegistry.ParamEntry> paramEntries,
+                                                   JsonNode arguments) {
+        return parameterBinder.bindArgumentsAsMap(paramInfos(paramEntries), arguments);
+    }
+
+    private Object idValue(JsonNode id) {
+        if (id == null || id.isNull()) return null;
+        if (id.isNumber()) return id.numberValue();
+        if (id.isString()) return id.stringValue();
+        return id.toString();
+    }
+
+    private McpSession getOrCreateSession(AtmosphereResource resource) {
+        var session = (McpSession) resource.getRequest().getAttribute(McpSession.ATTRIBUTE_KEY);
+        if (session == null) {
+            session = new McpSession();
+            resource.getRequest().setAttribute(McpSession.ATTRIBUTE_KEY, session);
+        }
+        return session;
+    }
+
+    private String serialize(Object obj) {
+        try {
+            return mapper.writeValueAsString(obj);
+        } catch (JacksonException e) {
+            logger.error("Failed to serialize JSON-RPC response", e);
+            return "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"Serialization failed\"}}";
+        }
+    }
+}

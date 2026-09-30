@@ -1,0 +1,361 @@
+# Atmosphere Framework - Architectural Validation Patterns
+# This file defines patterns that indicate code quality anti-patterns.
+# Used by scripts/architectural-validation.sh
+
+# ============================================================================
+# PLACEHOLDER PATTERNS — code that pretends to work but doesn't
+# ============================================================================
+
+[placeholder_patterns]
+# Critical: code left by AI assistants or incomplete implementations
+critical = [
+    "Implementation would",
+    "Would implement",
+    "Should implement",
+    "Will implement",
+    "TODO: Implementation",
+    "stub implementation",
+    "stub for now",
+    "mock implementation",
+    "placeholder implementation",
+    "placeholder structure",
+    "simplified placeholder",
+    "this is a placeholder",
+    "will be implemented",
+    "to be implemented",
+    "not yet.*implemented",
+    "return mock data",
+    "fake implementation",
+    "in a real app",
+    "for demo purposes",
+    "temporary solution",
+    "temp fix",
+    "quick fix"
+]
+
+# Hedge language — avoiding commitment (warning only)
+hedge = [
+    "might implement",
+    "could implement",
+    "should handle",
+    "if needed",
+    "when required"
+]
+
+# ============================================================================
+# NON-SHIPPED MODULES — test-support and perf harnesses, not product code
+# ============================================================================
+
+[non_shipped_modules]
+# The production-hygiene checks (mock/stub, System.out, printStackTrace) ask
+# "would a user of the published jar see this?". These modules publish nothing,
+# so the question does not apply: benchmarks exists to build synthetic fixtures
+# and print numbers to a console, and integration-tests exists to be a fixture.
+#
+# NOT a convenience allowlist — every entry is verified against its pom on each
+# run (see verify_non_shipped in architectural-validation.sh). Listing a module
+# that actually deploys fails the build, so this list cannot be used to smuggle
+# product code out of the checks.
+#
+# Evidence (re-verified by the gate, quoted here for readers):
+#   modules/benchmarks/pom.xml        <maven.deploy.skip>true</maven.deploy.skip>
+#   modules/integration-tests/pom.xml maven-deploy-plugin  <skip>true</skip>
+#                                     maven-install-plugin <skip>true</skip>
+modules = [
+    "benchmarks",
+    "integration-tests"
+]
+
+# ============================================================================
+# MOCK / STUB EXCLUSIONS — legitimate uses of mock/stub/fake words
+# ============================================================================
+
+[mock_exclusions]
+# File-level exclusions (these files legitimately use mock/stub/fake words)
+files = [
+    "FakeHttpSession.java",
+    "FakeLlmClient.java"
+]
+
+# Word-level false positives (words containing mock/stub/fake but not meaning it)
+false_positive_words = [
+    "socket",
+    "dock",
+    "block",
+    "knock",
+    "unstub",
+    "clock",
+    "newStub",
+    "newWorkflowStub",
+    "blockingStub",
+    "Grpc",
+    "noOpsRequest",
+    "AtmosphereRequestImpl"
+]
+
+# NOTE: every bare key of [mock_exclusions] must stay ABOVE the
+# [[mock_exclusions.wiring_sites]] block below. TOML binds subsequent bare keys
+# to the most recent table header, so a key placed after the array-of-tables
+# silently becomes a field of wiring_sites[0] instead. That is not theoretical:
+# false_positive_words was briefly stranded there, which emptied
+# MOCK_FALSE_POSITIVES, turned the mock check's `grep -viE "$EMPTY"` into a
+# match-everything filter, and made the whole check pass vacuously. Add new bare
+# keys above this line.
+
+# Production sites that WIRE a legitimately-named fake, rather than leaking a
+# stub. `atmosphere.ai.mode=fake` is a documented, shipped config mode: it
+# selects FakeLlmClient so the samples run with no API key, and AiConfig logs
+# the choice at startup. The mode is a product feature, so the word "fake" in
+# its wiring is the feature's real name --- not a placeholder someone forgot.
+#
+# Scoped to file + symbol, deliberately: a bare file exclusion would let a real
+# stub land in AiConfig unnoticed. Any mock/stub/fake hit in these files that
+# does NOT match the paired regex still fails.
+[[mock_exclusions.wiring_sites]]
+file = "AiConfig.java"
+pattern = '"fake"\.equalsIgnoreCase\(mode\)|new FakeLlmClient\(|mode=fake'
+reason = "wires the documented atmosphere.ai.mode=fake demo mode"
+
+# ============================================================================
+# @SuppressWarnings ALLOWLIST
+# ============================================================================
+
+[suppress_warnings_allowlist]
+# These suppression categories are permitted in production code
+allowed = [
+    "unchecked",      # unavoidable generic erasure
+    "rawtypes",       # third-party API compatibility
+    "serial",         # Atmosphere doesn't serialize
+    "deprecation",    # migration path
+    "try",            # try-with-resources on non-AutoCloseable (JDK 21 structured concurrency)
+    "this-escape",    # JDK 21+ warning for constructors calling overridable methods
+    "fallthrough",    # intentional switch fallthrough
+    "unused",         # callback parameters required by interface but not used
+    "removal"         # deprecated-for-removal API usage during migration
+]
+
+# ============================================================================
+# NOOP CONSTANT ALLOWLIST — NOOP constants that are intentionally internal-only
+# ============================================================================
+
+[noop_allowlist]
+# These NOOP constants are defined as default/sentinel values and used internally
+# via constructor defaults or ServiceLoader fallbacks. They don't need external references.
+internal_use = [
+    "AiMetrics.NOOP",            # used as ServiceLoader fallback default
+    "GovernanceDecisionLog.NOOP", # sentinel for the installed-by-default log
+    "GovernanceTracer.NOOP"       # no-op span handle when OTel is absent
+]
+
+# ============================================================================
+# SPI INTERFACE ALLOWLIST — interfaces meant for user implementation
+# ============================================================================
+
+[spi_interfaces]
+# These interfaces have zero implementations in production code ON PURPOSE.
+# They are extension points for users/adapters to implement.
+user_extensible = [
+    "AiSupport",
+    "AiInterceptor",
+    "AiGuardrail",
+    "ContextProvider",
+    "ConversationPersistence",
+    "AiMetrics",
+    "StreamingSession",
+    "ToolProvider",
+    "AtmosphereHandler",
+    "AtmosphereInterceptor",
+    "BroadcastFilter",
+    "WebSocketHandler",
+    "AtmosphereResourceEventListener",
+    "Broadcaster",
+    "BroadcasterCache",
+    "CoalescedCacheEventListener",
+    "ToolExecutor",
+    "PostPromptHook",
+    "AgentLifecycleListener",
+    "EmbeddingRuntime",
+    "TokenPricing"
+]
+
+# ============================================================================
+# EMPTY META-INF/services ALLOWLIST — SPI files intentionally present but
+# with no in-tree provider (third-party extension points).
+# ============================================================================
+
+[empty_services]
+# These files exist so third-party ProtocolBridge / runtime implementations
+# have a canonical registration point. The in-tree bridge is registered
+# programmatically (requires AtmosphereFramework reference at construction).
+allowed = [
+    "modules/coordinator/src/main/resources/META-INF/services/org.atmosphere.ai.bridge.ProtocolBridge",
+    "modules/mcp/src/main/resources/META-INF/services/org.atmosphere.ai.bridge.ProtocolBridge"
+]
+
+# ============================================================================
+# DISABLED TESTS ALLOWLIST
+# ============================================================================
+
+[disabled_tests_allowlist]
+# These test files are allowed to have @Disabled annotations with justification
+files = [
+    "AtmosphereResourceStateRecoveryTest.java"
+]
+
+# ============================================================================
+# CI WORKFLOW ALLOWLIST
+# ============================================================================
+
+[ci_allowlist]
+# CI workflow files where continue-on-error: true is acceptable
+continue_on_error = [
+    "atmosphere-js-ci.yml",   # JS CI may fail on optional browser tests
+    "release-4x.yml",         # trailing website-sync dispatch must not skip the publish jobs
+    # Reporting-only lane: it runs the QUARANTINED specs, i.e. exactly the tests
+    # already known to fail for a documented reason. Blocking on them would make
+    # every quarantine a red build, which is the opposite of the point — the
+    # signal wanted here is "a quarantined spec started PASSING, go delete its
+    # quarantine". The tests it runs are skipped in the blocking lanes, so this
+    # lane's continue-on-error cannot mask a regression in required coverage.
+    "e2e-quarantine.yml"
+]
+
+# -DskipTests in CI is normal and correct: nearly every workflow primes its
+# dependency closure with `install -DskipTests` and then runs the real suite in
+# a later step. Flagging the flag itself produced 19 findings and zero bugs.
+#
+# The invariant that actually matters is "a workflow must not skip tests and
+# then run none". So the gate now asks that question directly: a workflow using
+# -DskipTests must ALSO contain a step matching test_step_patterns below, or be
+# listed in never_tests with a reason. Adding a bad -DskipTests to a workflow
+# that still runs tests elsewhere is not caught here — no cheap static check
+# can tell which suite a given flag suppressed; that is what review is for.
+#
+# Audited 2026-07-14: all 11 previously-unlisted workflows were legitimate
+# (prime-then-test or publish-only), which is why the file-blanket approach was
+# replaced rather than extended.
+never_tests = [
+    "publish-github-packages.yml",  # republishes an already-CI-tested tag
+    "dependency-submission.yml",    # submits a dependency graph; nothing to test
+    "snapshot-deploy.yml",          # deploys SNAPSHOTs after CI passed
+    "codeql-analysis.yml"           # CodeQL needs compilation, not tests
+]
+
+# Evidence that a workflow really runs tests. Kept explicit rather than clever:
+# a heuristic nobody can read is a gate nobody trusts.
+test_step_patterns = [
+    "mvnw[^\\n]*\\btest\\b",        # ./mvnw test / ./mvnw -B test -pl ...
+    "mvnw[^\\n]*\\bverify\\b",      # failsafe lanes
+    "playwright test",              # e2e / foundation / release-gate lanes
+    "benchmarks\\.jar",             # benchmarks.yml runs JMH as its test
+    "vt-pinning-check\\.sh",        # benchmarks.yml virtual-thread lane
+    "release-gate-samples\\.sh",    # release-gate shards invoke Playwright
+    "sample-startup-smoke\\.sh",    # ci.yml smoke job
+    "test-cli\\.sh",                # cli-e2e.yml unit + runtime suites
+    "e2e-test-[a-z-]*\\.sh",        # cli-e2e.yml overlay/runtime e2e
+    "pytest",                       # sidecar suites
+    "mcp-conformance/run\\.sh",     # mcp-conformance.yml runs the official MCP suite
+    # native-image-ci.yml's test is an inline boot probe, not a script: it
+    # backgrounds the native binary, polls an actuator/health endpoint with
+    # `curl -sf`, and `exit 1`s if the app never answers. For a native-image
+    # lane that IS the assertion under test — reflection/AOT misconfiguration
+    # shows up as a binary that will not boot.
+    "curl -sf http"
+]
+
+# ============================================================================
+# FLUENT BUILDER PATTERNS — methods that return a new object (must not discard)
+# ============================================================================
+
+[fluent_builder_methods]
+# Method name suffixes that indicate fluent/immutable builder patterns.
+# Calling these without assigning the return value is a bug.
+ai_module = [
+    "system",
+    "user",
+    "messages",
+    "advisors",
+    "toolCallbacks",
+    "temperature",
+    "topP",
+    "maxTokens"
+]
+
+# ============================================================================
+# UNCHECKED RETURN VALUES — silent failures from concurrent operations
+# ============================================================================
+
+[unchecked_returns]
+# Patterns where discarding the return value is almost always a bug.
+# These methods return boolean/object to indicate success/failure.
+# Ignoring the return silently drops data or misses state transitions.
+patterns = [
+    "^\\s+\\w+\\.offer\\(",              # BlockingQueue.offer() — false means queue full
+    "^\\s+messages\\.offer\\(",          # Broadcaster queue specifically
+]
+# Files where these patterns are acceptable (e.g., test utilities, stubs)
+allowlist_files = [
+    "StubAgentTransport.java",
+    "InMemoryCheckpointStore.java"
+]
+
+# ============================================================================
+# SECURITY PATTERNS — detect common security anti-patterns
+# ============================================================================
+
+[security]
+# Warn when write endpoints (@PostMapping, @DeleteMapping, @PutMapping) appear
+# in staged files without a visible auth/guard check nearby.
+# This is advisory (warning), not blocking — some endpoints are intentionally open.
+warn_unguarded_write_endpoints = true
+
+# Warn when Path.resolve() or File constructor uses string concatenation with
+# method parameters (potential path traversal).
+warn_unsanitized_paths = true
+
+# ============================================================================
+# TEST QUALITY — detect tests that don't actually test anything
+# ============================================================================
+
+[test_quality]
+# No-op assertions that inflate coverage without testing behavior
+noop_assertions = [
+    "expect(true).toBe(true)",
+    "expect(1).toBe(1)",
+    "expect(false).toBe(false)",
+    "assertTrue(true)",
+    "assertEquals(1, 1)"
+]
+# Maximum percentage of skipped/fixme tests before warning
+max_skip_percentage = 5
+
+# ============================================================================
+# ASYNC PARITY — ensure async paths are tested alongside sync
+# ============================================================================
+
+[async_parity]
+# Interfaces where every method should have test coverage for all variants.
+# Advisory only — logged as info, not enforced.
+proxy_interfaces = [
+    "AgentProxy",
+    "ResilientAgentProxy"
+]
+# Methods that must have async test variants
+methods = ["call", "callAsync", "stream"]
+
+# ============================================================================
+# THRESHOLD CONFIGURATION
+# ============================================================================
+
+[thresholds]
+# Every threshold is 0 and every check is blocking. The old non-zero budgets
+# (mock_in_production = 5, todo_markers = 50) were how 99 findings stayed
+# invisible under a green banner: the counts sat just under the budget and the
+# advisory tier meant nothing failed. A budget above zero is a promise to
+# tolerate the next one too — if a pattern is acceptable, allowlist the
+# specific case with a reason; do not raise the number.
+mock_in_production = 0
+placeholder_markers = 0
+system_out_calls = 0
+print_stack_trace = 0
+todo_markers = 0

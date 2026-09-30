@@ -1,0 +1,58 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.ai.embabel
+
+import com.embabel.common.ai.model.EmbeddingService
+import com.embabel.common.ai.model.PricingModel
+import org.atmosphere.ai.EmbeddingRuntime
+import org.atmosphere.ai.test.AbstractEmbeddingRuntimeContractTest
+
+/**
+ * Concrete TCK subclass for [EmbabelEmbeddingRuntime]. Injects a
+ * test-double [EmbeddingService] whose `embed(String)` and
+ * `embed(List<String>)` match the base assertion's `vector[0] = text.length`
+ * invariant. Exercises the thin pass-through path.
+ */
+internal class EmbabelEmbeddingRuntimeContractTest : AbstractEmbeddingRuntimeContractTest() {
+
+    override fun createRuntime(): EmbeddingRuntime = EmbabelEmbeddingRuntime()
+
+    override fun installFakeEmbedder(runtime: EmbeddingRuntime) {
+        (runtime as EmbabelEmbeddingRuntime).setNativeEmbeddingService(TestEmbabelEmbeddingService)
+    }
+
+    private object TestEmbabelEmbeddingService : EmbeddingService {
+        override val name: String = "test-embabel"
+        override val provider: String = "atmosphere-test"
+        override val dimensions: Int = 8
+        // Embabel 0.3.5 dropped the AiModel<Any> super-interface from
+        // EmbeddingService — the `model` property is no longer part of the
+        // contract. Embabel 0.5.0 then re-added a `pricingModel` member via
+        // the EmbeddingServiceMetadata super-interface, which 1.5.0 (the
+        // currently pinned version) still carries; a fake embedder is
+        // free, so it reports ALL_YOU_CAN_EAT. The stub thus needs the
+        // metadata trio (name / provider / dimensions), the pricing model,
+        // and the two embed() overloads.
+        override val pricingModel: PricingModel = PricingModel.ALL_YOU_CAN_EAT
+        override fun embed(text: String): FloatArray {
+            val vector = FloatArray(8)
+            vector[0] = text.length.toFloat()
+            return vector
+        }
+        override fun embed(texts: List<String>): List<FloatArray> =
+            texts.map { embed(it) }
+    }
+}

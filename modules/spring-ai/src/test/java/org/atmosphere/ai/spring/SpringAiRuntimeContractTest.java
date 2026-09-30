@@ -1,0 +1,245 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.ai.spring;
+
+import org.atmosphere.ai.AiCapability;
+import org.atmosphere.ai.AgentExecutionContext;
+import org.atmosphere.ai.AgentRuntime;
+import org.atmosphere.ai.test.AbstractAgentRuntimeContractTest;
+import org.junit.jupiter.api.Test;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.ai.chat.model.Generation;
+import reactor.core.publisher.Flux;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+/**
+ * Concrete TCK test for {@link SpringAiAgentRuntime}.
+ */
+class SpringAiRuntimeContractTest extends AbstractAgentRuntimeContractTest {
+
+    @Override
+    protected AgentRuntime createRuntime() {
+        return new TestableSpringAiRuntime(mockToolAwareChatClient());
+    }
+
+    @Override
+    protected AgentExecutionContext createTextContext() {
+        return new AgentExecutionContext(
+                "Hello", "You are helpful", "gpt-4",
+                null, "session-1", "user-1", "conv-1",
+                List.of(), null, null, List.of(), Map.of(),
+                List.of(), null, null);
+    }
+
+    @Override
+    protected AgentExecutionContext createToolCallContext() {
+        return null;
+    }
+
+    @Override
+    protected AgentExecutionContext createErrorContext() {
+        return new AgentExecutionContext(
+                CONTRACT_ERROR_SENTINEL, "You are helpful", "gpt-4",
+                null, "session-1", "user-1", "conv-1",
+                List.of(), null, null, List.of(), Map.of(),
+                List.of(), null, null);
+    }
+
+    @Override
+    protected Set<AiCapability> expectedCapabilities() {
+        return Set.of(
+                AiCapability.TEXT_STREAMING,
+                AiCapability.TOOL_CALLING,
+                AiCapability.STRUCTURED_OUTPUT,
+                AiCapability.NATIVE_STRUCTURED_OUTPUT,
+                AiCapability.SYSTEM_PROMPT,
+                AiCapability.TOOL_APPROVAL,
+                AiCapability.VISION,
+                AiCapability.AUDIO,
+                AiCapability.MULTI_MODAL,
+                AiCapability.PROMPT_CACHING,
+                AiCapability.TOKEN_USAGE,
+                AiCapability.CONVERSATION_MEMORY,
+                AiCapability.PER_REQUEST_RETRY,
+                AiCapability.BUDGET_ENFORCEMENT,
+                AiCapability.CONFIDENCE_SCORES,
+                AiCapability.PASSIVATION,
+                AiCapability.CANCELLATION);
+    }
+
+    /**
+     * All four knobs ride Spring AI's generic {@code ChatOptions} builder
+     * (stop as {@code stopSequences}) — proven in
+     * {@code SpringAiGenerationParamsTest}.
+     */
+    @Override
+    protected Set<GenerationParamsSupport> expectedGenerationHonoring() {
+        return Set.of(GenerationParamsSupport.TEMPERATURE,
+                GenerationParamsSupport.MAX_TOKENS,
+                GenerationParamsSupport.TOP_P,
+                GenerationParamsSupport.STOP);
+    }
+
+    @Override
+    protected AgentExecutionContext createImageContext() {
+        var parts = List.<org.atmosphere.ai.Content>of(
+                new org.atmosphere.ai.Content.Image(TINY_PNG, "image/png"));
+        return new AgentExecutionContext(
+                "Describe this image.", "You are helpful", "gpt-4",
+                null, "session-1", "user-1", "conv-1",
+                List.of(), null, null, List.of(), Map.of(),
+                List.of(), null, null, List.of(), parts,
+                org.atmosphere.ai.approval.ToolApprovalPolicy.annotated());
+    }
+
+    /**
+     * Exercise the {@code runtimeWithPromptCachingAcceptsCacheHint} assertion
+     * on Spring AI. The context carries a {@link org.atmosphere.ai.llm.CacheHint#conservative()}
+     * under the canonical metadata key; {@code doExecuteWithHandle} reads it
+     * via {@code CacheHint.from(context)} and rides it through
+     * {@code OpenAiChatOptions.extraBody(Map.of("prompt_cache_key", ...))}
+     * on the prompt spec. Dispatch continues through Spring AI's reactor
+     * pipeline; downstream network failures are caught and treated as a
+     * skip per the base contract.
+     */
+    @Override
+    protected AgentExecutionContext createCacheContext() {
+        var metadata = Map.<String, Object>of(
+                org.atmosphere.ai.llm.CacheHint.METADATA_KEY,
+                org.atmosphere.ai.llm.CacheHint.conservative("spring-ai-cache-test"));
+        return new AgentExecutionContext(
+                "Hello, cached.", "You are helpful", "gpt-4",
+                null, "session-1", "user-1", "conv-1",
+                List.of(), null, null, List.of(), metadata,
+                List.of(), null, null, List.of(), List.of(),
+                org.atmosphere.ai.approval.ToolApprovalPolicy.annotated());
+    }
+
+    /**
+     * Exercise {@code runtimeAcceptsCustomRetryPolicyOnContext} on Spring AI.
+     * {@code AbstractAgentRuntime.executeWithOuterRetry} wraps
+     * {@code doExecute} when {@code context.retryPolicy()} is not the inherit
+     * sentinel, so a non-default policy must ride the dispatch without the
+     * bridge rejecting it.
+     */
+    @Override
+    protected AgentExecutionContext createRetryContext() {
+        return new AgentExecutionContext(
+                "Hello, no retries.", "You are helpful", "gpt-4",
+                null, "session-1", "user-1", "conv-1",
+                List.of(), null, null, List.of(), Map.of(),
+                List.of(), null, null, List.of(), List.of(),
+                org.atmosphere.ai.approval.ToolApprovalPolicy.annotated())
+                .withRetryPolicy(org.atmosphere.ai.RetryPolicy.NONE);
+    }
+
+    /**
+     * Cancellation fixture for Spring AI. {@code doExecuteWithHandle}
+     * subscribes to the {@code ChatClient}'s response {@link Flux} and wraps
+     * the Reactor {@code Disposable} in the returned handle; {@code cancel()}
+     * disposes it, which propagates an upstream cancel to the provider call.
+     * The stub returns a never-emitting {@code Flux} whose {@code doOnCancel}
+     * counts that dispose — so the contract's exactly-once assertion proves
+     * the CAS guard around the disposal.
+     */
+    @Override
+    protected CancellationFixture createCancellationFixture() {
+        var releases = new java.util.concurrent.atomic.AtomicInteger();
+        return CancellationFixture
+                .of(new TestableSpringAiRuntime(mockBlockingChatClient(releases)),
+                        createTextContext())
+                .withBackendRelease("Reactor subscription dispose()", releases);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static ChatClient mockBlockingChatClient(
+            java.util.concurrent.atomic.AtomicInteger releases) {
+        var chatClient = mock(ChatClient.class);
+        var promptSpec = mock(ChatClient.ChatClientRequestSpec.class,
+                org.mockito.Answers.RETURNS_SELF);
+        var streamSpec = mock(ChatClient.StreamResponseSpec.class);
+        when(chatClient.prompt()).thenReturn(promptSpec);
+        when(promptSpec.stream()).thenReturn(streamSpec);
+        // Never-emitting source: the subscription stays open until the test
+        // cancels, so the handle is genuinely in flight.
+        when(streamSpec.chatResponse()).thenAnswer(inv ->
+                Flux.<ChatResponse>never().doOnCancel(releases::incrementAndGet));
+        return chatClient;
+    }
+
+    @Test
+    void springAiDeclaresToolCalling() {
+        assertTrue(createRuntime().capabilities().contains(AiCapability.TOOL_CALLING));
+    }
+
+    @Test
+    void springAiDeclaresStructuredOutput() {
+        assertTrue(createRuntime().capabilities().contains(AiCapability.STRUCTURED_OUTPUT));
+    }
+
+    static class TestableSpringAiRuntime extends SpringAiAgentRuntime {
+        TestableSpringAiRuntime(ChatClient client) {
+            setNativeClient(client);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static ChatClient mockToolAwareChatClient() {
+        var chatClient = mock(ChatClient.class);
+        // RETURNS_SELF handles all fluent chain methods — unstubbed calls
+        // return the mock itself instead of null, avoiding NPEs on
+        // Spring AI's deeply chained promptSpec.system().user().options()...
+        var promptSpec = mock(ChatClient.ChatClientRequestSpec.class,
+                org.mockito.Answers.RETURNS_SELF);
+        var streamSpec = mock(ChatClient.StreamResponseSpec.class);
+
+        when(chatClient.prompt()).thenReturn(promptSpec);
+        when(promptSpec.stream()).thenReturn(streamSpec);
+
+        // Capture the user text passed via promptSpec.user(String) so the
+        // streamSpec.chatResponse() answer can route the contract sentinel
+        // through Flux.error(...) — Spring AI's fluent chain hides the
+        // request body behind RETURNS_SELF, so a side-channel capture is
+        // the only way the stub can switch on the user prompt.
+        var lastUser = new java.util.concurrent.atomic.AtomicReference<String>();
+        when(promptSpec.user(anyString())).thenAnswer(inv -> {
+            lastUser.set(inv.getArgument(0));
+            return promptSpec;
+        });
+
+        var generation = new Generation(new AssistantMessage("Hello world"));
+        var chatResponse = new ChatResponse(List.of(generation));
+        when(streamSpec.chatResponse()).thenAnswer(inv -> {
+            if (CONTRACT_ERROR_SENTINEL.equals(lastUser.get())) {
+                return Flux.error(new RuntimeException("forced contract error"));
+            }
+            return Flux.just(chatResponse);
+        });
+
+        return chatClient;
+    }
+
+}

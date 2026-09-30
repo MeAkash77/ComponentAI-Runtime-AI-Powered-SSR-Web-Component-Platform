@@ -1,0 +1,1642 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.spring.boot;
+
+import org.atmosphere.admin.AtmosphereAdmin;
+import org.atmosphere.admin.a2a.TaskController;
+import org.atmosphere.admin.ai.AiRuntimeController;
+import org.atmosphere.admin.ai.GovernanceController;
+import org.atmosphere.admin.ai.VerifierController;
+import org.atmosphere.admin.coordinator.CoordinatorController;
+import org.atmosphere.admin.flow.FlowController;
+import org.atmosphere.admin.mcp.McpController;
+import org.atmosphere.admin.metrics.MetricsController;
+import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
+import org.springframework.http.ResponseEntity;
+import org.springframework.util.ClassUtils;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import jakarta.servlet.http.HttpServletRequest;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * REST controller exposing the Atmosphere Admin control plane read operations.
+ * All endpoints are under {@code /api/admin/}.
+ *
+ * @since 4.0
+ */
+@AutoConfiguration
+@RestController
+@RequestMapping("/api/admin")
+@ConditionalOnBean(AtmosphereAdmin.class)
+public class AtmosphereAdminEndpoint {
+
+    private final AtmosphereAdmin admin;
+    private final org.springframework.core.env.Environment env;
+    private final org.springframework.beans.factory.ObjectProvider<org.atmosphere.room.RoomManager> roomManager;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public AtmosphereAdminEndpoint(
+            AtmosphereAdmin admin,
+            org.springframework.core.env.Environment env,
+            org.springframework.beans.factory.ObjectProvider<org.atmosphere.room.RoomManager> roomManager) {
+        this.admin = admin;
+        this.env = env;
+        this.roomManager = roomManager;
+    }
+
+    /** Convenience for tests and embedders without a Room Protocol wiring. */
+    public AtmosphereAdminEndpoint(
+            AtmosphereAdmin admin,
+            org.springframework.core.env.Environment env) {
+        this(admin, env, null);
+    }
+
+    /**
+     * Consulted on every mutating call — not cached — so an operator
+     * can flip {@code atmosphere.admin.http-write-enabled=false} at
+     * runtime (Spring's {@code @RefreshScope} or a live
+     * {@code ConfigFileApplicationListener}) and every subsequent
+     * write rejects without a restart. Resolved fresh per request; the
+     * cost is one environment lookup per guardWrite call — negligible
+     * next to the servlet dispatch.
+     */
+    boolean writeEnabled() {
+        return Boolean.parseBoolean(
+                env.getProperty("atmosphere.admin.http-write-enabled", "false"));
+    }
+
+    /**
+     * Authorization gate for every mutating admin REST endpoint. Three
+     * layers, evaluated in order:
+     * <ol>
+     *   <li><strong>Feature flag</strong> —
+     *       {@code atmosphere.admin.http-write-enabled} must be {@code true}.
+     *       Returns {@code 403} when disabled.</li>
+     *   <li><strong>Authenticated principal</strong> — the servlet
+     *       {@code HttpServletRequest.getUserPrincipal()} must be non-null
+     *       and non-blank. Returns {@code 401} when anonymous.</li>
+     *   <li><strong>{@link org.atmosphere.admin.ControlAuthorizer}</strong>
+     *       installed on {@link AtmosphereAdmin} — an operator may plug in a
+     *       role/scope/tenant check. Returns {@code 403} on deny.</li>
+     * </ol>
+     *
+     * <p>Every decision (allowed or denied) is recorded in the control audit
+     * log so operators see the complete picture.</p>
+     *
+     * <p>Default deny per Correctness Invariant #6. The earlier
+     * feature-flag-only gate let any anonymous caller mutate state once the
+     * flag was flipped for machine access — the principal check closes that
+     * hole.</p>
+     */
+    private ResponseEntity<Map<String, Object>> guardWrite(
+            HttpServletRequest request, String action, String target) {
+        if (!writeEnabled()) {
+            admin.auditLog().record(null, action + ".denied.flag", target, false,
+                    "atmosphere.admin.http-write-enabled=false");
+            return ResponseEntity.status(403).body(Map.of(
+                    "error", "Admin write operations disabled",
+                    "hint", "Set atmosphere.admin.http-write-enabled=true to enable"));
+        }
+        // Principal resolution order mirrors AiEndpointHandler:
+        //   1. servlet getUserPrincipal() (Spring Security, Jakarta Security)
+        //   2. Atmosphere's own AuthInterceptor attribute (token-validated Principal)
+        //   3. ai.userId request attribute (framework-set fallback)
+        String principalName = null;
+        if (request != null) {
+            var principal = request.getUserPrincipal();
+            if (principal != null && principal.getName() != null
+                    && !principal.getName().isBlank()) {
+                principalName = principal.getName();
+            } else if (request.getAttribute("org.atmosphere.auth.principal")
+                    instanceof java.security.Principal attrPrincipal
+                    && attrPrincipal.getName() != null
+                    && !attrPrincipal.getName().isBlank()) {
+                principalName = attrPrincipal.getName();
+            } else if (request.getAttribute("ai.userId") instanceof String s
+                    && !s.isBlank()) {
+                principalName = s;
+            }
+        }
+        if (principalName == null) {
+            admin.auditLog().record(null, action + ".denied.anonymous", target, false, null);
+            return ResponseEntity.status(401).body(Map.of(
+                    "error", "Authentication required for admin write operations"));
+        }
+        // Opt-in role authorization (atmosphere.admin.required-role), parity
+        // with the Quarkus admin extension. When set, a caller authenticated by
+        // the servlet security layer (Spring Security / Jakarta Security — e.g. a
+        // JWT whose authorities Spring maps onto isUserInRole) must additionally
+        // carry that role. The X-Atmosphere-Auth token path (which sets the
+        // org.atmosphere.auth.principal attribute when AdminApiAuthFilter wraps
+        // the request) and the ai.userId attribute are not role-bearing and stay
+        // governed by the ControlAuthorizer below, so the gate fires only for a
+        // container-security principal. Default off — existing deployments are
+        // unaffected.
+        var requiredRole = requiredRole();
+        if (requiredRole != null && isContainerSecurityPrincipal(request)
+                && !request.isUserInRole(requiredRole)) {
+            admin.auditLog().record(principalName, action + ".denied.role", target, false,
+                    "missing role: " + requiredRole);
+            return ResponseEntity.status(403).body(Map.of(
+                    "error", "Forbidden: caller lacks required role"));
+        }
+        var authorizer = admin.authorizer();
+        if (!authorizer.authorize(action, target, principalName)) {
+            admin.auditLog().record(principalName, action + ".denied.authz", target, false, null);
+            return ResponseEntity.status(403).body(Map.of(
+                    "error", "Forbidden"));
+        }
+        return null;
+    }
+
+    /**
+     * Resolve the authenticated caller's name using the same order as
+     * {@code guardWrite}. Must only be called on a request that already
+     * passed guardWrite — so principalName is guaranteed non-null.
+     */
+    private static String resolvePrincipalName(HttpServletRequest request) {
+        var principal = request.getUserPrincipal();
+        if (principal != null && principal.getName() != null
+                && !principal.getName().isBlank()) {
+            return principal.getName();
+        }
+        if (request.getAttribute("org.atmosphere.auth.principal")
+                instanceof java.security.Principal attrPrincipal
+                && attrPrincipal.getName() != null) {
+            return attrPrincipal.getName();
+        }
+        if (request.getAttribute("ai.userId") instanceof String s) {
+            return s;
+        }
+        return "unknown";
+    }
+
+    /**
+     * Resolve the opt-in admin role requirement
+     * ({@code atmosphere.admin.required-role}). Returns {@code null} —
+     * meaning no role gate — when the property is unset or blank.
+     * Consulted per request like {@link #writeEnabled()} so an operator
+     * can tighten the gate at runtime without a restart.
+     */
+    String requiredRole() {
+        var role = env.getProperty("atmosphere.admin.required-role", "");
+        return role != null && !role.isBlank() ? role.trim() : null;
+    }
+
+    /**
+     * True when the request was authenticated by the servlet security
+     * layer (Spring Security / Jakarta Security) rather than the
+     * Atmosphere {@code X-Atmosphere-Auth} token path. Only the former
+     * is role-bearing, so only it is subject to the role gate.
+     *
+     * <p>The token path is identified by the
+     * {@code org.atmosphere.auth.principal} request attribute that
+     * {@code AdminApiAuthFilter} sets when it wraps the request — a
+     * container-security principal sets {@code getUserPrincipal()} but
+     * never that attribute.</p>
+     */
+    private static boolean isContainerSecurityPrincipal(HttpServletRequest request) {
+        if (request == null) {
+            return false;
+        }
+        var principal = request.getUserPrincipal();
+        if (principal == null || principal.getName() == null
+                || principal.getName().isBlank()) {
+            return false;
+        }
+        return request.getAttribute("org.atmosphere.auth.principal") == null;
+    }
+
+    // ── System Overview ──
+
+    @GetMapping("/overview")
+    public Map<String, Object> overview() {
+        return admin.overview();
+    }
+
+    // ── Framework ──
+
+    @GetMapping("/broadcasters")
+    public List<Map<String, Object>> listBroadcasters() {
+        return admin.framework().listBroadcasters();
+    }
+
+    @GetMapping("/broadcasters/detail")
+    public ResponseEntity<Map<String, Object>> getBroadcaster(@RequestParam("id") String id) {
+        return admin.framework().getBroadcaster(id)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    @GetMapping("/resources")
+    public List<Map<String, Object>> listResources() {
+        return admin.framework().listResources();
+    }
+
+    @GetMapping("/handlers")
+    public List<Map<String, Object>> listHandlers() {
+        return admin.framework().listHandlers();
+    }
+
+    /** Protocol bridges live on this framework (runtime truth — registre#22). */
+    @GetMapping("/protocols")
+    public List<Map<String, Object>> listProtocolBridges() {
+        return admin.framework().listProtocolBridges();
+    }
+
+    @GetMapping("/interceptors")
+    public List<Map<String, Object>> listInterceptors() {
+        return admin.framework().listInterceptors();
+    }
+
+    // ── Framework Write Operations ──
+
+    @PostMapping("/broadcasters/broadcast")
+    public ResponseEntity<Map<String, Object>> broadcast(
+            HttpServletRequest request,
+            @RequestBody Map<String, String> body) {
+        var id = body.get("broadcasterId");
+        var message = body.get("message");
+        var denied = guardWrite(request, "broadcast", id);
+        if (denied != null) return denied;
+        if (id == null || message == null) {
+            return ResponseEntity.badRequest().body(
+                    Map.of("error", "missing 'broadcasterId' or 'message' field"));
+        }
+        var principalName = resolvePrincipalName(request);
+        var success = admin.framework().broadcast(id, message);
+        admin.auditLog().record(principalName, "broadcast", id, success, message);
+        if (success) {
+            return ResponseEntity.ok(Map.of("status", "broadcast sent"));
+        }
+        return ResponseEntity.notFound().build();
+    }
+
+    @PostMapping("/broadcasters/unicast")
+    public ResponseEntity<Map<String, Object>> unicast(
+            HttpServletRequest request,
+            @RequestBody Map<String, String> body) {
+        var id = body.get("broadcasterId");
+        var uuid = body.get("uuid");
+        var message = body.get("message");
+        var target = id != null && uuid != null ? id + "/" + uuid : id;
+        var denied = guardWrite(request, "unicast", target);
+        if (denied != null) return denied;
+        if (id == null || uuid == null || message == null) {
+            return ResponseEntity.badRequest().body(
+                    Map.of("error", "missing 'broadcasterId', 'uuid', or 'message' field"));
+        }
+        var principalName = resolvePrincipalName(request);
+        var success = admin.framework().unicast(id, uuid, message);
+        admin.auditLog().record(principalName, "unicast", target, success, message);
+        if (success) {
+            return ResponseEntity.ok(Map.of("status", "unicast sent"));
+        }
+        return ResponseEntity.notFound().build();
+    }
+
+    @DeleteMapping("/broadcasters/destroy")
+    public ResponseEntity<Map<String, Object>> destroyBroadcaster(
+            HttpServletRequest request,
+            @RequestParam("id") String id) {
+        var denied = guardWrite(request, "destroy_broadcaster", id);
+        if (denied != null) return denied;
+        var principalName = resolvePrincipalName(request);
+        var success = admin.framework().destroyBroadcaster(id);
+        admin.auditLog().record(principalName, "destroy_broadcaster", id, success, null);
+        if (success) {
+            return ResponseEntity.ok(Map.of("status", "broadcaster destroyed"));
+        }
+        return ResponseEntity.notFound().build();
+    }
+
+    @DeleteMapping("/resources/{uuid}")
+    public ResponseEntity<Map<String, Object>> disconnectResource(
+            HttpServletRequest request,
+            @PathVariable("uuid") String uuid) {
+        var denied = guardWrite(request, "disconnect", uuid);
+        if (denied != null) return denied;
+        var principalName = resolvePrincipalName(request);
+        var success = admin.framework().disconnectResource(uuid);
+        admin.auditLog().record(principalName, "disconnect", uuid, success, null);
+        if (success) {
+            return ResponseEntity.ok(Map.of("status", "resource disconnected"));
+        }
+        return ResponseEntity.notFound().build();
+    }
+
+    @PostMapping("/resources/{uuid}/resume")
+    public ResponseEntity<Map<String, Object>> resumeResource(
+            HttpServletRequest request,
+            @PathVariable("uuid") String uuid) {
+        var denied = guardWrite(request, "resume", uuid);
+        if (denied != null) return denied;
+        var principalName = resolvePrincipalName(request);
+        var success = admin.framework().resumeResource(uuid);
+        admin.auditLog().record(principalName, "resume", uuid, success, null);
+        if (success) {
+            return ResponseEntity.ok(Map.of("status", "resource resumed"));
+        }
+        return ResponseEntity.notFound().build();
+    }
+
+    // ── A2A Task Write Operations ──
+
+    @PostMapping("/tasks/{taskId}/cancel")
+    public ResponseEntity<Map<String, Object>> cancelTask(
+            HttpServletRequest request,
+            @PathVariable("taskId") String taskId) {
+        var denied = guardWrite(request, "cancel_task", taskId);
+        if (denied != null) return denied;
+        TaskController controller = admin.taskController();
+        if (controller == null) {
+            return ResponseEntity.notFound().build();
+        }
+        var principalName = resolvePrincipalName(request);
+        var success = controller.cancelTask(taskId);
+        admin.auditLog().record(principalName, "cancel_task", taskId, success, null);
+        if (success) {
+            return ResponseEntity.ok(Map.of("status", "task canceled"));
+        }
+        return ResponseEntity.notFound().build();
+    }
+
+    // ── AI Streaming Session Operations ──
+
+    /**
+     * Cancel an in-flight LLM call on an AI streaming session WITHOUT
+     * disconnecting the underlying transport. Surfaces
+     * {@link org.atmosphere.ai.AiStreamingSession#cancelInflight} to operators
+     * who want to abort just the upstream call (refunding tokens, releasing
+     * approval futures) while keeping the socket open for follow-up turns.
+     *
+     * <p>For "kill the whole connection" semantics, prefer
+     * {@code DELETE /resources/{uuid}} which fires a full transport
+     * disconnect — that path automatically triggers cancelInflight via the
+     * removeAllForResource fan-out, but also closes the socket.</p>
+     *
+     * @param request the servlet request (for guardWrite + audit)
+     * @param uuid    the AtmosphereResource UUID whose AI sessions to cancel
+     * @return 200 with the count of sessions cancelled, 404 when no AI
+     *     sessions are registered for that uuid
+     */
+    @PostMapping("/sessions/{uuid}/cancel-inflight")
+    public ResponseEntity<Map<String, Object>> cancelSessionInflight(
+            HttpServletRequest request,
+            @PathVariable("uuid") String uuid) {
+        var denied = guardWrite(request, "cancel_inflight", uuid);
+        if (denied != null) return denied;
+        var principalName = resolvePrincipalName(request);
+
+        // Pre-check: is there a session registered? AiStreamingSession does
+        // not expose a public "size" accessor for the per-uuid list, so we
+        // route through the static cancel path which is itself idempotent —
+        // a 404 here is informational, not load-bearing.
+        var hadSessions = org.atmosphere.ai.AiStreamingSession
+                .resourceHasActiveSessions(uuid);
+        org.atmosphere.ai.AiStreamingSession.cancelInflightForResource(uuid);
+        admin.auditLog().record(principalName, "cancel_inflight", uuid, hadSessions, null);
+        if (hadSessions) {
+            return ResponseEntity.ok(Map.of(
+                    "status", "in-flight LLM call cancelled",
+                    "uuid", uuid));
+        }
+        return ResponseEntity.notFound().build();
+    }
+
+    // ── Rooms ──
+
+    /**
+     * Room Protocol rooms with member counts and details — the framework-owned
+     * read plane behind the console's Rooms tab (the {@code RoomManager} is
+     * app-wired alongside {@code RoomProtocolInterceptor}; absent bean = empty
+     * list, and the console gates the tab on the {@code hasRooms} info flag).
+     */
+    @GetMapping("/rooms")
+    public List<Map<String, Object>> listRooms() {
+        var manager = roomManager == null ? null : roomManager.getIfAvailable();
+        if (manager == null) {
+            return List.of();
+        }
+        return manager.all().stream()
+                .map(room -> {
+                    var map = new java.util.LinkedHashMap<String, Object>();
+                    map.put("name", room.name());
+                    map.put("members", room.size());
+                    map.put("destroyed", room.isDestroyed());
+                    map.put("memberDetails", room.memberInfo().values().stream()
+                            .map(m -> Map.<String, Object>of(
+                                    "id", m.id(),
+                                    "metadata", m.metadata()))
+                            .toList());
+                    return (Map<String, Object>) map;
+                })
+                .toList();
+    }
+
+    // ── Agents ──
+
+    @GetMapping("/agents")
+    public List<Map<String, Object>> listAgents() {
+        return admin.agents().listAgents();
+    }
+
+    @GetMapping("/agents/{name}")
+    public ResponseEntity<Map<String, Object>> getAgent(@PathVariable("name") String name) {
+        return admin.agents().getAgent(name)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    @GetMapping("/agents/{name}/sessions")
+    public List<Map<String, Object>> listAgentSessions(@PathVariable("name") String name) {
+        return admin.agents().listSessions(name);
+    }
+
+    // ── Agent state (registre#21: memory control plane, wired + guarded) ──
+
+    private ResponseEntity<Map<String, Object>> stateUnavailable() {
+        return ResponseEntity.status(503).body(Map.of(
+                "error", "State controller not wired"));
+    }
+
+    @GetMapping("/agents/{agentId}/rules")
+    public ResponseEntity<Map<String, Object>> getAgentRules(
+            @PathVariable("agentId") String agentId,
+            @RequestParam("userId") String userId) {
+        var controller = admin.stateController();
+        if (controller == null) {
+            return stateUnavailable();
+        }
+        try {
+            return ResponseEntity.ok(controller.getRules(agentId, userId));
+        } catch (java.util.NoSuchElementException e) {
+            return ResponseEntity.notFound().build();
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    @GetMapping("/agents/{agentId}/facts")
+    public ResponseEntity<Object> listAgentFacts(
+            @PathVariable("agentId") String agentId,
+            @RequestParam("userId") String userId) {
+        var controller = admin.stateController();
+        if (controller == null) {
+            return ResponseEntity.status(503).body(Map.of("error", "State controller not wired"));
+        }
+        try {
+            return ResponseEntity.ok(controller.listFacts(agentId, userId));
+        } catch (java.util.NoSuchElementException e) {
+            return ResponseEntity.notFound().build();
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    @PostMapping("/agents/{agentId}/facts")
+    public ResponseEntity<Map<String, Object>> addAgentFact(
+            @PathVariable("agentId") String agentId,
+            @RequestParam("userId") String userId,
+            @RequestBody Map<String, String> body,
+            HttpServletRequest request) {
+        var guard = guardWrite(request, "agent_state.fact.add", agentId);
+        if (guard != null) {
+            return guard;
+        }
+        var controller = admin.stateController();
+        if (controller == null) {
+            return stateUnavailable();
+        }
+        try {
+            return ResponseEntity.ok(controller.addFact(agentId, userId,
+                    body != null ? body.get("content") : null));
+        } catch (java.util.NoSuchElementException e) {
+            return ResponseEntity.notFound().build();
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    @DeleteMapping("/agents/{agentId}/facts/{factId}")
+    public ResponseEntity<Map<String, Object>> removeAgentFact(
+            @PathVariable("agentId") String agentId,
+            @PathVariable("factId") String factId,
+            @RequestParam("userId") String userId,
+            HttpServletRequest request) {
+        var guard = guardWrite(request, "agent_state.fact.remove", agentId);
+        if (guard != null) {
+            return guard;
+        }
+        var controller = admin.stateController();
+        if (controller == null) {
+            return stateUnavailable();
+        }
+        try {
+            controller.removeFact(agentId, userId, factId);
+            return ResponseEntity.ok(Map.of("removed", factId));
+        } catch (java.util.NoSuchElementException e) {
+            return ResponseEntity.notFound().build();
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    @GetMapping("/agents/{agentId}/conversation/{sessionId}")
+    public ResponseEntity<Object> getAgentConversation(
+            @PathVariable("agentId") String agentId,
+            @PathVariable("sessionId") String sessionId) {
+        var controller = admin.stateController();
+        if (controller == null) {
+            return ResponseEntity.status(503).body(Map.of("error", "State controller not wired"));
+        }
+        try {
+            return ResponseEntity.ok(controller.getConversation(agentId, sessionId));
+        } catch (java.util.NoSuchElementException e) {
+            return ResponseEntity.notFound().build();
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    @DeleteMapping("/agents/{agentId}/conversation/{sessionId}")
+    public ResponseEntity<Map<String, Object>> clearAgentConversation(
+            @PathVariable("agentId") String agentId,
+            @PathVariable("sessionId") String sessionId,
+            HttpServletRequest request) {
+        var guard = guardWrite(request, "agent_state.conversation.clear", agentId);
+        if (guard != null) {
+            return guard;
+        }
+        var controller = admin.stateController();
+        if (controller == null) {
+            return stateUnavailable();
+        }
+        try {
+            controller.clearConversation(agentId, sessionId);
+            return ResponseEntity.ok(Map.of("cleared", sessionId));
+        } catch (java.util.NoSuchElementException e) {
+            return ResponseEntity.notFound().build();
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    @GetMapping("/agents/{agentId}/workspace")
+    public ResponseEntity<Map<String, Object>> getAgentWorkspace(
+            @PathVariable("agentId") String agentId) {
+        var controller = admin.stateController();
+        if (controller == null) {
+            return stateUnavailable();
+        }
+        try {
+            return ResponseEntity.ok(controller.getWorkspaceRoot(agentId));
+        } catch (java.util.NoSuchElementException e) {
+            return ResponseEntity.notFound().build();
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    // ── Coordinators ──
+
+    @GetMapping("/coordinators")
+    public ResponseEntity<List<Map<String, Object>>> listCoordinators() {
+        CoordinatorController controller = admin.coordinatorController();
+        if (controller == null) {
+            return ResponseEntity.ok(List.of());
+        }
+        return ResponseEntity.ok(controller.listCoordinators());
+    }
+
+    /** Fleet health — availability + circuit state per agent (registre#43). */
+    @GetMapping("/coordinators/{name}/health")
+    public ResponseEntity<Map<String, Object>> getCoordinatorHealth(
+            @PathVariable("name") String name) {
+        CoordinatorController controller = admin.coordinatorController();
+        if (controller == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return controller.getFleetHealth(name)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    @GetMapping("/coordinators/{name}/fleet")
+    public ResponseEntity<Map<String, Object>> getFleet(@PathVariable("name") String name) {
+        CoordinatorController controller = admin.coordinatorController();
+        if (controller == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return controller.getFleet(name)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    @GetMapping("/journal")
+    public ResponseEntity<List<Map<String, Object>>> queryJournal(
+            @RequestParam(value = "coordinationId", required = false) String coordinationId,
+            @RequestParam(value = "agent", required = false) String agentName,
+            @RequestParam(value = "since", required = false) String since,
+            @RequestParam(value = "until", required = false) String until,
+            @RequestParam(value = "limit", defaultValue = "100") int limit) {
+        CoordinatorController controller = admin.coordinatorController();
+        if (controller == null) {
+            return ResponseEntity.ok(List.of());
+        }
+        Instant sinceInstant = null;
+        Instant untilInstant = null;
+        try {
+            if (since != null) sinceInstant = Instant.parse(since);
+            if (until != null) untilInstant = Instant.parse(until);
+        } catch (java.time.format.DateTimeParseException e) {
+            return ResponseEntity.badRequest().body(List.of(Map.of(
+                    "error", "Invalid timestamp: " + e.getMessage())));
+        }
+        return ResponseEntity.ok(
+                controller.queryJournal(coordinationId, agentName, sinceInstant, untilInstant, limit));
+    }
+
+    @GetMapping("/journal/{coordinationId}")
+    public ResponseEntity<List<Map<String, Object>>> getJournalEvents(
+            @PathVariable("coordinationId") String coordinationId) {
+        CoordinatorController controller = admin.coordinatorController();
+        if (controller == null) {
+            return ResponseEntity.ok(List.of());
+        }
+        return ResponseEntity.ok(
+                controller.queryJournal(coordinationId, null, null, null, 0));
+    }
+
+    @GetMapping("/journal/{coordinationId}/log")
+    public ResponseEntity<String> getJournalLog(
+            @PathVariable("coordinationId") String coordinationId) {
+        CoordinatorController controller = admin.coordinatorController();
+        if (controller == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return controller.getJournalLog(coordinationId)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    /** The coordination's causal DAG from the journaled envelope lineage (registre#23). */
+    @GetMapping("/journal/{coordinationId}/tree")
+    public ResponseEntity<List<Map<String, Object>>> getJournalTree(
+            @PathVariable("coordinationId") String coordinationId) {
+        CoordinatorController controller = admin.coordinatorController();
+        if (controller == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return controller.getCoordinationTree(coordinationId)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    // ── Agent-to-Agent Flow Graph ──
+
+    @GetMapping("/flow")
+    public ResponseEntity<Map<String, Object>> renderFlow(
+            @RequestParam(value = "lookbackMinutes", defaultValue = "0") int lookbackMinutes) {
+        FlowController controller = admin.flowController();
+        if (controller == null) {
+            return ResponseEntity.ok(Map.of("nodes", List.of(), "edges", List.of()));
+        }
+        return ResponseEntity.ok(controller.renderFlow(lookbackMinutes));
+    }
+
+    @GetMapping("/flow/{coordinationId}")
+    public ResponseEntity<Map<String, Object>> renderRun(
+            @PathVariable("coordinationId") String coordinationId) {
+        FlowController controller = admin.flowController();
+        if (controller == null) {
+            return ResponseEntity.ok(Map.of("nodes", List.of(), "edges", List.of()));
+        }
+        return ResponseEntity.ok(controller.renderRun(coordinationId));
+    }
+
+    // ── Workflow Authoring ──
+
+    @GetMapping("/workflow")
+    public ResponseEntity<List<org.atmosphere.admin.workflow.WorkflowManifest>> listWorkflows() {
+        org.atmosphere.admin.workflow.WorkflowController controller = admin.workflowController();
+        if (controller == null) {
+            return ResponseEntity.ok(List.of());
+        }
+        return ResponseEntity.ok(controller.list());
+    }
+
+    @GetMapping("/workflow/{id}")
+    public ResponseEntity<org.atmosphere.admin.workflow.WorkflowManifest> getWorkflow(
+            @PathVariable("id") String id) {
+        org.atmosphere.admin.workflow.WorkflowController controller = admin.workflowController();
+        if (controller == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return controller.get(id)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    @PostMapping("/workflow")
+    public ResponseEntity<Map<String, Object>> saveWorkflow(
+            @org.springframework.web.bind.annotation.RequestBody
+            org.atmosphere.admin.workflow.WorkflowManifest manifest,
+            HttpServletRequest request) {
+        var guard = guardWrite(request, "workflow.write", manifest.id());
+        if (guard != null) {
+            return guard;
+        }
+        org.atmosphere.admin.workflow.WorkflowController controller = admin.workflowController();
+        if (controller == null) {
+            return ResponseEntity.status(503).body(Map.of(
+                    "error", "Workflow controller not wired"));
+        }
+        try {
+            var saved = controller.save(manifest, resolvePrincipal(request));
+            return ResponseEntity.ok(Map.of(
+                    "id", saved.id(),
+                    "name", saved.name(),
+                    "version", saved.version(),
+                    "updatedAt", saved.updatedAt().toString()));
+        } catch (org.atmosphere.admin.workflow.WorkflowStoreException wse) {
+            if (wse.kind() == org.atmosphere.admin.workflow.WorkflowStoreException.Kind.VERSION_CONFLICT) {
+                return ResponseEntity.status(409).body(Map.of(
+                        "error", wse.getMessage(),
+                        "kind", wse.kind().name()));
+            }
+            return ResponseEntity.status(500).body(Map.of(
+                    "error", wse.getMessage(),
+                    "kind", wse.kind().name()));
+        } catch (IllegalArgumentException iae) {
+            return ResponseEntity.badRequest().body(Map.of("error", iae.getMessage()));
+        } catch (SecurityException se) {
+            return ResponseEntity.status(403).body(Map.of("error", se.getMessage()));
+        }
+    }
+
+    @DeleteMapping("/workflow/{id}")
+    public ResponseEntity<Map<String, Object>> deleteWorkflow(
+            @PathVariable("id") String id,
+            HttpServletRequest request) {
+        var guard = guardWrite(request, "workflow.delete", id);
+        if (guard != null) {
+            return guard;
+        }
+        org.atmosphere.admin.workflow.WorkflowController controller = admin.workflowController();
+        if (controller == null) {
+            return ResponseEntity.status(503).body(Map.of(
+                    "error", "Workflow controller not wired"));
+        }
+        try {
+            controller.delete(id, resolvePrincipal(request));
+            return ResponseEntity.ok(Map.of("deleted", id));
+        } catch (SecurityException se) {
+            return ResponseEntity.status(403).body(Map.of("error", se.getMessage()));
+        }
+    }
+
+    /**
+     * Execute a saved workflow (registre#1). Blocks until the run reaches
+     * its terminal state — approval gates in the manifest park the request's
+     * virtual thread until resolved via the approvals endpoint below or
+     * their timeout expires.
+     */
+    @PostMapping("/workflow/{id}/run")
+    public ResponseEntity<Object> runWorkflow(
+            @PathVariable("id") String id,
+            @org.springframework.web.bind.annotation.RequestParam(value = "coordinator", required = false)
+            String coordinator,
+            @org.springframework.web.bind.annotation.RequestBody(required = false)
+            Map<String, Object> input,
+            HttpServletRequest request) {
+        var guard = guardWrite(request, "workflow.run", id);
+        if (guard != null) {
+            return ResponseEntity.status(guard.getStatusCode()).body(guard.getBody());
+        }
+        org.atmosphere.admin.workflow.WorkflowController controller = admin.workflowController();
+        if (controller == null) {
+            return ResponseEntity.status(503).body(Map.of(
+                    "error", "Workflow controller not wired"));
+        }
+        try {
+            var run = controller.run(id, coordinator,
+                    input != null ? input : Map.of(), resolvePrincipal(request));
+            return ResponseEntity.ok(run);
+        } catch (java.util.NoSuchElementException nse) {
+            return ResponseEntity.status(404).body(Map.of("error", nse.getMessage()));
+        } catch (IllegalStateException ise) {
+            return ResponseEntity.status(503).body(Map.of("error", ise.getMessage()));
+        } catch (IllegalArgumentException iae) {
+            return ResponseEntity.badRequest().body(Map.of("error", iae.getMessage()));
+        } catch (SecurityException se) {
+            return ResponseEntity.status(403).body(Map.of("error", se.getMessage()));
+        }
+    }
+
+    /** Approval gates currently parking a workflow run. */
+    @GetMapping("/workflow/approvals")
+    public ResponseEntity<Object> listWorkflowApprovals() {
+        org.atmosphere.admin.workflow.WorkflowController controller = admin.workflowController();
+        if (controller == null || controller.runner() == null) {
+            return ResponseEntity.status(503).body(Map.of(
+                    "error", "Workflow runner not wired"));
+        }
+        return ResponseEntity.ok(controller.runner().pendingApprovals());
+    }
+
+    /** Resolve a parked approval gate: body {@code {"approve": true|false}}. */
+    @PostMapping("/workflow/approvals/{approvalId}")
+    public ResponseEntity<Object> resolveWorkflowApproval(
+            @PathVariable("approvalId") String approvalId,
+            @org.springframework.web.bind.annotation.RequestBody Map<String, Object> body,
+            HttpServletRequest request) {
+        var guard = guardWrite(request, "workflow.approve", approvalId);
+        if (guard != null) {
+            return ResponseEntity.status(guard.getStatusCode()).body(guard.getBody());
+        }
+        org.atmosphere.admin.workflow.WorkflowController controller = admin.workflowController();
+        if (controller == null) {
+            return ResponseEntity.status(503).body(Map.of(
+                    "error", "Workflow controller not wired"));
+        }
+        var approve = Boolean.TRUE.equals(body.get("approve"));
+        try {
+            var resolved = controller.resolveApproval(approvalId, approve, resolvePrincipal(request));
+            if (!resolved) {
+                return ResponseEntity.status(404).body(Map.of(
+                        "error", "No pending approval: " + approvalId));
+            }
+            return ResponseEntity.ok(Map.of("approvalId", approvalId, "approved", approve));
+        } catch (IllegalStateException ise) {
+            return ResponseEntity.status(503).body(Map.of("error", ise.getMessage()));
+        } catch (SecurityException se) {
+            return ResponseEntity.status(403).body(Map.of("error", se.getMessage()));
+        }
+    }
+
+    private String resolvePrincipal(HttpServletRequest request) {
+        if (request == null) {
+            return null;
+        }
+        var principal = request.getUserPrincipal();
+        if (principal != null && principal.getName() != null && !principal.getName().isBlank()) {
+            return principal.getName();
+        }
+        var attr = request.getAttribute("ai.userId");
+        return attr != null ? attr.toString() : null;
+    }
+
+    // ── Eval Dashboard ──
+
+    @GetMapping("/evals/runs")
+    public ResponseEntity<List<org.atmosphere.admin.evals.EvalRun>> listEvalRuns(
+            @RequestParam(value = "baseline", required = false) String baseline) {
+        org.atmosphere.admin.evals.EvalController controller = admin.evalController();
+        if (controller == null) {
+            return ResponseEntity.ok(List.of());
+        }
+        return ResponseEntity.ok(
+                baseline != null ? controller.listRuns(baseline) : controller.listRuns());
+    }
+
+    @GetMapping("/evals/baselines")
+    public ResponseEntity<List<Map<String, Object>>> baselineSummary() {
+        org.atmosphere.admin.evals.EvalController controller = admin.evalController();
+        if (controller == null) {
+            return ResponseEntity.ok(List.of());
+        }
+        return ResponseEntity.ok(controller.baselineSummary());
+    }
+
+    @GetMapping("/evals/runs/{id}")
+    public ResponseEntity<org.atmosphere.admin.evals.EvalRun> getEvalRun(
+            @PathVariable("id") String id) {
+        org.atmosphere.admin.evals.EvalController controller = admin.evalController();
+        if (controller == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return controller.getRun(id)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    @PostMapping("/evals/runs")
+    public ResponseEntity<Map<String, Object>> recordEvalRun(
+            @org.springframework.web.bind.annotation.RequestBody
+            org.atmosphere.admin.evals.EvalRun run,
+            HttpServletRequest request) {
+        var guard = guardWrite(request, "evals.write", run.baseline());
+        if (guard != null) {
+            return guard;
+        }
+        org.atmosphere.admin.evals.EvalController controller = admin.evalController();
+        if (controller == null) {
+            return ResponseEntity.status(503).body(Map.of(
+                    "error", "Eval controller not wired"));
+        }
+        try {
+            var saved = controller.record(run, resolvePrincipal(request));
+            return ResponseEntity.ok(Map.of(
+                    "id", saved.id(),
+                    "baseline", saved.baseline(),
+                    "passed", saved.passed()));
+        } catch (IllegalArgumentException | IllegalStateException invalid) {
+            return ResponseEntity.badRequest().body(Map.of("error", invalid.getMessage()));
+        } catch (SecurityException se) {
+            return ResponseEntity.status(403).body(Map.of("error", se.getMessage()));
+        }
+    }
+
+    @DeleteMapping("/evals/runs/{id}")
+    public ResponseEntity<Map<String, Object>> deleteEvalRun(
+            @PathVariable("id") String id,
+            HttpServletRequest request) {
+        var guard = guardWrite(request, "evals.delete", id);
+        if (guard != null) {
+            return guard;
+        }
+        org.atmosphere.admin.evals.EvalController controller = admin.evalController();
+        if (controller == null) {
+            return ResponseEntity.status(503).body(Map.of(
+                    "error", "Eval controller not wired"));
+        }
+        try {
+            controller.delete(id, resolvePrincipal(request));
+            return ResponseEntity.ok(Map.of("deleted", id));
+        } catch (SecurityException se) {
+            return ResponseEntity.status(403).body(Map.of("error", se.getMessage()));
+        }
+    }
+
+    // ── Eval flywheel: dataset + online scoring ──
+
+    @GetMapping("/evals/dataset")
+    public ResponseEntity<List<org.atmosphere.admin.evals.EvalCase>> listEvalDataset() {
+        org.atmosphere.admin.evals.EvalController controller = admin.evalController();
+        if (controller == null) {
+            return ResponseEntity.ok(List.of());
+        }
+        return ResponseEntity.ok(controller.listDataset());
+    }
+
+    @GetMapping("/evals/dataset/{id}")
+    public ResponseEntity<org.atmosphere.admin.evals.EvalCase> getEvalCase(
+            @PathVariable("id") String id) {
+        org.atmosphere.admin.evals.EvalController controller = admin.evalController();
+        if (controller == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return controller.getDatasetCase(id)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    @PostMapping("/evals/dataset/promote")
+    public ResponseEntity<Map<String, Object>> promoteEvalCase(
+            @org.springframework.web.bind.annotation.RequestBody Map<String, Object> body,
+            HttpServletRequest request) {
+        var coordinationId = body.get("coordinationId");
+        if (coordinationId == null || coordinationId.toString().isBlank()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "coordinationId is required"));
+        }
+        var guard = guardWrite(request, "evals.write", coordinationId.toString());
+        if (guard != null) {
+            return guard;
+        }
+        org.atmosphere.admin.evals.EvalController controller = admin.evalController();
+        if (controller == null) {
+            return ResponseEntity.status(503).body(Map.of("error", "Eval controller not wired"));
+        }
+        try {
+            var tags = body.get("tags") instanceof List<?> raw
+                    ? raw.stream().map(String::valueOf).toList() : List.<String>of();
+            return controller.promoteFromJournal(coordinationId.toString(), tags,
+                            resolvePrincipal(request))
+                    .<ResponseEntity<Map<String, Object>>>map(c -> ResponseEntity.ok(Map.of(
+                            "id", c.id(), "prompt", c.prompt(), "source", c.source())))
+                    .orElse(ResponseEntity.status(404).body(Map.of(
+                            "error", "coordination has no result to promote (unknown id or no completion)")));
+        } catch (SecurityException se) {
+            return ResponseEntity.status(403).body(Map.of("error", se.getMessage()));
+        } catch (IllegalArgumentException | IllegalStateException invalid) {
+            return ResponseEntity.badRequest().body(Map.of("error", invalid.getMessage()));
+        }
+    }
+
+    @PostMapping("/evals/score")
+    public ResponseEntity<Map<String, Object>> observeLiveTurn(
+            @org.springframework.web.bind.annotation.RequestBody Map<String, Object> body,
+            HttpServletRequest request) {
+        var guard = guardWrite(request, "evals.write", "live");
+        if (guard != null) {
+            return guard;
+        }
+        org.atmosphere.admin.evals.EvalController controller = admin.evalController();
+        if (controller == null) {
+            return ResponseEntity.status(503).body(Map.of("error", "Eval controller not wired"));
+        }
+        var prompt = body.getOrDefault("prompt", "").toString();
+        var response = body.getOrDefault("response", "").toString();
+        try {
+            return controller.observeLive(prompt, response, resolvePrincipal(request))
+                    .<ResponseEntity<Map<String, Object>>>map(run -> ResponseEntity.ok(Map.of(
+                            "scored", true, "id", run.id(), "passed", run.passed())))
+                    .orElse(ResponseEntity.ok(Map.of(
+                            "scored", false,
+                            "reason", controller.liveScoringEnabled() ? "not sampled" : "no live scorer configured")));
+        } catch (SecurityException se) {
+            return ResponseEntity.status(403).body(Map.of("error", se.getMessage()));
+        }
+    }
+
+    /**
+     * Start replaying the curated eval dataset against the live agent —
+     * the "run the evals" half of the flywheel. Body: optional
+     * {@code baseline} (grouping label, default {@code dataset}), {@code tag}
+     * (narrow the dataset to cases carrying the tag) and {@code judgeModel}
+     * (judge model override). Returns 202 with the run id; per-case rows and
+     * the aggregate (row id = run id) surface through the existing
+     * {@code GET /evals/runs?baseline=...} listing as they land.
+     */
+    @PostMapping("/evals/run")
+    public ResponseEntity<Map<String, Object>> runEvalDataset(
+            @org.springframework.web.bind.annotation.RequestBody Map<String, Object> body,
+            HttpServletRequest request) {
+        var baseline = body.getOrDefault("baseline", "dataset").toString();
+        var guard = guardWrite(request, "evals.write", baseline);
+        if (guard != null) {
+            return guard;
+        }
+        org.atmosphere.admin.evals.EvalController controller = admin.evalController();
+        if (controller == null) {
+            return ResponseEntity.status(503).body(Map.of("error", "Eval controller not wired"));
+        }
+        if (!controller.runnerEnabled()) {
+            return ResponseEntity.status(503).body(Map.of(
+                    "error", "Eval runner not wired",
+                    "hint", "requires the atmosphere-ai and atmosphere-ai-test modules on the classpath"));
+        }
+        var tag = body.get("tag") instanceof String s ? s : null;
+        var judgeModel = body.get("judgeModel") instanceof String j ? j : null;
+        try {
+            var started = controller.startRun(
+                    new org.atmosphere.admin.evals.EvalRunner.RunRequest(baseline, tag, judgeModel),
+                    resolvePrincipal(request));
+            return ResponseEntity.accepted().body(Map.of(
+                    "runId", started.runId(),
+                    "baseline", started.baseline(),
+                    "totalCases", started.totalCases(),
+                    "progress", "/api/admin/evals/runs?baseline=" + java.net.URLEncoder.encode(
+                            started.baseline(), java.nio.charset.StandardCharsets.UTF_8)));
+        } catch (SecurityException se) {
+            return ResponseEntity.status(403).body(Map.of("error", se.getMessage()));
+        } catch (IllegalArgumentException iae) {
+            return ResponseEntity.badRequest().body(Map.of("error", iae.getMessage()));
+        } catch (IllegalStateException ise) {
+            // busy (single-flight) or target runtime unavailable — retryable
+            return ResponseEntity.status(409).body(Map.of("error", ise.getMessage()));
+        }
+    }
+
+    // ── Dev Inspector (inner-loop, dev-only) ──
+
+    @GetMapping("/ai/dev/inspector")
+    public ResponseEntity<List<org.atmosphere.ai.devinspector.DevInspectorEntry>> devInspectorRecent(
+            @RequestParam(value = "limit", required = false, defaultValue = "50") int limit) {
+        org.atmosphere.admin.ai.DevInspectorController controller = admin.devInspectorController();
+        if (controller == null) {
+            return ResponseEntity.ok(List.of());
+        }
+        return ResponseEntity.ok(controller.recent(limit));
+    }
+
+    @DeleteMapping("/ai/dev/inspector")
+    public ResponseEntity<Map<String, Object>> devInspectorClear(HttpServletRequest request) {
+        var guard = guardWrite(request, "ai.dev.inspector.clear", "dev-inspector");
+        if (guard != null) {
+            return guard;
+        }
+        org.atmosphere.admin.ai.DevInspectorController controller = admin.devInspectorController();
+        if (controller == null) {
+            return ResponseEntity.status(503).body(Map.of("error", "Dev inspector not wired"));
+        }
+        controller.clear();
+        return ResponseEntity.ok(Map.of("cleared", true));
+    }
+
+    // ── A2A Tasks ──
+
+    @GetMapping("/tasks")
+    public ResponseEntity<List<Map<String, Object>>> listTasks(
+            @RequestParam(value = "contextId", required = false) String contextId) {
+        TaskController controller = admin.taskController();
+        if (controller == null) {
+            return ResponseEntity.ok(List.of());
+        }
+        return ResponseEntity.ok(controller.listTasks(contextId));
+    }
+
+    @GetMapping("/tasks/{taskId}")
+    public ResponseEntity<Map<String, Object>> getTask(@PathVariable("taskId") String taskId) {
+        TaskController controller = admin.taskController();
+        if (controller == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return controller.getTask(taskId)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    // ── AI Runtimes ──
+
+    @GetMapping("/runtimes")
+    public ResponseEntity<List<Map<String, Object>>> listRuntimes() {
+        AiRuntimeController controller = admin.aiRuntimeController();
+        if (controller == null) {
+            return ResponseEntity.ok(List.of());
+        }
+        return ResponseEntity.ok(controller.listRuntimes());
+    }
+
+    @GetMapping("/runtimes/active")
+    public ResponseEntity<Map<String, Object>> getActiveRuntime() {
+        AiRuntimeController controller = admin.aiRuntimeController();
+        if (controller == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok(controller.getActiveRuntime());
+    }
+
+    // ── Governance Policies ──
+
+    @GetMapping("/governance/policies")
+    public ResponseEntity<List<Map<String, Object>>> listGovernancePolicies() {
+        GovernanceController controller = admin.governanceController();
+        if (controller == null) {
+            return ResponseEntity.ok(List.of());
+        }
+        return ResponseEntity.ok(controller.listPolicies());
+    }
+
+    @GetMapping("/governance/summary")
+    public ResponseEntity<Map<String, Object>> governanceSummary() {
+        GovernanceController controller = admin.governanceController();
+        if (controller == null) {
+            return ResponseEntity.ok(Map.of("policyCount", 0, "sources", List.of()));
+        }
+        return ResponseEntity.ok(controller.summary());
+    }
+
+    // ── Validation / plan-and-verify plane ──────────────────────────────
+    // Validation surface backing the console tab. Summary/examples are
+    // read-only; check is write-guarded because verifier-approved plans can
+    // execute application tools. Returns 404 when atmosphere-verifier (and a
+    // PlanAndVerify bean) are absent so the console probe hides the tab.
+
+    @GetMapping("/verifier/summary")
+    public ResponseEntity<Map<String, Object>> verifierSummary() {
+        VerifierController controller = admin.verifierController();
+        if (controller == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok(controller.summary());
+    }
+
+    @GetMapping("/verifier/examples")
+    public ResponseEntity<List<Map<String, Object>>> verifierExamples() {
+        VerifierController controller = admin.verifierController();
+        if (controller == null) {
+            return ResponseEntity.ok(List.of());
+        }
+        return ResponseEntity.ok(controller.examples());
+    }
+
+    /**
+     * Plan + verify a goal and return the plan AST, the per-verifier pass/fail
+     * breakdown, the merged violations, and (on a clean pass) the executed
+     * environment. Guarded like every admin write surface because successful
+     * plans may execute tools; 400 on a missing {@code goal} (Correctness
+     * Invariant #4, Boundary Safety).
+     */
+    @PostMapping("/verifier/check")
+    public ResponseEntity<Map<String, Object>> verifierCheck(
+            HttpServletRequest request,
+            @RequestBody(required = false) Map<String, Object> body) {
+        VerifierController controller = admin.verifierController();
+        if (controller == null) {
+            return ResponseEntity.status(503).body(Map.of("error", "verifier controller not installed"));
+        }
+        var goal = stringField(body, "goal");
+        if (goal == null || goal.isBlank()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "missing 'goal'"));
+        }
+        var denied = guardWrite(request, "verifier.check", goal);
+        if (denied != null) return denied;
+        var principalName = resolvePrincipalName(request);
+        var result = controller.check(goal);
+        admin.auditLog().record(principalName, "verifier.check", goal,
+                !"error".equals(result.get("status")), null);
+        return ResponseEntity.ok(result);
+    }
+
+    /**
+     * Governance plane health snapshot — kill switch state, dry-run counters,
+     * and per-policy hash fingerprints for supply-chain drift detection.
+     * Read-only; no authorizer required.
+     */
+    @GetMapping("/governance/health")
+    public ResponseEntity<Map<String, Object>> governanceHealth() {
+        GovernanceController controller = admin.governanceController();
+        if (controller == null) {
+            return ResponseEntity.ok(Map.of(
+                    "killSwitch", Map.of("armed", false),
+                    "policies", List.of(),
+                    "dryRuns", List.of(),
+                    "slos", List.of()));
+        }
+        return ResponseEntity.ok(controller.healthMap());
+    }
+
+    /**
+     * Hot-reload a policy wrapped in {@code SwappablePolicy}. Request body
+     * carries {@code {swapName, content, format}} — {@code format} is one of
+     * {@code yaml} (default), {@code cedar}, or {@code rego} and selects the
+     * {@code PolicyParser} SPI that parses {@code content}; the legacy
+     * {@code yaml} field is still accepted as the content when {@code content}
+     * is absent. Response carries the outgoing / incoming delegate identity
+     * plus the resolved {@code format}. MUTATING — requires authenticated +
+     * authorized caller at the HTTP layer.
+     *
+     * <p>400 on a malformed artifact, an unknown swap name, or an unknown
+     * {@code format} (fail-closed — no silent YAML fallback); 200 with swap
+     * summary on success.</p>
+     */
+    @PostMapping("/governance/reload")
+    public ResponseEntity<Map<String, Object>> governanceReload(
+            HttpServletRequest request,
+            @RequestBody(required = false) Map<String, Object> body) {
+        GovernanceController controller = admin.governanceController();
+        if (controller == null) {
+            return ResponseEntity.status(503).body(Map.of("error", "governance controller not installed"));
+        }
+        var swapName = stringField(body, "swapName");
+        var denied = guardWrite(request, "governance.reload", swapName);
+        if (denied != null) return denied;
+
+        var format = stringField(body, "format");
+        var content = stringField(body, "content");
+        if (content == null || content.isBlank()) {
+            content = stringField(body, "yaml");
+        }
+        var principalName = resolvePrincipalName(request);
+        try {
+            var result = controller.reloadSwappable(swapName, content,
+                    (format == null || format.isBlank()) ? "yaml" : format);
+            admin.auditLog().record(principalName, "governance.reload", swapName, true, null);
+            return ResponseEntity.ok(result);
+        } catch (IllegalArgumentException e) {
+            admin.auditLog().record(principalName, "governance.reload.invalid",
+                    swapName, false, e.getMessage());
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    /**
+     * Arm the operator kill switch. Request body carries
+     * {@code {reason, operator}} — subsequent turns deny until disarm.
+     * MUTATING — gated by {@code guardWrite}.
+     */
+    @PostMapping("/governance/kill-switch/arm")
+    public ResponseEntity<Map<String, Object>> governanceKillSwitchArm(
+            HttpServletRequest request,
+            @RequestBody(required = false) Map<String, Object> body) {
+        GovernanceController controller = admin.governanceController();
+        if (controller == null) {
+            return ResponseEntity.status(503).body(Map.of("error", "governance controller not installed"));
+        }
+        var reason = stringField(body, "reason");
+        var denied = guardWrite(request, "governance.kill_switch.arm", reason);
+        if (denied != null) return denied;
+
+        var operator = stringField(body, "operator");
+        var principalName = resolvePrincipalName(request);
+        try {
+            var result = controller.armKillSwitch(reason,
+                    operator != null ? operator : principalName);
+            admin.auditLog().record(principalName, "governance.kill_switch.arm",
+                    reason, true, operator);
+            return ResponseEntity.ok(result);
+        } catch (IllegalArgumentException e) {
+            admin.auditLog().record(principalName, "governance.kill_switch.arm.invalid",
+                    reason, false, e.getMessage());
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        } catch (IllegalStateException e) {
+            admin.auditLog().record(principalName, "governance.kill_switch.arm.unavailable",
+                    reason, false, e.getMessage());
+            return ResponseEntity.status(409).body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    /** Disarm the kill switch. No body required. MUTATING — gated by {@code guardWrite}. */
+    @PostMapping("/governance/kill-switch/disarm")
+    public ResponseEntity<Map<String, Object>> governanceKillSwitchDisarm(HttpServletRequest request) {
+        GovernanceController controller = admin.governanceController();
+        if (controller == null) {
+            return ResponseEntity.status(503).body(Map.of("error", "governance controller not installed"));
+        }
+        var denied = guardWrite(request, "governance.kill_switch.disarm", null);
+        if (denied != null) return denied;
+
+        var principalName = resolvePrincipalName(request);
+        try {
+            var result = controller.disarmKillSwitch();
+            admin.auditLog().record(principalName, "governance.kill_switch.disarm",
+                    null, true, null);
+            return ResponseEntity.ok(result);
+        } catch (IllegalStateException e) {
+            admin.auditLog().record(principalName, "governance.kill_switch.disarm.unavailable",
+                    null, false, e.getMessage());
+            return ResponseEntity.status(409).body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    /**
+     * Extract a string field from a loosely-typed JSON body. Returns null
+     * for missing key, null value, or non-string type. Never coerces via
+     * {@code String.valueOf} — a missing field must not become the literal
+     * string {@code "null"} that trips blank-check validation.
+     */
+    private static String stringField(Map<String, Object> body, String key) {
+        if (body == null) return null;
+        var value = body.get(key);
+        if (value instanceof String s && !s.isBlank()) {
+            return s;
+        }
+        return null;
+    }
+
+    /**
+     * Compliance export in the {@code agt verify} schema shape —
+     * cross-framework findings + per-framework coverage counts. External
+     * compliance tooling that already consumes MS's Agent Compliance
+     * package format can round-trip this output.
+     */
+    @GetMapping("/governance/agt-verify")
+    public ResponseEntity<Map<String, Object>> governanceAgtVerify() {
+        GovernanceController controller = admin.governanceController();
+        if (controller == null) {
+            return ResponseEntity.ok(Map.of(
+                    "schemaVersion", "agt-verify/1",
+                    "findings", List.of(),
+                    "summary", Map.of()));
+        }
+        return ResponseEntity.ok(controller.agtVerifyExport());
+    }
+
+    /**
+     * Recent policy decisions (ring-buffered). {@code limit} defaults to 100;
+     * capped at the log's configured capacity. Read-only — no authorizer
+     * guard required.
+     */
+    @GetMapping("/governance/decisions")
+    public ResponseEntity<List<Map<String, Object>>> governanceDecisions(
+            @RequestParam(value = "limit", defaultValue = "100") int limit) {
+        GovernanceController controller = admin.governanceController();
+        if (controller == null) {
+            return ResponseEntity.ok(List.of());
+        }
+        return ResponseEntity.ok(controller.listRecentDecisions(limit));
+    }
+
+    /**
+     * Whether the optional {@code atmosphere-ai} tape package is on the
+     * classpath. Probed once, without force-loading the tape types, so this
+     * always-active admin controller ({@code @ConditionalOnBean(AtmosphereAdmin)})
+     * registers even on samples that don't carry {@code atmosphere-ai} (an
+     * optional starter dependency). A direct reference to a tape type in a
+     * controller method signature would make Spring's {@code getDeclaredMethods}
+     * reflection force-load the tape package at bean registration and crash
+     * those samples with {@link NoClassDefFoundError}. The tape reads live in
+     * {@link TapeAdminSupport}, reached only through the guarded bodies below.
+     */
+    private static final boolean TAPE_ON_CLASSPATH = tapeOnClasspath();
+
+    private static boolean tapeOnClasspath() {
+        try {
+            ClassUtils.forName("org.atmosphere.ai.tape.TapeSupport",
+                    AtmosphereAdminEndpoint.class.getClassLoader());
+            return true;
+        } catch (ClassNotFoundException | LinkageError absent) {
+            return false; // atmosphere-ai not on this sample's classpath
+        }
+    }
+
+    /**
+     * Session tape — list recorded AI runs (newest first), optionally filtered
+     * by {@code tapeId} / {@code status}. Reads the installed
+     * {@link org.atmosphere.ai.tape.TapeStore} via {@link TapeAdminSupport};
+     * returns an empty list when the tape is disabled or {@code atmosphere-ai}
+     * is absent (runtime truth). The tape holds pre-redaction content, so this
+     * endpoint sits behind the content-read-auth gate (see
+     * {@code AtmosphereAdminAutoConfiguration.AdminApiAuthFilter} — Invariant #6).
+     */
+    @GetMapping("/tape/runs")
+    public ResponseEntity<List<Map<String, Object>>> tapeRuns(
+            @RequestParam(value = "tapeId", required = false) String tapeId,
+            @RequestParam(value = "status", required = false) String status,
+            @RequestParam(value = "limit", defaultValue = "100") int limit) {
+        if (!TAPE_ON_CLASSPATH) {
+            return ResponseEntity.ok(List.of());
+        }
+        return ResponseEntity.ok(TapeAdminSupport.runs(tapeId, status, limit));
+    }
+
+    /**
+     * Session tape — the ordered steps of one run, from {@code fromSeq}
+     * (default 0) up to {@code max} (default 500). Pre-redaction content, gated
+     * like {@link #tapeRuns}.
+     */
+    @GetMapping("/tape/runs/{runId}/steps")
+    public ResponseEntity<Map<String, Object>> tapeSteps(
+            @PathVariable("runId") String runId,
+            @RequestParam(value = "fromSeq", defaultValue = "0") long fromSeq,
+            @RequestParam(value = "max", defaultValue = "500") int max) {
+        if (!TAPE_ON_CLASSPATH) {
+            return ResponseEntity.ok(Map.of("runId", runId, "steps", List.of()));
+        }
+        return ResponseEntity.ok(TapeAdminSupport.steps(runId, fromSeq, max));
+    }
+
+    /**
+     * Session tape — deterministically replay a recorded run as a coordination
+     * tree: the run plus its fan-out children (linked by {@code parentRunId}),
+     * reconstructed from the tape with no model in the loop. Pre-redaction
+     * content, gated like {@link #tapeRuns}.
+     */
+    @GetMapping("/tape/runs/{runId}/replay")
+    public ResponseEntity<Map<String, Object>> tapeReplay(@PathVariable("runId") String runId) {
+        if (!TAPE_ON_CLASSPATH) {
+            return ResponseEntity.ok(Map.of("runId", runId, "present", false));
+        }
+        return ResponseEntity.ok(TapeAdminSupport.replay(runId));
+    }
+
+    /**
+     * OWASP Agentic AI Top 10 (Dec 2025) self-assessment. Read-only. Pairs
+     * with the {@code agt verify} CLI payload shape — external compliance
+     * tooling that targets MS's Agent Compliance package can consume this
+     * endpoint as the Atmosphere equivalent evidence source.
+     */
+    @GetMapping("/governance/owasp")
+    public ResponseEntity<Map<String, Object>> governanceOwasp() {
+        GovernanceController controller = admin.governanceController();
+        if (controller == null) {
+            return ResponseEntity.ok(Map.of("framework", "OWASP Agentic AI Top 10 (December 2025)",
+                    "rows", List.of(), "total_rows", 0));
+        }
+        return ResponseEntity.ok(controller.owaspMatrix());
+    }
+
+    /**
+     * Compliance matrices — EU AI Act / HIPAA / SOC2 self-assessments
+     * parallel to the OWASP matrix. Read-only. Returns a map keyed by
+     * framework name ({@code EU_AI_ACT}, {@code HIPAA}, {@code SOC2})
+     * with one matrix per framework in the same shape as {@code /owasp}.
+     */
+    @GetMapping("/governance/compliance")
+    public ResponseEntity<Map<String, Object>> governanceCompliance() {
+        GovernanceController controller = admin.governanceController();
+        if (controller == null) {
+            return ResponseEntity.ok(Map.of());
+        }
+        return ResponseEntity.ok(controller.complianceMatrices());
+    }
+
+    /**
+     * Microsoft Agent Governance Toolkit {@code POST /check}-compatible
+     * decision endpoint. External gateways (Envoy, Kong, Azure APIM)
+     * that already speak to MS's ASGI policy provider can point at
+     * this endpoint to use Atmosphere as the decision service.
+     * Payload: {@code {"agent_id": "...", "action": "...", "context": {...}}}.
+     * Response: {@code {"allowed": bool, "decision": "...", "reason": "...",
+     *                   "matched_policy": "...", "evaluation_ms": N}}.
+     * Read-only — no authorizer guard required (this does not mutate state).
+     */
+    @PostMapping("/governance/check")
+    public ResponseEntity<Map<String, Object>> governanceCheck(@RequestBody(required = false) Map<String, Object> payload) {
+        GovernanceController controller = admin.governanceController();
+        if (controller == null) {
+            // MS /check wire compat — gateways routing on `allowed` keep
+            // working even on deployments that haven't wired the
+            // governance plane. Shape matches the shared
+            // GovernanceController.unconfiguredAllowPayload() helper so
+            // Spring and Quarkus return byte-identical JSON here.
+            return ResponseEntity.ok(GovernanceController.unconfiguredAllowPayload());
+        }
+        return ResponseEntity.ok(controller.check(payload));
+    }
+
+    /**
+     * Signed commitment records emitted by the coordination journal.
+     * Read-only. Operators render this stream as a verifiable audit
+     * trail — each entry carries the Ed25519 proof
+     * scheme / key id / signature so downstream SIEMs can verify
+     * against the publicly-published coordinator key.
+     *
+     * <p>Returns {@link org.atmosphere.admin.coordinator.CommitmentRecordView}
+     * — a typed record rather than a loose {@code Map<String, Object>}
+     * so shape drift surfaces at compile time.</p>
+     */
+    @GetMapping("/governance/commitments")
+    public ResponseEntity<List<org.atmosphere.admin.coordinator.CommitmentRecordView>> governanceCommitments(
+            @RequestParam(value = "limit", defaultValue = "100") int limit) {
+        CoordinatorController controller = admin.coordinatorController();
+        if (controller == null) {
+            return ResponseEntity.ok(List.of());
+        }
+        return ResponseEntity.ok(controller.listCommitmentRecords(limit));
+    }
+
+    // ── MCP Registry ──
+
+    @GetMapping("/mcp/tools")
+    public ResponseEntity<List<Map<String, Object>>> listMcpTools() {
+        McpController controller = admin.mcpController();
+        if (controller == null) {
+            return ResponseEntity.ok(List.of());
+        }
+        return ResponseEntity.ok(controller.listTools());
+    }
+
+    @GetMapping("/mcp/resources")
+    public ResponseEntity<List<Map<String, Object>>> listMcpResources() {
+        McpController controller = admin.mcpController();
+        if (controller == null) {
+            return ResponseEntity.ok(List.of());
+        }
+        return ResponseEntity.ok(controller.listResources());
+    }
+
+    @GetMapping("/mcp/prompts")
+    public ResponseEntity<List<Map<String, Object>>> listMcpPrompts() {
+        McpController controller = admin.mcpController();
+        if (controller == null) {
+            return ResponseEntity.ok(List.of());
+        }
+        return ResponseEntity.ok(controller.listPrompts());
+    }
+
+    // ── Metrics / Observability ──
+
+    @GetMapping("/metrics")
+    public ResponseEntity<Map<String, Object>> metricsSnapshot() {
+        MetricsController controller = admin.metricsController();
+        if (controller == null) {
+            return ResponseEntity.ok(Map.of("error", "Micrometer not on classpath"));
+        }
+        return ResponseEntity.ok(controller.snapshot());
+    }
+
+    @GetMapping("/metrics/all")
+    public ResponseEntity<List<Map<String, Object>>> allMeters() {
+        MetricsController controller = admin.metricsController();
+        if (controller == null) {
+            return ResponseEntity.ok(List.of());
+        }
+        return ResponseEntity.ok(controller.listMeters());
+    }
+
+    // ── Audit Log ──
+
+    @GetMapping("/audit")
+    public List<org.atmosphere.admin.ControlAuditLog.AuditEntry> listAuditEntries(
+            @RequestParam(value = "limit", defaultValue = "100") int limit) {
+        return admin.auditLog().entries(limit);
+    }
+}

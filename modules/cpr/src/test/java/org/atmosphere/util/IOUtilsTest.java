@@ -1,0 +1,122 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.util;
+
+import org.junit.jupiter.api.Test;
+
+import java.io.Closeable;
+import java.io.IOException;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * Created by Romain on 17/03/14.
+ */
+public class IOUtilsTest {
+
+    @Test
+    public void testGetCleanedServletPath() {
+        String testFullPath;
+        String testCleanedPath;
+
+        testFullPath = "/foo/bar/*";
+        testCleanedPath = IOUtils.getCleanedServletPath(testFullPath);
+        assertEquals("/foo/bar", testCleanedPath);
+
+        testFullPath = "foo/bar/**/*";
+        testCleanedPath = IOUtils.getCleanedServletPath(testFullPath);
+        assertEquals("/foo/bar/**", testCleanedPath);
+
+        testFullPath = "/com.zyxabc.abc.Abc/gwtCometEvent*";
+        testCleanedPath = IOUtils.getCleanedServletPath(testFullPath);
+        assertEquals("/com.zyxabc.abc.Abc/gwtCometEvent", testCleanedPath);
+    }
+
+    @Test
+    public void cleanedServletPathWildcardOnly() {
+        assertEquals("", IOUtils.getCleanedServletPath("/*"));
+    }
+
+    @Test
+    public void cleanedServletPathPlain() {
+        assertEquals("/simple", IOUtils.getCleanedServletPath("/simple"));
+    }
+
+    @Test
+    public void cleanedServletPathNoLeadingSlash() {
+        String result = IOUtils.getCleanedServletPath("api/events");
+        assertTrue(result.startsWith("/"));
+    }
+
+    @Test
+    public void isBodyEmptyForEmptyString() {
+        assertTrue(IOUtils.isBodyEmpty(""));
+    }
+
+    @Test
+    public void isBodyEmptyForNonEmptyString() {
+        assertFalse(IOUtils.isBodyEmpty("data"));
+    }
+
+    @Test
+    public void isBodyEmptyForEmptyByteArray() {
+        assertTrue(IOUtils.isBodyEmpty(new Byte[0]));
+    }
+
+    @Test
+    public void isBodyEmptyForNonEmptyByteArray() {
+        assertFalse(IOUtils.isBodyEmpty(new Byte[]{1, 2}));
+    }
+
+    @Test
+    public void loadClassFindsExistingClass() throws Exception {
+        Class<?> clazz = IOUtils.loadClass(IOUtilsTest.class, "java.lang.String");
+        assertNotNull(clazz);
+        assertEquals(String.class, clazz);
+    }
+
+    @Test
+    public void closeHandlesNull() {
+        IOUtils.close((Closeable) null);
+    }
+
+    @Test
+    public void closeHandlesMultipleCloseables() {
+        var c1 = new Closeable() {
+            boolean closed = false;
+            @Override
+            public void close() { closed = true; }
+        };
+        var c2 = new Closeable() {
+            boolean closed = false;
+            @Override
+            public void close() { closed = true; }
+        };
+        IOUtils.close(c1, c2);
+        assertTrue(c1.closed);
+        assertTrue(c2.closed);
+    }
+
+    @Test
+    public void closeSwallowsIOException() {
+        Closeable throwing = () -> { throw new IOException("test"); };
+        IOUtils.close(throwing);
+    }
+
+}

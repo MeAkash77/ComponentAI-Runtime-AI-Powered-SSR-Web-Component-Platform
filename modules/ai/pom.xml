@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <parent>
+        <groupId>org.atmosphere</groupId>
+        <artifactId>atmosphere-project</artifactId>
+        <version>4.0.72-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <modelVersion>4.0.0</modelVersion>
+    <artifactId>atmosphere-ai</artifactId>
+    <packaging>jar</packaging>
+    <name>atmosphere-ai</name>
+    <description>AI/LLM streaming SPI for Atmosphere Framework — shared interfaces for Spring AI, LangChain4j, Embabel, and custom adapters</description>
+    <url>https://github.com/Atmosphere/atmosphere</url>
+
+    <properties>
+        <atmosphere.module.name>org.atmosphere.ai</atmosphere.module.name>
+        <jqwik.version>1.10.1</jqwik.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.atmosphere</groupId>
+            <artifactId>atmosphere-runtime</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>tools.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+        <!-- Used directly (JacksonException, TypeReference), not merely via
+             databind — declared so the compile classpath doesn't lean on a
+             transitive that databind could re-arrange in a future line. -->
+        <dependency>
+            <groupId>tools.jackson.core</groupId>
+            <artifactId>jackson-core</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+        <!--
+            SnakeYAML is the default PolicyParser implementation for the
+            governance policy plane. Declared as an explicit runtime dep
+            because it is NOT transitive on Quarkus / bare-JVM / Jetty-embedded
+            deployments — operators must get the YAML policy loader
+            out-of-the-box on every runtime.
+        -->
+        <dependency>
+            <groupId>org.yaml</groupId>
+            <artifactId>snakeyaml</artifactId>
+        </dependency>
+        <!--
+            Mozilla Rhino backs the optional, default-off in-process 'eval' tool.
+            Declared optional so it does NOT bloat consumers that never enable
+            eval; EvalSupport probes for it at runtime (Class.forName) and reports
+            the tool INACTIVE when absent. Present here so the module compiles and
+            its own tests exercise the sandbox.
+        -->
+        <dependency>
+            <groupId>org.mozilla</groupId>
+            <artifactId>rhino</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <!-- Durable SQLite batch job store. Optional: operators opt in via
+             atmosphere.ai.batch.db; without the driver the store fails fast
+             at construction (the default-off endpoint stays unregistered). -->
+        <dependency>
+            <groupId>org.xerial</groupId>
+            <artifactId>sqlite-jdbc</artifactId>
+            <version>3.53.2.0</version>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>${mockito.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>jakarta.servlet</groupId>
+            <artifactId>jakarta.servlet-api</artifactId>
+            <version>${jakarta-servlet-api.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-core</artifactId>
+            <scope>provided</scope>
+            <optional>true</optional>
+        </dependency>
+
+        <!--
+            OpenTelemetry SDK is TEST-scope ONLY. GenAiTracer reflects against
+            io.opentelemetry.api at runtime (no hard main-scope OTel dep, mirroring
+            GovernanceTracer); these artifacts let GenAiTracerTest install a real
+            SdkTracerProvider + InMemorySpanExporter and assert the emitted span
+            attributes. Pinned to the managed opentelemetry-api version.
+        -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk</artifactId>
+            <version>${opentelemetry-api.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk-testing</artifactId>
+            <version>${opentelemetry-api.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>${logback-version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!--
+            jqwik drives the generative (property-based) wire-parsing tests (the
+            *PropertyTest suites). The adversarial example-based suites pin the
+            specific malformed frames we have already seen; the property tests
+            search the input space around them for the ones we have not. Test
+            scope only — no consumer of atmosphere-ai sees this on its classpath.
+
+            jqwik runs on the JUnit 5 platform alongside Jupiter (both engines
+            are discovered by Surefire), and re-runs any falsified property with
+            its recorded seed, so a CI failure reproduces locally verbatim.
+        -->
+        <dependency>
+            <groupId>net.jqwik</groupId>
+            <artifactId>jqwik</artifactId>
+            <version>${jqwik.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>

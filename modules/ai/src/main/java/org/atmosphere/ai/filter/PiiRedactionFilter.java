@@ -1,0 +1,193 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.ai.filter;
+
+import org.atmosphere.ai.DefaultStreamingSession;
+import org.atmosphere.cpr.RawMessage;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
+
+/**
+ * {@link AiStreamBroadcastFilter} that detects and redacts PII (email, phone, SSN,
+ * credit card) from AI streaming text streams. Buffers streaming texts per session
+ * until a sentence boundary, then scans and redacts before emitting. Custom patterns
+ * can be added via {@link #addPattern(String, Pattern)}.
+ */
+public class PiiRedactionFilter extends AiStreamBroadcastFilter {
+
+    private static final Logger logger = LoggerFactory.getLogger(PiiRedactionFilter.class);
+
+    private static final String DEFAULT_REPLACEMENT = "[REDACTED]";
+
+    // Sentence boundary detection
+    private static final Pattern SENTENCE_BOUNDARY = Pattern.compile("[.!?\\n]");
+
+    // Default PII patterns — the canonical definitions live in PiiPatterns so
+    // every redaction surface (this stream filter, the tape redactor) shares
+    // one source instead of drifting per consumer.
+    private static final Pattern EMAIL_PATTERN = PiiPatterns.EMAIL;
+    private static final Pattern US_PHONE_PATTERN = PiiPatterns.US_PHONE;
+    private static final Pattern SSN_PATTERN = PiiPatterns.SSN;
+    private static final Pattern CREDIT_CARD_PATTERN = PiiPatterns.CREDIT_CARD;
+
+    private final Map<String, Pattern> patterns = new LinkedHashMap<>();
+    private final ConcurrentHashMap<String, StringBuffer> buffers = new ConcurrentHashMap<>();
+    private final String replacement;
+
+    /**
+     * Create a filter with default PII patterns and "[REDACTED]" replacement text.
+     */
+    public PiiRedactionFilter() {
+        this(DEFAULT_REPLACEMENT);
+    }
+
+    /**
+     * Create a filter with default PII patterns and a custom replacement string.
+     *
+     * @param replacement the text to substitute for detected PII
+     */
+    public PiiRedactionFilter(String replacement) {
+        this.replacement = replacement;
+        patterns.put("email", EMAIL_PATTERN);
+        patterns.put("us-phone", US_PHONE_PATTERN);
+        patterns.put("ssn", SSN_PATTERN);
+        patterns.put("credit-card", CREDIT_CARD_PATTERN);
+    }
+
+    /**
+     * Add a custom PII pattern.
+     *
+     * @param name    a descriptive name for the pattern (for logging)
+     * @param pattern the regex pattern to match
+     * @return this filter for chaining
+     */
+    public PiiRedactionFilter addPattern(String name, Pattern pattern) {
+        patterns.put(name, pattern);
+        return this;
+    }
+
+    /**
+     * Remove a pattern by name.
+     *
+     * @param name the pattern name to remove
+     * @return this filter for chaining
+     */
+    public PiiRedactionFilter removePattern(String name) {
+        patterns.remove(name);
+        return this;
+    }
+
+    @Override
+    protected BroadcastAction filterAiMessage(
+            String broadcasterId, AiStreamMessage msg, String originalJson, RawMessage rawMessage) {
+
+        if (msg.isStreamingText() && msg.data() != null) {
+            return handleStreamingText(msg);
+        }
+
+        if (msg.isComplete() || msg.isError()) {
+            return handleStreamEnd(broadcasterId, msg, rawMessage);
+        }
+
+        // Pass through metadata, progress
+        return new BroadcastAction(rawMessage);
+    }
+
+    private BroadcastAction handleStreamingText(AiStreamMessage msg) {
+        var buffer = buffers.computeIfAbsent(msg.sessionId(), k -> new StringBuffer());
+        buffer.append(msg.data());
+
+        // Check for sentence boundary
+        if (SENTENCE_BOUNDARY.matcher(msg.data()).find()) {
+            var sentence = buffer.toString();
+            buffer.setLength(0);
+
+            var redacted = redact(sentence);
+            if (!redacted.equals(sentence)) {
+                logger.debug("PII redacted in session {}", msg.sessionId());
+            }
+
+            var modified = msg.withData(redacted);
+            return new BroadcastAction(new RawMessage(modified.toJson()));
+        }
+
+        // Buffer the streaming text — ABORT so it doesn't reach the client yet
+        return new BroadcastAction(BroadcastAction.ACTION.ABORT, rawMessageFor(msg));
+    }
+
+    private BroadcastAction handleStreamEnd(String broadcasterId, AiStreamMessage msg, RawMessage rawMessage) {
+        var buffer = buffers.remove(msg.sessionId());
+        if (buffer != null && !buffer.isEmpty()) {
+            var redacted = redact(buffer.toString());
+            var streamingTextMsg = new AiStreamMessage("streaming-text", redacted, msg.sessionId(), msg.seq(), null, null);
+
+            // Emit the flushed streaming text as a proper "streaming-text" message to maintain protocol
+            // invariant: all text arrives as "streaming-text" type, "complete" is always bare.
+            // Bump the terminal message's seq to seq+1 so it doesn't collide with the
+            // synthetic flush streaming text and the monotonic sequence invariant is preserved.
+            var bumpedTerminal = msg.withSeq(msg.seq() + 1);
+            deferBroadcast(broadcasterId, msg.sessionId(), new RawMessage(bumpedTerminal.toJson()));
+            return new BroadcastAction(new RawMessage(streamingTextMsg.toJson()));
+        }
+        return new BroadcastAction(rawMessage);
+    }
+
+    private void deferBroadcast(String broadcasterId, String sessionId, RawMessage message) {
+        var factory = broadcasterFactory();
+        Thread.ofVirtual().name("pii-flush").start(() -> {
+            try {
+                // Wait for the current filter chain to complete and deliver the flushed streaming text
+                Thread.sleep(50);
+                if (factory != null) {
+                    factory.findBroadcaster(broadcasterId).ifPresent(b -> {
+                        var target = DefaultStreamingSession.resourceForSession(sessionId);
+                        if (target.isPresent()) {
+                            b.broadcast(message, Set.of(target.get()));
+                        } else {
+                            b.broadcast(message);
+                        }
+                    });
+                }
+            } catch (Exception e) {
+                logger.warn("Failed to emit deferred stream-end message: {}", e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * Apply all PII patterns to the input text.
+     *
+     * @param text the text to scan
+     * @return the text with PII replaced
+     */
+    String redact(String text) {
+        var result = text;
+        for (var entry : patterns.entrySet()) {
+            result = entry.getValue().matcher(result).replaceAll(replacement);
+        }
+        return result;
+    }
+
+    private static RawMessage rawMessageFor(AiStreamMessage msg) {
+        return new RawMessage(msg.toJson());
+    }
+}

@@ -1,0 +1,160 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.ai;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.HashSet;
+import java.util.Set;
+
+/**
+ * {@link StreamingSession} decorator that intercepts streamed LLM output,
+ * extracts structured fields progressively via
+ * {@link StructuredOutputParser#parseField}, and emits
+ * {@link AiEvent.StructuredField}, {@link AiEvent.EntityStart}, and
+ * {@link AiEvent.EntityComplete} events.
+ *
+ * <p>Follows the same wrapping pattern as {@link GuardrailCapturingSession}
+ * and {@link MemoryCapturingSession}.</p>
+ */
+class StructuredOutputCapturingSession extends DelegatingStreamingSession {
+
+    private static final Logger logger = LoggerFactory.getLogger(
+            StructuredOutputCapturingSession.class);
+    private static final int PARSE_INTERVAL = 100;
+
+    /**
+     * Metadata key sent when the declared structured type could not be
+     * parsed from the completed response — the caller's signal that the
+     * missing {@code EntityComplete} is a parse failure, not an
+     * intentionally empty answer.
+     */
+    static final String PARSE_FAILED_METADATA_KEY = "ai.structured.parse_failed";
+
+    private final StructuredOutputParser parser;
+    private final Class<?> responseType;
+    private final StringBuilder accumulated = new StringBuilder();
+    private final Set<String> emittedFields = new HashSet<>();
+    private int lastParsedLength;
+    private boolean entityStarted;
+
+    StructuredOutputCapturingSession(StreamingSession delegate,
+                                     StructuredOutputParser parser,
+                                     Class<?> responseType) {
+        super(delegate);
+        this.parser = parser;
+        this.responseType = responseType;
+    }
+
+    @Override
+    public void send(String text) {
+        delegate.send(text);
+        accumulated.append(text);
+        attemptFieldParse();
+    }
+
+    @Override
+    public void sendContent(Content content) {
+        // Text variants feed the progressive field parser just like send().
+        // Binary variants have no structured-output projection — forward
+        // them to the delegate so the leaf session emits the binary frame
+        // without poisoning the parser's accumulated JSON buffer.
+        if (content instanceof Content.Text text) {
+            send(text.text());
+            return;
+        }
+        delegate.sendContent(content);
+    }
+
+    @Override
+    public void emit(AiEvent event) {
+        delegate.emit(event);
+        if (event instanceof AiEvent.TextDelta delta) {
+            accumulated.append(delta.text());
+            attemptFieldParse();
+        }
+    }
+
+    @Override
+    public void complete() {
+        emitEntity();
+        delegate.complete();
+    }
+
+    @Override
+    public void complete(String summary) {
+        emitEntity();
+        delegate.complete(summary);
+    }
+
+    private void attemptFieldParse() {
+        if (accumulated.length() - lastParsedLength < PARSE_INTERVAL) {
+            return;
+        }
+        lastParsedLength = accumulated.length();
+
+        try {
+            var field = parser.parseField(accumulated.toString(), responseType);
+            if (field.isPresent()) {
+                var entry = field.get();
+                if (emittedFields.add(entry.getKey())) {
+                    if (!entityStarted) {
+                        entityStarted = true;
+                        delegate.emit(new AiEvent.EntityStart(
+                                responseType.getSimpleName(),
+                                parser.schemaInstructions(responseType)));
+                    }
+                    var schemaType = entry.getValue() != null
+                            ? entry.getValue().getClass().getSimpleName().toLowerCase()
+                            : "string";
+                    delegate.emit(new AiEvent.StructuredField(
+                            entry.getKey(), entry.getValue(), schemaType));
+                }
+            }
+        } catch (Exception e) {
+            logger.trace("Progressive field parse attempt failed", e);
+        }
+    }
+
+    private void emitEntity() {
+        if (accumulated.isEmpty()) {
+            return;
+        }
+        try {
+            if (!entityStarted) {
+                delegate.emit(new AiEvent.EntityStart(
+                        responseType.getSimpleName(),
+                        parser.schemaInstructions(responseType)));
+            }
+            var entity = parser.parse(accumulated.toString(), responseType);
+            delegate.emit(new AiEvent.EntityComplete(
+                    responseType.getSimpleName(), entity));
+        } catch (Exception e) {
+            // A swallowed parse failure is indistinguishable from a model
+            // that legitimately returned nothing: send a metadata breadcrumb
+            // before the terminal frame so the caller can tell the two
+            // apart, and log at WARN — the declared responseType was not
+            // honored. Metadata (not an Error event) keeps the turn's
+            // terminal semantics: the text stream itself succeeded, and the
+            // StreamingSession default maps Error events to a hard error().
+            logger.warn("Structured output parsing failed for type {}",
+                    responseType.getSimpleName(), e);
+            delegate.sendMetadata(PARSE_FAILED_METADATA_KEY,
+                    responseType.getSimpleName() + ": " + e.getMessage());
+        }
+    }
+}

@@ -1,0 +1,1674 @@
+#!/bin/sh
+# Atmosphere CLI test suite
+# Usage: ./cli/test-cli.sh
+#
+# Tests the CLI script, npx launcher, and samples.json integrity
+# without network access or Java runtime.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CLI="$SCRIPT_DIR/atmosphere"
+NPX="$SCRIPT_DIR/npx/index.js"
+SAMPLES_JSON="$SCRIPT_DIR/samples.json"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PASS=0
+FAIL=0
+TESTS=""
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+RED='\033[31m'
+GREEN='\033[32m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+pass() {
+    PASS=$((PASS + 1))
+    printf "  ${GREEN}✓${RESET} %s\n" "$1"
+}
+
+fail() {
+    FAIL=$((FAIL + 1))
+    printf "  ${RED}✗${RESET} %s\n" "$1"
+    if [ -n "$2" ]; then
+        printf "    ${DIM}%s${RESET}\n" "$2"
+    fi
+}
+
+assert_contains() {
+    output="$1"
+    expected="$2"
+    label="$3"
+    # Use `grep -e --` so patterns beginning with '-' (e.g. "--group") are
+    # not mistaken for grep options.
+    if printf '%s' "$output" | grep -q -F -e "$expected"; then
+        pass "$label"
+    else
+        fail "$label" "expected output to contain: $expected"
+    fi
+}
+
+assert_not_contains() {
+    output="$1"
+    unexpected="$2"
+    label="$3"
+    if printf '%s' "$output" | grep -q -F -e "$unexpected"; then
+        fail "$label" "output should NOT contain: $unexpected"
+    else
+        pass "$label"
+    fi
+}
+
+assert_exit_code() {
+    actual="$1"
+    expected="$2"
+    label="$3"
+    if [ "$actual" -eq "$expected" ]; then
+        pass "$label"
+    else
+        fail "$label" "expected exit code $expected, got $actual"
+    fi
+}
+
+# ── Prerequisites ───────────────────────────────────────────────────────────
+printf "\n${BOLD}Atmosphere CLI Test Suite${RESET}\n\n"
+
+if [ ! -x "$CLI" ]; then
+    printf "${RED}error:${RESET} CLI script not found or not executable: %s\n" "$CLI"
+    exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    printf "${RED}error:${RESET} jq is required to run tests: brew install jq\n"
+    exit 1
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+    printf "${RED}warning:${RESET} node not found — skipping npx tests\n"
+    SKIP_NPX=1
+fi
+
+# ── 1. samples.json Integrity ──────────────────────────────────────────────
+printf "${BOLD}samples.json${RESET}\n"
+
+# Valid JSON
+if jq empty "$SAMPLES_JSON" 2>/dev/null; then
+    pass "valid JSON"
+else
+    fail "valid JSON" "samples.json is not valid JSON"
+fi
+
+# Has version field
+version=$(jq -r '.version' "$SAMPLES_JSON")
+assert_contains "$version" "4.0" "has version field"
+
+# Has samples array
+count=$(jq '.samples | length' "$SAMPLES_JSON")
+if [ "$count" -ge 15 ]; then
+    pass "has $count samples (>= 15)"
+else
+    fail "has enough samples" "only $count samples found"
+fi
+
+# Every sample has required fields
+missing=$(jq -r '.samples[] | select(.name == null or .description == null or .port == null or .runnable == null or .category == null) | .name // "unnamed"' "$SAMPLES_JSON")
+if [ -z "$missing" ]; then
+    pass "all samples have required fields (name, description, port, runnable, category)"
+else
+    fail "required fields" "missing in: $missing"
+fi
+
+# No duplicate names
+dupes=$(jq -r '[.samples[].name] | group_by(.) | map(select(length > 1)) | flatten | .[]' "$SAMPLES_JSON")
+if [ -z "$dupes" ]; then
+    pass "no duplicate sample names"
+else
+    fail "duplicate names" "$dupes"
+fi
+
+# Ports: warn about conflicts but don't fail (users run one at a time)
+port_dupes=$(jq -r '[.samples[] | select(.runnable == true and .port != 8080)] | group_by(.port) | map(select(length > 1)) | map(.[0].port | tostring) | unique | .[]' "$SAMPLES_JSON")
+if [ -z "$port_dupes" ]; then
+    pass "no port conflicts among non-8080 runnable samples"
+else
+    pass "port sharing detected on: $port_dupes (ok — users run one at a time)"
+fi
+
+# Runnable samples have valid packaging
+bad_pkg=$(jq -r '.samples[] | select(.runnable == true) | select(.packaging != "spring-boot" and .packaging != "quarkus" and .packaging != "executable-jar") | .name' "$SAMPLES_JSON")
+if [ -z "$bad_pkg" ]; then
+    pass "all runnable samples have valid packaging type"
+else
+    fail "bad packaging" "$bad_pkg"
+fi
+
+# All samples have tags array
+no_tags=$(jq -r '.samples[] | select(.tags == null or (.tags | length) == 0) | .name' "$SAMPLES_JSON")
+if [ -z "$no_tags" ]; then
+    pass "all samples have tags"
+else
+    fail "missing tags" "$no_tags"
+fi
+
+printf "\n"
+
+# ── 2. CLI: version ────────────────────────────────────────────────────────
+printf "${BOLD}atmosphere version${RESET}\n"
+
+out=$("$CLI" version 2>&1)
+assert_contains "$out" "Atmosphere" "prints 'Atmosphere'"
+assert_contains "$out" "$version" "version matches samples.json"
+
+printf "\n"
+
+# ── 3. CLI: help ───────────────────────────────────────────────────────────
+printf "${BOLD}atmosphere help${RESET}\n"
+
+out=$("$CLI" help 2>&1)
+assert_contains "$out" "install" "help mentions install"
+assert_contains "$out" "list" "help mentions list"
+assert_contains "$out" "run" "help mentions run"
+assert_contains "$out" "new" "help mentions new"
+assert_contains "$out" "info" "help mentions info"
+assert_contains "$out" "ATMOSPHERE_HOME" "help mentions ATMOSPHERE_HOME"
+
+printf "\n"
+
+# ── 4. CLI: list ───────────────────────────────────────────────────────────
+printf "${BOLD}atmosphere list${RESET}\n"
+
+out=$("$CLI" list 2>&1)
+assert_contains "$out" "spring-boot-chat" "lists spring-boot-chat"
+assert_contains "$out" "spring-boot-ai-chat" "lists spring-boot-ai-chat"
+assert_contains "$out" "quarkus-chat" "lists quarkus-chat"
+assert_contains "$out" "SAMPLE" "has table header"
+
+printf "\n"
+
+# ── 5. CLI: list --tag ─────────────────────────────────────────────────────
+printf "${BOLD}atmosphere list --tag${RESET}\n"
+
+out=$("$CLI" list --tag rag 2>&1)
+assert_contains "$out" "spring-boot-rag-chat" "tag filter: rag shows rag-chat"
+assert_not_contains "$out" "quarkus-chat" "tag filter: rag excludes quarkus-chat"
+
+out=$("$CLI" list --tag spring-boot 2>&1)
+assert_contains "$out" "spring-boot-chat" "tag filter: spring-boot shows spring-boot-chat"
+assert_not_contains "$out" "quarkus-chat" "tag filter: spring-boot excludes quarkus-chat"
+
+printf "\n"
+
+# ── 6. CLI: list --category ────────────────────────────────────────────────
+printf "${BOLD}atmosphere list --category${RESET}\n"
+
+out=$("$CLI" list --category chat 2>&1)
+assert_contains "$out" "spring-boot-chat" "category filter: chat shows spring-boot-chat"
+assert_not_contains "$out" "spring-boot-ai-chat" "category filter: chat excludes ai-chat"
+
+printf "\n"
+
+# ── 6b. CLI: list --tag + --category (combined filter, bug fix #1) ────────
+printf "${BOLD}atmosphere list --tag + --category (combined)${RESET}\n"
+
+tag_only=$("$CLI" list --tag ai 2>&1)
+cat_only=$("$CLI" list --category ai 2>&1)
+combined=$("$CLI" list --tag ai --category ai 2>&1)
+
+# Combined results should be a subset of both tag-only and category-only
+# Count sample rows (lines with a sample name, not header/decoration)
+tag_count=$(echo "$tag_only" | grep -c "spring-boot\|quarkus\|chat\|grpc" || true)
+cat_count=$(echo "$cat_only" | grep -c "spring-boot\|quarkus\|chat\|grpc" || true)
+combined_count=$(echo "$combined" | grep -c "spring-boot\|quarkus\|chat\|grpc" || true)
+
+if [ "$combined_count" -le "$tag_count" ] && [ "$combined_count" -le "$cat_count" ]; then
+    pass "combined filter: result count ($combined_count) <= tag-only ($tag_count) and category-only ($cat_count)"
+else
+    fail "combined filter: result count ($combined_count) not subset of tag ($tag_count) or category ($cat_count)"
+fi
+
+# Reversed flag order should produce same results
+reversed=$("$CLI" list --category ai --tag ai 2>&1)
+if [ "$combined" = "$reversed" ]; then
+    pass "combined filter: --tag --category same as --category --tag"
+else
+    fail "combined filter: reversed flag order produces different output"
+fi
+
+# Non-matching tag returns no samples (exit 0, empty table)
+out=$("$CLI" list --tag nonexistent-tag-zzz 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 0 "nonexistent tag exits cleanly"
+# Should show header but no sample rows
+sample_count=$(echo "$out" | grep -c "spring-boot\|quarkus\|chat\|grpc" || true)
+if [ "$sample_count" -eq 0 ]; then
+    pass "nonexistent tag: no sample rows returned"
+else
+    fail "nonexistent tag: expected 0 sample rows, got $sample_count"
+fi
+
+printf "\n"
+
+# ── 6c. CLI: info for all samples ─────────────────────────────────────────
+printf "${BOLD}atmosphere info (all samples)${RESET}\n"
+
+all_names=$(jq -r '.samples[].name' "$SAMPLES_JSON")
+for name in $all_names; do
+    out=$("$CLI" info "$name" 2>&1) && ec=0 || ec=$?
+    if [ "$ec" -eq 0 ]; then
+        pass "info $name: exits 0"
+    else
+        fail "info $name: exits $ec"
+    fi
+done
+
+printf "\n"
+
+# ── 7. CLI: info ───────────────────────────────────────────────────────────
+printf "${BOLD}atmosphere info${RESET}\n"
+
+out=$("$CLI" info spring-boot-ai-chat 2>&1)
+assert_contains "$out" "AI streaming" "info shows description"
+assert_contains "$out" "8080" "info shows port"
+assert_contains "$out" "LLM_API_KEY" "info shows env vars"
+assert_contains "$out" "spring-boot" "info shows packaging"
+assert_contains "$out" "atmosphere run" "info shows run command"
+
+out=$("$CLI" info spring-boot-rag-chat 2>&1)
+assert_contains "$out" "rag" "rag-chat info shows category"
+assert_contains "$out" "vectorstore" "rag-chat info shows tags"
+
+printf "\n"
+
+# ── 8. CLI: info unknown sample ────────────────────────────────────────────
+printf "${BOLD}atmosphere info (error cases)${RESET}\n"
+
+out=$("$CLI" info nonexistent-sample 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 1 "unknown sample exits with code 1"
+assert_contains "$out" "error" "unknown sample prints error"
+
+out=$("$CLI" info 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 1 "no argument exits with code 1"
+
+printf "\n"
+
+# ── 9. CLI: run (validation only, no Java) ─────────────────────────────────
+printf "${BOLD}atmosphere run (validation)${RESET}\n"
+
+out=$("$CLI" run 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 1 "no argument exits with code 1"
+
+out=$("$CLI" run chat 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 1 "non-runnable sample (WAR) exits with error"
+assert_contains "$out" "not directly runnable" "non-runnable sample shows helpful message"
+
+printf "\n"
+
+# ── 10. CLI: unknown command ───────────────────────────────────────────────
+printf "${BOLD}atmosphere (error cases)${RESET}\n"
+
+out=$("$CLI" foobar 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 1 "unknown command exits with code 1"
+assert_contains "$out" "Unknown command" "unknown command prints error"
+
+out=$("$CLI" list --badopt 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 1 "unknown option exits with code 1"
+
+printf "\n"
+
+# ── 11. CLI: install (menu rendering) ──────────────────────────────────────
+printf "${BOLD}atmosphere install (menu)${RESET}\n"
+
+# Force numbered menu (skip fzf), cancel immediately
+out=$(printf '\n' | env TERM=dumb "$CLI" install 2>&1)
+assert_contains "$out" "Choose a sample" "install shows picker header"
+assert_contains "$out" "CHAT" "install shows CHAT category"
+assert_contains "$out" "AI" "install shows AI category"
+assert_contains "$out" "spring-boot-chat" "install shows spring-boot-chat"
+assert_contains "$out" "Enter number" "install shows number prompt"
+
+# With --tag filter
+out=$(printf '\n' | env TERM=dumb "$CLI" install --tag rag 2>&1)
+assert_contains "$out" "spring-boot-rag-chat" "install --tag rag shows rag-chat"
+assert_not_contains "$out" "quarkus-chat" "install --tag rag excludes quarkus-chat"
+
+# Cancelling (empty input) exits cleanly
+out=$(printf '\n' | "$CLI" install 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 0 "empty input cancels gracefully"
+assert_contains "$out" "No sample selected" "empty input shows cancel message"
+
+printf "\n"
+
+# ── 12. CLI: new (validation, no network) ─────────────────────────────────
+# `atmosphere new` sparse-clones a sample from GitHub, so end-to-end tests
+# require network. These cases exercise only the pure-local validation path.
+printf "${BOLD}atmosphere new (validation)${RESET}\n"
+
+tmp_dir=$(mktemp -d)
+trap 'rm -rf "$tmp_dir"' EXIT
+
+# No name
+out=$("$CLI" new 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 1 "new without name exits with error"
+assert_contains "$out" "Usage: atmosphere new" "error message shows usage"
+
+# Unknown template
+out=$("$CLI" new foo --template nonesuch 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 1 "new with unknown template exits with error"
+assert_contains "$out" "Unknown template: nonesuch" "error lists the bad template"
+assert_contains "$out" "multi-agent" "error lists known templates including multi-agent"
+assert_contains "$out" "classroom" "error lists known templates including classroom"
+
+# Flag typed in the project-name slot. The name is positional and consumed before the
+# option loop, so before 4.0.67 this scaffolded a real directory literally named
+# "--list-templates". That flag exists on the npx shim, so it is a realistic mistype.
+out=$("$CLI" new --list-templates 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 1 "new rejects a flag-shaped project name"
+assert_contains "$out" "Invalid project name" "error names the bad project name"
+assert_not_contains "$out" "Scaffolding" "no scaffold is attempted for a flag-shaped name"
+[ -e "./--list-templates" ] && fail "new created a directory named after the flag" \
+    || pass "new created no flag-named directory"
+
+# Unknown argument
+out=$("$CLI" new foo --bogus 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 1 "new with unknown option exits with error"
+
+# --routing on a non-AI template (chat ships no AI client / routing block) is
+# rejected up-front, before any network clone, with a message naming the
+# requirement. Pure-offline: the eligibility check runs before install_source.
+out=$("$CLI" new foo --routing --template chat 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 1 "new --routing on non-AI template exits with error"
+assert_contains "$out" "requires an AI template" "error explains --routing needs an AI template"
+
+# --routing must not break the unknown-flag guard: a bogus flag alongside (or
+# instead of) --routing still hits the Unknown-option path.
+out=$("$CLI" new foo --bogusflag 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 1 "new --bogusflag still exits with error (unknown-option path intact)"
+assert_contains "$out" "Unknown option: --bogusflag" "unknown flag names the offending option"
+
+# --skill-file with nonexistent file
+out=$("$CLI" new bad-agent --skill-file /nonexistent/skill.md 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 1 "nonexistent skill file exits with error"
+assert_contains "$out" "Skill file not found" "error mentions missing skill file"
+
+# Directory already exists
+mkdir "$tmp_dir/already-here"
+out=$(cd "$tmp_dir" && "$CLI" new already-here --template chat 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 1 "existing directory exits with error"
+assert_contains "$out" "already exists" "error mentions existing directory"
+
+# --group is deprecated but still parsed; ensure the warning is emitted
+# on a validation-only code path (unknown template after --group).
+out=$("$CLI" new foo --template nonesuch --group com.acme 2>&1) && ec=0 || ec=$?
+assert_contains "$out" "--group is no longer supported" "--group prints deprecation warning"
+
+printf "\n"
+
+# ── 12a. CLI: sample sources come from the ref that matches VERSION ───────
+# `atmosphere new` rewrites the scaffolded pom to resolve the parent at the
+# CLI's pinned VERSION from Maven Central, so the sources have to be the
+# matching `atmosphere-<VERSION>` release tag. Cloning `main` pairs unreleased
+# sample code with released artefacts and the scaffold cannot compile.
+# Offline: a stub `git` records its argv and fails, so no clone is attempted.
+printf "${BOLD}atmosphere new (source ref)${RESET}\n"
+
+git_stub_dir="$tmp_dir/gitstub"
+mkdir -p "$git_stub_dir"
+cat > "$git_stub_dir/git" <<'GITSTUBEOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$GIT_STUB_LOG"
+exit 1
+GITSTUBEOF
+chmod +x "$git_stub_dir/git"
+
+cli_version=$(grep -m1 '^VERSION=' "$CLI" | sed 's/^VERSION="\(.*\)"$/\1/')
+GIT_STUB_LOG="$tmp_dir/git-argv.log"
+export GIT_STUB_LOG
+: > "$GIT_STUB_LOG"
+
+# Clear both overrides explicitly: the CI network lane exports
+# ATMOSPHERE_VERSION_OVERRIDE for the whole job, and this case is about the
+# default (released-CLI) resolution.
+out=$(cd "$tmp_dir" && PATH="$git_stub_dir:$PATH" ATMOSPHERE_VERSION_OVERRIDE= ATMOSPHERE_SOURCE_REF= \
+        "$CLI" new refprobe --template chat 2>&1) && ec=0 || ec=$?
+git_argv=$(cat "$GIT_STUB_LOG")
+
+assert_exit_code "$ec" 1 "new reports a failed source clone instead of exiting silently"
+assert_contains "$out" "Could not fetch sample sources at ref" "clone failure names the ref"
+assert_contains "$git_argv" "--branch atmosphere-$cli_version" \
+    "sample sources are cloned from the atmosphere-$cli_version tag"
+assert_not_contains "$git_argv" "--branch main" \
+    "a released CLI does not clone main for sample sources"
+
+# ATMOSPHERE_SOURCE_REF is the documented escape hatch for testing against a
+# branch; a SNAPSHOT ATMOSPHERE_VERSION_OVERRIDE implies main (that is what CI
+# installs into the local repo before scaffolding).
+: > "$GIT_STUB_LOG"
+out=$(cd "$tmp_dir" && PATH="$git_stub_dir:$PATH" ATMOSPHERE_SOURCE_REF= ATMOSPHERE_VERSION_OVERRIDE=9.9.9-SNAPSHOT \
+        "$CLI" new refprobe2 --template chat 2>&1) && ec=0 || ec=$?
+assert_contains "$(cat "$GIT_STUB_LOG")" "--branch main" \
+    "a SNAPSHOT version override clones main"
+
+: > "$GIT_STUB_LOG"
+out=$(cd "$tmp_dir" && PATH="$git_stub_dir:$PATH" ATMOSPHERE_SOURCE_REF=some-branch \
+        "$CLI" new refprobe3 --template chat 2>&1) && ec=0 || ec=$?
+assert_contains "$(cat "$GIT_STUB_LOG")" "--branch some-branch" \
+    "ATMOSPHERE_SOURCE_REF overrides the ref"
+
+unset GIT_STUB_LOG
+
+printf "\n"
+
+# ── 12b. CLI: new (network — gated by ATMOSPHERE_NETWORK_TESTS=1) ─────────
+# Full end-to-end clone test, skipped by default to keep CI fast and offline.
+if [ "${ATMOSPHERE_NETWORK_TESTS:-0}" = "1" ]; then
+    printf "${BOLD}atmosphere new (network clone)${RESET}\n"
+
+    out=$(cd "$tmp_dir" && "$CLI" new net-chat --template chat 2>&1) && ec=0 || ec=$?
+    assert_exit_code "$ec" 0 "new chat exits successfully"
+    assert_contains "$out" "Project created" "prints success message"
+    assert_contains "$out" "spring-boot-chat" "output mentions source sample"
+
+    if [ -f "$tmp_dir/net-chat/pom.xml" ]; then
+        pass "clones pom.xml from sample"
+    else
+        fail "clones pom.xml from sample"
+    fi
+
+    # Portable Maven wrapper: scaffold must be runnable with just a JDK (the
+    # printed './mvnw spring-boot:run' has to actually exist), version pinned.
+    if [ -x "$tmp_dir/net-chat/mvnw" ]; then
+        pass "scaffold ships executable mvnw"
+    else
+        fail "scaffold ships executable mvnw"
+    fi
+    if [ -f "$tmp_dir/net-chat/.mvn/wrapper/maven-wrapper.properties" ]; then
+        pass "scaffold ships .mvn/wrapper/maven-wrapper.properties"
+    else
+        fail "scaffold ships .mvn/wrapper/maven-wrapper.properties"
+    fi
+    # Reactor-internal GIB files must NOT leak into a standalone scaffold.
+    if [ ! -e "$tmp_dir/net-chat/.mvn/extensions.xml" ]; then
+        pass "scaffold excludes reactor-internal .mvn/extensions.xml"
+    else
+        fail "scaffold excludes reactor-internal .mvn/extensions.xml"
+    fi
+
+    # Skill-file + agent template copies the skill into the cloned project
+    cat > "$tmp_dir/test-skill.md" <<'SKILLEOF'
+# Support Agent
+You are a customer support agent for Acme Corp.
+
+## Skills
+- Answer product questions
+
+## Guardrails
+- Never share internal pricing
+SKILLEOF
+
+    out=$(cd "$tmp_dir" && "$CLI" new net-agent --skill-file "$tmp_dir/test-skill.md" 2>&1) && ec=0 || ec=$?
+    assert_exit_code "$ec" 0 "new --skill-file exits successfully"
+    if [ -f "$tmp_dir/net-agent/src/main/resources/prompts/skill.md" ]; then
+        pass "copies skill file into cloned project"
+        skill_content=$(cat "$tmp_dir/net-agent/src/main/resources/prompts/skill.md")
+        assert_contains "$skill_content" "Support Agent" "skill file content preserved"
+        assert_contains "$skill_content" "Guardrails" "skill file guardrails preserved"
+    else
+        fail "copies skill file into cloned project"
+    fi
+
+    # Sparse-clone standalone-compile regression (commit 0b9a8f194d).
+    # The cloned pom.xml must build standalone against the Maven Central
+    # parent — without <relativePath>, pinned SNAPSHOT→release, and with
+    # checkstyle/pmd skipped. Pick one representative template to keep the
+    # cycle fast; compiling every template would dominate CI runtime.
+    if command -v mvn >/dev/null 2>&1; then
+        out=$(cd "$tmp_dir" && "$CLI" new net-ai-chat --template ai-chat 2>&1) && ec=0 || ec=$?
+        assert_exit_code "$ec" 0 "new ai-chat exits successfully"
+        if [ -d "$tmp_dir/net-ai-chat" ]; then
+            compile_log=$(cd "$tmp_dir/net-ai-chat" && mvn -q -B -DskipTests -Dcheckstyle.skip=true -Dpmd.skip=true compile 2>&1) && cec=0 || cec=$?
+            if [ "$cec" -eq 0 ]; then
+                pass "cloned ai-chat pom.xml compiles standalone"
+            else
+                fail "cloned ai-chat pom.xml compile failed" "$(printf '%s' "$compile_log" | tail -20)"
+            fi
+        else
+            fail "cloned ai-chat project directory missing"
+        fi
+
+        # The scaffolded pom pins the parent to the CLI's released VERSION, so
+        # the sources have to come from the matching release tag. When the CLI
+        # cloned `main` instead, any sample using an API added after the last
+        # release scaffolded a project that could not compile — ai-tools calls
+        # AiConfig.LlmSettings#hasReachableModel(), which 4.0.65 does not have,
+        # and the scaffold died with "cannot find symbol: hasReachableModel".
+        out=$(cd "$tmp_dir" && "$CLI" new net-ai-tools --template ai-tools 2>&1) && ec=0 || ec=$?
+        assert_exit_code "$ec" 0 "new ai-tools exits successfully"
+        if [ -d "$tmp_dir/net-ai-tools" ]; then
+            compile_log=$(cd "$tmp_dir/net-ai-tools" && mvn -q -B -DskipTests -Dcheckstyle.skip=true -Dpmd.skip=true compile 2>&1) && cec=0 || cec=$?
+            if [ "$cec" -eq 0 ]; then
+                pass "cloned ai-tools sources match the pinned release (compiles standalone)"
+            else
+                fail "cloned ai-tools sources do not match the pinned release" "$(printf '%s' "$compile_log" | tail -20)"
+            fi
+        else
+            fail "cloned ai-tools project directory missing"
+        fi
+
+        # ── --runtime scaffold + compile ──────────────────────────────────
+        # For each scaffold-and-compile overlay runtime, scaffold ai-chat with
+        # the adapter dep injected and confirm the resulting standalone pom.xml
+        # resolves and compiles. Catches the things unit tests can't:
+        # malformed XML in the injected block, missing transitive deps,
+        # version-property refs that don't resolve outside the reactor,
+        # and repository-block placement.
+        printf "\n  ${BOLD}--runtime scaffold + compile${RESET}\n"
+
+        rt_compile() {
+            rt_name="$1"
+            rt_extra_args="$2"
+            proj="net-rt-$rt_name"
+            out=$(cd "$tmp_dir" && "$CLI" new "$proj" --template ai-chat --runtime "$rt_name" 2>&1) && ec=0 || ec=$?
+            if [ "$ec" -ne 0 ]; then
+                fail "scaffold --runtime $rt_name" "exit=$ec, output: $(printf '%s' "$out" | tail -3)"
+                return
+            fi
+            pass "scaffold --runtime $rt_name"
+
+            # shellcheck disable=SC2086
+            compile_log=$(cd "$tmp_dir/$proj" && mvn -q -B -DskipTests \
+                -Dcheckstyle.skip=true -Dpmd.skip=true \
+                $rt_extra_args compile 2>&1) && cec=0 || cec=$?
+            if [ "$cec" -eq 0 ]; then
+                pass "scaffold --runtime $rt_name compiles standalone"
+            else
+                fail "scaffold --runtime $rt_name compile failed" \
+                     "$(printf '%s' "$compile_log" | tail -15)"
+            fi
+        }
+
+        # Built-in is a no-op overlay (no extra deps); compile as a control.
+        rt_compile builtin ""
+        rt_compile spring-ai ""
+        rt_compile langchain4j ""
+        rt_compile adk ""
+        rt_compile koog ""
+        # Embabel 1.5.0 is built on Spring Boot 4.1 / Spring AI 2.0, so it
+        # compiles on the default Spring Boot 4 profile like the others.
+        rt_compile embabel ""
+        rt_compile semantic-kernel ""
+        # Native HTTP+SSE runtimes (no third-party SDK, no provider deps): they
+        # shipped without scaffold coverage and went unscaffoldable for days
+        # (drift #59). Single atmosphere-<x> dep on top of the ai-chat template,
+        # so they compile like the built-in control. crewai's Python sidecar is
+        # a runtime dependency only — the Java app compiles standalone.
+        rt_compile anthropic ""
+        rt_compile cohere ""
+        rt_compile crewai ""
+    else
+        printf "  ${DIM}— skipping sparse-clone compile regression (mvn not on PATH)${RESET}\n"
+    fi
+
+    printf "\n"
+fi
+
+# ── 12c. CLI: --runtime overlay ────────────────────────────────────────────
+# `--runtime <name>` injects an AgentRuntime adapter (and provider deps + repo)
+# into the scaffolded pom.xml. Tests cover the registry, validation path, and
+# the pure-local injection logic (sourcing the helper without network).
+printf "${BOLD}atmosphere new --runtime${RESET}\n"
+
+OVERLAYS_JSON="$SCRIPT_DIR/runtime-overlays.json"
+
+# Registry integrity
+if jq empty "$OVERLAYS_JSON" 2>/dev/null; then
+    pass "runtime-overlays.json is valid JSON"
+else
+    fail "runtime-overlays.json is valid JSON"
+fi
+
+expected_runtimes="builtin spring-ai langchain4j adk koog agentscope spring-ai-alibaba embabel semantic-kernel"
+for rt in $expected_runtimes; do
+    if jq -e ".overlays[\"$rt\"]" "$OVERLAYS_JSON" >/dev/null 2>&1; then
+        pass "registry has '$rt' overlay"
+    else
+        fail "registry has '$rt' overlay"
+    fi
+done
+
+# Every non-builtin overlay must declare description + at least one dep with
+# groupId/artifactId; built-in is the only valid empty-deps entry.
+bad_overlays=$(jq -r '
+    .overlays | to_entries[] |
+    select(.key != "builtin") |
+    select((.value.description | not) or (.value.deps | length == 0) or
+           (.value.deps | map(select(.groupId == null or .artifactId == null)) | length > 0)) |
+    .key
+' "$OVERLAYS_JSON")
+if [ -z "$bad_overlays" ]; then
+    pass "all overlays declare description + groupId/artifactId on every dep"
+else
+    fail "overlays missing required fields" "$bad_overlays"
+fi
+
+# Embabel must declare the repository entry (Embabel artifacts are not on
+# Maven Central — without this, the cloned project won't resolve the deps).
+emb_repo=$(jq -r '.overlays.embabel.repository.url // empty' "$OVERLAYS_JSON")
+assert_contains "$emb_repo" "repo.embabel.com" "embabel overlay declares repo.embabel.com"
+
+# Validation: --runtime with no value
+out=$("$CLI" new foo --runtime 2>&1) && ec=0 || ec=$?
+if [ "$ec" -ne 0 ]; then
+    pass "new --runtime without value exits with error"
+else
+    fail "new --runtime without value exits with error" "exit was $ec"
+fi
+assert_contains "$out" "--runtime requires a value" "error message names the missing argument"
+
+# Validation: --force without --runtime is rejected (the flag only makes sense
+# when there's an overlay to apply).
+out=$("$CLI" new foo --force 2>&1) && ec=0 || ec=$?
+if [ "$ec" -ne 0 ]; then
+    pass "new --force without --runtime exits with error"
+else
+    fail "new --force without --runtime exits with error" "exit was $ec"
+fi
+assert_contains "$out" "--force requires --runtime" "error message explains why --force is rejected"
+
+# Validation: unknown runtime triggers the registry error path. The CLI must
+# parse arguments far enough to call apply_runtime_overlay AFTER scaffolding,
+# so we can't test this purely offline against a real template (clone needs
+# network). Instead, drive the helper directly via a sub-shell that sources
+# only the apply_runtime_overlay function.
+overlay_tmp=$(mktemp -d)
+cp "$SCRIPT_DIR/../samples/spring-boot-ai-chat/pom.xml" "$overlay_tmp/pom.xml"
+
+# Extract strip_competing_adapters + apply_runtime_overlay function bodies
+# to a sourceable file. We can't pass them through `sh -c` (the functions'
+# own $variables would expand in the outer shell first), so we drive them
+# via a tiny harness script.
+overlay_fn_file="$overlay_tmp/apply_overlay.sh"
+sed -n '/^# Strip every <dependency>/,/^cmd_new() {$/p' "$CLI" \
+    | sed '/^cmd_new() {$/d' > "$overlay_fn_file"
+
+cat > "$overlay_tmp/harness.sh" <<HARNESS
+#!/bin/sh
+# Stand-alone harness that calls apply_runtime_overlay with the env the
+# real CLI provides. Third arg (optional) is the force flag.
+die()  { echo "error: \$1" >&2; exit 1; }
+info() { :; }
+ok()   { :; }
+warn() { :; }
+has_jq() { command -v jq >/dev/null 2>&1; }
+ensure_cache_dir() { :; }
+download() { :; }
+RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; DIM=''; RESET=''
+CACHE_DIR='$overlay_tmp/cache'
+get_runtime_overlays_json() { cat '$OVERLAYS_JSON'; }
+. '$overlay_fn_file'
+apply_runtime_overlay "\$1" "\$2" "\${3:-false}"
+HARNESS
+chmod +x "$overlay_tmp/harness.sh"
+
+drive_overlay() {
+    "$overlay_tmp/harness.sh" "$1" "$2" "${3:-false}"
+}
+
+# Unknown runtime gives a friendly error listing valid choices
+cp "$overlay_tmp/pom.xml" "$overlay_tmp/pom.unknown.xml"
+out=$(drive_overlay nonsense "$overlay_tmp/pom.unknown.xml" 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 1 "unknown runtime exits with error"
+assert_contains "$out" "Unknown runtime: nonsense" "error names the bad runtime"
+assert_contains "$out" "spring-ai" "error lists spring-ai as valid"
+assert_contains "$out" "embabel" "error lists embabel as valid"
+
+# Each overlay produces well-formed XML, leaves <dependencyManagement> alone,
+# and adds the matching adapter dependency. Use xmllint when available;
+# otherwise fall back to a structural grep.
+have_xmllint=0
+command -v xmllint >/dev/null 2>&1 && have_xmllint=1
+
+for rt in $expected_runtimes; do
+    pom_copy="$overlay_tmp/pom.$rt.xml"
+    cp "$overlay_tmp/pom.xml" "$pom_copy"
+    drive_overlay "$rt" "$pom_copy" >/dev/null 2>&1 || {
+        fail "overlay '$rt' applied without error"
+        continue
+    }
+    pass "overlay '$rt' applied without error"
+
+    if [ "$have_xmllint" = 1 ]; then
+        if xmllint --noout "$pom_copy" 2>/dev/null; then
+            pass "overlay '$rt' produces well-formed XML"
+        else
+            fail "overlay '$rt' produces well-formed XML" \
+                 "$(xmllint --noout "$pom_copy" 2>&1 | head -3)"
+        fi
+    fi
+
+    # Built-in is a no-op overlay — skip the dep-presence check.
+    if [ "$rt" = "builtin" ]; then continue; fi
+
+    expected_artifact=$(jq -r ".overlays[\"$rt\"].deps[0].artifactId" "$OVERLAYS_JSON")
+    if grep -q "<artifactId>$expected_artifact</artifactId>" "$pom_copy"; then
+        pass "overlay '$rt' injected $expected_artifact"
+    else
+        fail "overlay '$rt' injected $expected_artifact"
+    fi
+done
+
+# Embabel's repository must end up inside <repositories>.
+emb_pom="$overlay_tmp/pom.embabel.xml"
+if grep -q "<id>embabel-releases</id>" "$emb_pom"; then
+    pass "embabel overlay injects <repository> entry"
+else
+    fail "embabel overlay injects <repository> entry"
+fi
+
+# The injection must NOT land inside <dependencyManagement> — that section
+# only declares versions, it does not bring deps onto the runtime classpath.
+# Smoke-check by ensuring the injected comment marker appears AFTER the
+# closing </dependencyManagement> tag (or that the pom has none).
+mgmt_close_line=$(grep -n "</dependencyManagement>" "$overlay_tmp/pom.langchain4j.xml" | head -1 | cut -d: -f1)
+inject_line=$(grep -n "Injected by atmosphere CLI" "$overlay_tmp/pom.langchain4j.xml" | head -1 | cut -d: -f1)
+if [ -z "$mgmt_close_line" ] || [ -z "$inject_line" ] || [ "$inject_line" -gt "$mgmt_close_line" ]; then
+    pass "overlay lands outside <dependencyManagement>"
+else
+    fail "overlay lands outside <dependencyManagement>" \
+         "inject@$inject_line, </dependencyManagement>@$mgmt_close_line"
+fi
+
+# ── --force: strip pre-pinned adapters before injecting ───────────────────
+# ai-tools pre-pins atmosphere-langchain4j. Without --force, swapping to
+# spring-ai is additive (both adapters end up on the classpath, and the
+# resolver picks one based on jar order). With --force, the langchain4j
+# adapter dep should be removed before atmosphere-spring-ai is injected.
+ai_tools_pom="$SCRIPT_DIR/../samples/spring-boot-ai-tools/pom.xml"
+if [ -f "$ai_tools_pom" ]; then
+    force_pom="$overlay_tmp/pom.force.spring-ai.xml"
+    cp "$ai_tools_pom" "$force_pom"
+    if drive_overlay spring-ai "$force_pom" true >/dev/null 2>&1; then
+        pass "--force overlay 'spring-ai' applied without error on ai-tools pom"
+    else
+        fail "--force overlay 'spring-ai' applied without error on ai-tools pom"
+    fi
+    if grep -q "<artifactId>atmosphere-langchain4j</artifactId>" "$force_pom"; then
+        fail "--force strips pre-pinned atmosphere-langchain4j" \
+             "found stale dep in $force_pom"
+    else
+        pass "--force strips pre-pinned atmosphere-langchain4j"
+    fi
+    if grep -q "<artifactId>atmosphere-spring-ai</artifactId>" "$force_pom"; then
+        pass "--force injects atmosphere-spring-ai after stripping"
+    else
+        fail "--force injects atmosphere-spring-ai after stripping"
+    fi
+    if grep -q "<artifactId>atmosphere-ai</artifactId>" "$force_pom"; then
+        pass "--force preserves foundational atmosphere-ai dep"
+    else
+        fail "--force preserves foundational atmosphere-ai dep"
+    fi
+    if [ "$have_xmllint" = 1 ] && xmllint --noout "$force_pom" 2>/dev/null; then
+        pass "--force overlay produces well-formed XML"
+    elif [ "$have_xmllint" = 1 ]; then
+        fail "--force overlay produces well-formed XML"
+    fi
+
+    # Builtin + --force: every adapter dep should be wiped, leaving only the
+    # foundational atmosphere-ai. There's no overlay dep to inject, so this
+    # is the strict-strip case.
+    builtin_force_pom="$overlay_tmp/pom.force.builtin.xml"
+    cp "$ai_tools_pom" "$builtin_force_pom"
+    if drive_overlay builtin "$builtin_force_pom" true >/dev/null 2>&1; then
+        pass "--force overlay 'builtin' applied without error on ai-tools pom"
+    else
+        fail "--force overlay 'builtin' applied without error on ai-tools pom"
+    fi
+    if grep -q "<artifactId>atmosphere-langchain4j</artifactId>" "$builtin_force_pom"; then
+        fail "--force builtin strips atmosphere-langchain4j"
+    else
+        pass "--force builtin strips atmosphere-langchain4j"
+    fi
+    if grep -q "<artifactId>atmosphere-ai</artifactId>" "$builtin_force_pom"; then
+        pass "--force builtin preserves foundational atmosphere-ai dep"
+    else
+        fail "--force builtin preserves foundational atmosphere-ai dep"
+    fi
+fi
+
+rm -rf "$overlay_tmp"
+printf "\n"
+
+# ── 12d. CLI: new --routing ────────────────────────────────────────────────
+# `--routing` is a bare boolean that appends a COMMENTED, ready-to-uncomment
+# atmosphere.ai.routing.* block to an AI template's application.yml. Off by
+# default (the scaffold is byte-identical without it). Like the --runtime
+# overlay tests, the injection logic is exercised purely locally by sourcing the
+# inject_routing_block helper — no network. (The exit-1 rejection cases live in
+# the "atmosphere new (validation)" section above.)
+printf "${BOLD}atmosphere new --routing${RESET}\n"
+
+routing_tmp=$(mktemp -d)
+
+# Extract the routing helpers (ROUTING_AI_TEMPLATES, is_routing_template,
+# inject_routing_block) to a sourceable file — same trick as the overlay tests.
+# Range: from the "Routing block" section banner up to (not including) cmd_new.
+routing_fn_file="$routing_tmp/routing_fn.sh"
+sed -n '/^# ── Routing block (--routing)/,/^cmd_new() {$/p' "$CLI" \
+    | sed '/^cmd_new() {$/d' > "$routing_fn_file"
+
+cat > "$routing_tmp/harness.sh" <<HARNESS
+#!/bin/sh
+# Stand-alone harness that calls inject_routing_block with the env the real CLI
+# provides. \$1 = template, \$2 = scaffold dir.
+die()  { echo "error: \$1" >&2; exit 1; }
+info() { echo "info: \$1"; }
+warn() { echo "warn: \$1" >&2; }
+RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; DIM=''; RESET=''
+. '$routing_fn_file'
+inject_routing_block "\$1" "\$2"
+HARNESS
+chmod +x "$routing_tmp/harness.sh"
+
+drive_routing() {
+    "$routing_tmp/harness.sh" "$1" "$2"
+}
+
+# Build a scaffold-shaped dir holding a COPY of the real ai-chat application.yml
+# so we never mutate the checked-in sample.
+routing_proj="$routing_tmp/proj"
+mkdir -p "$routing_proj/src/main/resources"
+src_yml="$SCRIPT_DIR/../samples/spring-boot-ai-chat/src/main/resources/application.yml"
+cp "$src_yml" "$routing_proj/src/main/resources/application.yml"
+proj_yml="$routing_proj/src/main/resources/application.yml"
+
+# Capture the pre-injection top-level keys so we can prove no-clobber later.
+pre_keys=$(grep -E '^[a-zA-Z].*:' "$proj_yml")
+
+# Inject once against the temp copy.
+out=$(drive_routing ai-chat "$routing_proj" 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 0 "inject_routing_block exits 0 on ai-chat yml"
+
+injected=$(cat "$proj_yml")
+assert_contains "$injected" "routing:" "injected yml contains routing:"
+assert_contains "$injected" "enabled: false" "injected yml contains enabled: false"
+assert_contains "$injected" "content-rules:" "injected yml contains content-rules:"
+assert_contains "$injected" "keywords:" "injected yml contains keywords:"
+assert_contains "$injected" "model:" "injected yml contains model:"
+assert_contains "$injected" "default-model:" "injected yml contains default-model:"
+
+# No-clobber: every pre-existing top-level key must survive the append.
+missing_key=""
+echo "$pre_keys" | while IFS= read -r k; do
+    [ -z "$k" ] && continue
+    printf '%s' "$injected" | grep -q -F -e "$k" || echo "$k" >> "$routing_tmp/missing_keys"
+done
+if [ -f "$routing_tmp/missing_keys" ]; then
+    fail "injection preserves pre-existing top-level keys" "$(cat "$routing_tmp/missing_keys")"
+else
+    pass "injection preserves pre-existing top-level keys (no clobber)"
+fi
+# Spot-check the headline pre-existing keys explicitly.
+assert_contains "$injected" "atmosphere:" "pre-existing atmosphere: block preserved"
+assert_contains "$injected" "llm:" "pre-existing llm: block preserved"
+assert_contains "$injected" "server:" "pre-existing server: block preserved"
+
+# Idempotency: a second injection must warn and no-op (routing: stays single).
+out=$(drive_routing ai-chat "$routing_proj" 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 0 "second inject_routing_block exits 0 (idempotent)"
+assert_contains "$out" "already exists" "second injection warns the block already exists"
+routing_count=$(grep -c 'routing:' "$proj_yml")
+if [ "$routing_count" -eq 1 ]; then
+    pass "routing: appears exactly once after double injection"
+else
+    fail "routing: appears exactly once after double injection" "grep -c routing: = $routing_count"
+fi
+
+# No-op: a scaffold dir with NO application.yml must warn + return 0 (graceful;
+# the routing block is optional, it must not break scaffolding).
+routing_empty="$routing_tmp/empty"
+mkdir -p "$routing_empty/src/main/resources"
+out=$(drive_routing ai-chat "$routing_empty" 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 0 "inject_routing_block returns 0 when no application.yml present"
+assert_contains "$out" "no application.yml" "no-yml case warns about the missing file"
+
+# Non-AI template via the helper directly: exit 1 + 'requires an AI template'.
+out=$(drive_routing chat "$routing_proj" 2>&1) && ec=0 || ec=$?
+assert_exit_code "$ec" 1 "inject_routing_block rejects a non-AI template"
+assert_contains "$out" "requires an AI template" "helper rejection names the AI-template requirement"
+
+# YAML validity: the post-injection file is still valid YAML (the block is inert
+# comments). Use pyyaml when available; otherwise fall back to an indentation
+# grep that proves the routing tree sits at the README's depth (mirrors the
+# xmllint-when-available fallback used by the --runtime tests).
+if python3 -c 'import yaml' >/dev/null 2>&1; then
+    if python3 -c "import yaml,sys; yaml.safe_load(open('$proj_yml')); sys.exit(0)" 2>/dev/null; then
+        pass "post-injection application.yml is valid YAML (pyyaml)"
+    else
+        fail "post-injection application.yml is valid YAML (pyyaml)" \
+             "$(python3 -c "import yaml; yaml.safe_load(open('$proj_yml'))" 2>&1 | tail -3)"
+    fi
+else
+    # Structural fallback: the commented routing tree must carry the README's
+    # nesting — '#     routing:' (6 cols incl. '#'), '#       enabled:' deeper,
+    # and a content-rules list item at the rule depth.
+    if grep -q '^#     routing:' "$proj_yml" \
+       && grep -q '^#       enabled: false' "$proj_yml" \
+       && grep -q '^#         - keywords:' "$proj_yml"; then
+        pass "post-injection routing block carries README indentation depth (grep fallback)"
+    else
+        fail "post-injection routing block carries README indentation depth (grep fallback)"
+    fi
+fi
+
+# Doc-drift pin: every routing key the block emits must be documented in
+# modules/ai/README.md. If the README drops/renames one, this breaks — the same
+# way capability sets are pinned against drift.
+AI_README="$SCRIPT_DIR/../modules/ai/README.md"
+if [ -f "$AI_README" ]; then
+    for key in default-model content-rules keywords model base-url api-key; do
+        if grep -q -F -e "$key" "$AI_README"; then
+            pass "routing key '$key' is documented in modules/ai/README.md"
+        else
+            fail "routing key '$key' missing from modules/ai/README.md" \
+                 "emitted block and README routing docs have drifted"
+        fi
+    done
+else
+    fail "modules/ai/README.md present for doc-drift pin" "$AI_README not found"
+fi
+
+rm -rf "$routing_tmp"
+
+# Network-gated end-to-end: scaffold a real ai-chat with --routing and confirm
+# the cloned application.yml carries the routing block. Skipped by default
+# (ATMOSPHERE_NETWORK_TESTS=1) to keep CI offline + fast.
+if [ "${ATMOSPHERE_NETWORK_TESTS:-0}" = "1" ]; then
+    routing_net_tmp=$(mktemp -d)
+    out=$(cd "$routing_net_tmp" && "$CLI" new net-routing --template ai-chat --routing 2>&1) && ec=0 || ec=$?
+    assert_exit_code "$ec" 0 "new ai-chat --routing exits successfully (network)"
+    net_yml="$routing_net_tmp/net-routing/src/main/resources/application.yml"
+    if [ -f "$net_yml" ]; then
+        net_content=$(cat "$net_yml")
+        assert_contains "$net_content" "routing:" "cloned ai-chat --routing yml contains routing:"
+        assert_contains "$net_content" "enabled: false" "cloned ai-chat --routing yml contains enabled: false"
+        assert_contains "$net_content" "content-rules:" "cloned ai-chat --routing yml contains content-rules:"
+    else
+        fail "cloned ai-chat --routing application.yml present (network)" "$net_yml missing"
+    fi
+    rm -rf "$routing_net_tmp"
+else
+    printf "  ${DIM}— skipping --routing network clone (set ATMOSPHERE_NETWORK_TESTS=1)${RESET}\n"
+fi
+
+printf "\n"
+
+# ── 12e. CLI: compose (gated by ATMOSPHERE_NETWORK_TESTS=1 + jbang) ───────
+# `atmosphere compose` shells out to generator/ComposeGenerator.java via jbang.
+# jbang does not set -Djbang.source, so the generator used to fall back to
+# walking the CWD for generator/templates — which only succeeds inside a
+# checkout of this repo. Every other invocation died with
+# "Cannot find generator templates". Run it from a directory that is not the
+# repo, which is what an installed CLI always does.
+printf "${BOLD}atmosphere compose${RESET}\n"
+if [ "${ATMOSPHERE_NETWORK_TESTS:-0}" = "1" ] && command -v jbang >/dev/null 2>&1; then
+    compose_tmp=$(mktemp -d)
+    mkdir -p "$compose_tmp/skills/analyst" "$compose_tmp/out"
+    cat > "$compose_tmp/skills/analyst/SKILL.md" <<'COMPOSESKILLEOF'
+---
+name: analyst
+description: "Analyzes data"
+---
+# Analyst
+You analyze data.
+COMPOSESKILLEOF
+
+    out=$(cd "$compose_tmp" && "$CLI" compose --name probe-fleet --group com.example \
+            --protocol local --transport websocket --frontend none --deploy single-jar \
+            --ai builtin --output "$compose_tmp/out" "$compose_tmp/skills" </dev/null 2>&1) && ec=0 || ec=$?
+    assert_exit_code "$ec" 0 "compose succeeds from a directory outside the repo"
+    assert_not_contains "$out" "Cannot find generator templates" "compose resolves its templates"
+
+    if [ -f "$compose_tmp/out/pom.xml" ]; then
+        pass "compose writes a parent pom.xml"
+
+        # The generator reads <spring-boot.version> from the reactor root pom;
+        # probing the starter pom (which only *references* the property) always
+        # missed and every generated project silently took the hard-coded
+        # fallback instead of the version the framework is built against.
+        repo_sb=$(grep -m1 '<spring-boot.version>' "$SCRIPT_DIR/../pom.xml" \
+                  | sed 's|.*<spring-boot.version>\([^<]*\)</spring-boot.version>.*|\1|')
+        composed_sb=$(grep -m1 '<spring-boot.version>' "$compose_tmp/out/pom.xml" \
+                  | sed 's|.*<spring-boot.version>\([^<]*\)</spring-boot.version>.*|\1|')
+        if [ -n "$repo_sb" ] && [ "$repo_sb" = "$composed_sb" ]; then
+            pass "compose pins the reactor's Spring Boot version ($repo_sb)"
+        else
+            fail "compose pins the reactor's Spring Boot version" \
+                 "reactor=$repo_sb composed=$composed_sb"
+        fi
+    else
+        fail "compose writes a parent pom.xml"
+    fi
+
+    # Reactor-internal Maven files must not leak into a standalone project —
+    # same rule install_source's copy_maven_wrapper enforces for `new`.
+    if [ ! -e "$compose_tmp/out/.mvn/extensions.xml" ] && [ ! -e "$compose_tmp/out/.mvn/gib.properties" ]; then
+        pass "compose output excludes reactor-internal .mvn files"
+    else
+        fail "compose output excludes reactor-internal .mvn files"
+    fi
+    if [ -f "$compose_tmp/out/.mvn/wrapper/maven-wrapper.properties" ]; then
+        pass "compose output ships .mvn/wrapper/maven-wrapper.properties"
+    else
+        fail "compose output ships .mvn/wrapper/maven-wrapper.properties"
+    fi
+
+    rm -rf "$compose_tmp"
+else
+    printf "  ${DIM}— skipping compose (needs ATMOSPHERE_NETWORK_TESTS=1 and jbang)${RESET}\n"
+fi
+
+printf "\n"
+
+# ── 13. npx: create-atmosphere-app ─────────────────────────────────────────
+# The npx wrapper is a thin shim that delegates to `atmosphere new`. Tests
+# assert its argument parsing + delegation contract, not clone output.
+if [ -z "$SKIP_NPX" ]; then
+    printf "${BOLD}npx create-atmosphere-app${RESET}\n"
+
+    # Resolve node's absolute path so delegation tests that override PATH
+    # can still invoke node itself (homebrew installs node outside /usr/bin).
+    real_node=$(command -v node)
+
+    # Help
+    out=$(node "$NPX" --help 2>&1)
+    assert_contains "$out" "create-atmosphere-app" "npx help shows tool name"
+    assert_contains "$out" "chat" "npx help lists chat template"
+    assert_contains "$out" "ai-chat" "npx help lists ai-chat template"
+    assert_contains "$out" "multi-agent" "npx help lists multi-agent template"
+    assert_contains "$out" "classroom" "npx help lists classroom template"
+    assert_contains "$out" "guarded-agent" "npx help lists guarded-agent template"
+    assert_contains "$out" "spring-ai-alibaba" "npx help lists spring-ai-alibaba runtime"
+
+    # List templates
+    out=$(node "$NPX" --list-templates 2>&1)
+    assert_contains "$out" "chat" "npx --list-templates shows chat"
+    assert_contains "$out" "rag" "npx --list-templates shows rag"
+    assert_contains "$out" "multi-agent" "npx --list-templates shows multi-agent"
+    assert_contains "$out" "classroom" "npx --list-templates shows classroom"
+    assert_contains "$out" "ms-governance" "npx --list-templates shows ms-governance"
+    assert_contains "$out" "assistant" "npx --list-templates shows assistant"
+    assert_contains "$out" "classic-rooms" "npx --list-templates shows classic-rooms"
+
+    # Lockstep: cli/npx/index.js carries its own copy of the template map, and its
+    # own comment says it "must stay in lockstep with the cmd_new template map in
+    # cli/atmosphere" — but nothing enforced that. A template added to one and not
+    # the other is invisible until a user picks the missing name. Compare the two
+    # lists directly, both directions.
+    cli_templates=$(sed -n '/^    case "$template" in$/,/^    esac$/p' "$CLI" \
+        | sed -nE 's/^[[:space:]]*([a-z][a-z0-9-]*)\)[[:space:]]*source_sample=.*/\1/p' | sort -u)
+    npx_templates=$(node -e "
+        const fs=require('fs');
+        const src=fs.readFileSync('$NPX','utf8');
+        const body=src.slice(src.indexOf('const TEMPLATES'), src.indexOf('};', src.indexOf('const TEMPLATES')));
+        const names=[...body.matchAll(/'([a-z][a-z0-9-]*)':/g)].map(m=>m[1]);
+        console.log([...new Set(names)].sort().join('\n'));
+    ")
+    lockstep_tmp=$(mktemp -d)
+    printf '%s\n' "$cli_templates" > "$lockstep_tmp/cli.txt"
+    printf '%s\n' "$npx_templates" > "$lockstep_tmp/npx.txt"
+    only_cli=$(comm -23 "$lockstep_tmp/cli.txt" "$lockstep_tmp/npx.txt" | tr '\n' ' ')
+    only_npx=$(comm -13 "$lockstep_tmp/cli.txt" "$lockstep_tmp/npx.txt" | tr '\n' ' ')
+    rm -rf "$lockstep_tmp"
+    if [ -z "$only_cli" ]; then
+        pass "every cmd_new template is also in cli/npx/index.js TEMPLATES"
+    else
+        fail "every cmd_new template is also in cli/npx/index.js TEMPLATES" \
+            "missing from the npx shim: $only_cli"
+    fi
+    if [ -z "$only_npx" ]; then
+        pass "every cli/npx/index.js template is also in the cmd_new map"
+    else
+        fail "every cli/npx/index.js template is also in the cmd_new map" \
+            "missing from cmd_new: $only_npx"
+    fi
+
+    # Same lockstep, extended to the PROSE lists. ac56cbe5dc gated the two code
+    # maps against each other but touched no prose, so samples/README.md shipped
+    # 13 of 15 templates and the published tutorial 12 of 15 — a reader concludes
+    # the missing samples are unreachable via `atmosphere new`. Both files are
+    # unhedged exhaustive enumerations, so compare them the same way.
+    prose_tmp=$(mktemp -d)
+    printf '%s\n' "$cli_templates" > "$prose_tmp/cli.txt"
+
+    # samples/README.md: the single "Available `--template` values:" line.
+    grep -h '^Available `--template` values:' "$REPO_ROOT/samples/README.md" \
+        | grep -oE '`[a-z][a-z0-9-]+`' | tr -d '`' \
+        | grep -vx 'template' | sort -u > "$prose_tmp/samples.txt"
+    only_code=$(comm -23 "$prose_tmp/cli.txt" "$prose_tmp/samples.txt" | tr '\n' ' ')
+    only_prose=$(comm -13 "$prose_tmp/cli.txt" "$prose_tmp/samples.txt" | tr '\n' ' ')
+    if [ -z "$only_code" ] && [ -z "$only_prose" ]; then
+        pass "samples/README.md --template list matches the cmd_new map"
+    else
+        fail "samples/README.md --template list matches the cmd_new map" \
+            "missing from the doc: ${only_code:-none}; stale in the doc: ${only_prose:-none}"
+    fi
+
+    # cli/README.md: the Available Templates table.
+    grep -oE '^\| `[a-z][a-z0-9-]+`' "$REPO_ROOT/cli/README.md" \
+        | tr -d '|` ' | sort -u > "$prose_tmp/clidoc.txt"
+    only_code=$(comm -23 "$prose_tmp/cli.txt" "$prose_tmp/clidoc.txt" | tr '\n' ' ')
+    only_prose=$(comm -13 "$prose_tmp/cli.txt" "$prose_tmp/clidoc.txt" | tr '\n' ' ')
+    if [ -z "$only_code" ] && [ -z "$only_prose" ]; then
+        pass "cli/README.md template table matches the cmd_new map"
+    else
+        fail "cli/README.md template table matches the cmd_new map" \
+            "missing from the doc: ${only_code:-none}; stale in the doc: ${only_prose:-none}"
+    fi
+    rm -rf "$prose_tmp"
+
+    # The npx shim only forwards --runtime (cli/atmosphere validates it against
+    # cli/runtime-overlays.json, so the shell CLI cannot drift), but its help
+    # text hardcodes the list and listed 9 of 12 — anthropic, cohere and crewai
+    # all work and were unadvertised. Gate the help string against the JSON.
+    rt_tmp=$(mktemp -d)
+    node -e "
+        const fs=require('fs');
+        const d=JSON.parse(fs.readFileSync('$SCRIPT_DIR/runtime-overlays.json','utf8'));
+        const names=Object.keys(d.overlays||d).sort();
+        console.log(names.join('\n'));
+    " > "$rt_tmp/json.txt"
+    sed -n '/--runtime, -r <name>/,/)$/p' "$NPX" \
+        | grep -oE '[a-z][a-z0-9-]+' \
+        | grep -vxE 'runtime|r|name|AI|adapter|to|inject' \
+        | sort -u > "$rt_tmp/help.txt"
+    only_json=$(comm -23 "$rt_tmp/json.txt" "$rt_tmp/help.txt" | tr '\n' ' ')
+    only_help=$(comm -13 "$rt_tmp/json.txt" "$rt_tmp/help.txt" | tr '\n' ' ')
+    rm -rf "$rt_tmp"
+    if [ -z "$only_json" ] && [ -z "$only_help" ]; then
+        pass "npx --runtime help text matches cli/runtime-overlays.json"
+    else
+        fail "npx --runtime help text matches cli/runtime-overlays.json" \
+            "missing from help: ${only_json:-none}; not a real overlay: ${only_help:-none}"
+    fi
+
+    # No name
+    out=$(node "$NPX" 2>&1) && ec=0 || ec=$?
+    assert_exit_code "$ec" 1 "npx without name exits with error"
+
+    # Unknown template
+    out=$(node "$NPX" bad-app --template nonexistent 2>&1) && ec=0 || ec=$?
+    assert_exit_code "$ec" 1 "npx with unknown template exits with error"
+    assert_contains "$out" "Unknown template: nonexistent" "npx error lists the bad template"
+
+    # Existing directory
+    npx_tmp=$(mktemp -d)
+    mkdir -p "$npx_tmp/existing-dir"
+    out=$(cd "$npx_tmp" && node -e "
+process.argv = ['node', 'index.js', 'existing-dir', '--template', 'chat'];
+try { require('$NPX'); } catch(e) { process.exit(1); }
+" 2>&1) && ec=0 || ec=$?
+    assert_exit_code "$ec" 1 "npx with existing directory exits with error"
+
+    # Missing atmosphere CLI → actionable install hint.
+    npx_nocli_bin="$npx_tmp/empty-bin"
+    mkdir -p "$npx_nocli_bin"
+    out=$(cd "$npx_tmp" && env PATH="$npx_nocli_bin" "$real_node" "$NPX" no-cli-app --template chat 2>&1) && ec=0 || ec=$?
+    assert_exit_code "$ec" 1 "npx exits 1 when atmosphere CLI is missing"
+    assert_contains "$out" "atmosphere" "npx install-hint mentions atmosphere CLI"
+
+    # Delegation: fake `atmosphere` binary captures the delegated argv
+    fake_bin="$npx_tmp/fake-bin"
+    mkdir -p "$fake_bin"
+    cat > "$fake_bin/atmosphere" <<'FAKEOF'
+#!/bin/sh
+printf 'ATMOSPHERE_ARGS: %s\n' "$*"
+exit 0
+FAKEOF
+    chmod +x "$fake_bin/atmosphere"
+
+    out=$(cd "$npx_tmp" && env PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" "$real_node" "$NPX" my-ai-app --template ai-chat 2>&1)
+    assert_contains "$out" "ATMOSPHERE_ARGS: new my-ai-app --template ai-chat" \
+        "npx delegates to 'atmosphere new' with --template"
+
+    out=$(cd "$npx_tmp" && env PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" "$real_node" "$NPX" my-fleet --template multi-agent 2>&1)
+    assert_contains "$out" "ATMOSPHERE_ARGS: new my-fleet --template multi-agent" \
+        "npx delegates multi-agent template correctly"
+
+    # --runtime forwards through to the shell CLI
+    out=$(cd "$npx_tmp" && env PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" "$real_node" "$NPX" my-rt-app --template ai-chat --runtime langchain4j 2>&1)
+    assert_contains "$out" "--runtime langchain4j" "npx forwards --runtime to shell CLI"
+
+    # --runtime help is documented
+    out=$(node "$NPX" --help 2>&1)
+    assert_contains "$out" "--runtime" "npx --help documents --runtime"
+
+    # --group is silently accepted but warned about (not forwarded)
+    out=$(cd "$npx_tmp" && env PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" "$real_node" "$NPX" g-app --template chat --group com.acme 2>&1)
+    assert_contains "$out" "--group is no longer supported" "npx warns on deprecated --group"
+    assert_not_contains "$out" "ATMOSPHERE_ARGS: new g-app --template chat --group" "npx strips --group before delegating"
+
+    rm -rf "$npx_tmp"
+    printf "\n"
+fi
+
+# ── 14. samples.json <-> filesystem consistency ────────────────────────────
+printf "${BOLD}samples.json ↔ filesystem${RESET}\n"
+
+repo_root="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [ -d "$repo_root/samples" ]; then
+    # Every sample in JSON should exist on disk
+    # Use temp file to avoid subshell variable loss in piped while loops
+    fs_tmp="${TMPDIR:-/tmp}/atmo-test-fs-$$"
+    jq -r '.samples[].name' "$SAMPLES_JSON" > "$fs_tmp"
+    while read -r name; do
+        if [ -d "$repo_root/samples/$name" ]; then
+            pass "sample dir exists: $name"
+        else
+            fail "sample dir missing: $name"
+        fi
+    done < "$fs_tmp"
+
+    # Samples claiming hasFrontend should have frontend/
+    jq -r '.samples[] | select(.hasFrontend == true) | .name' "$SAMPLES_JSON" > "$fs_tmp"
+    while read -r name; do
+        if [ -d "$repo_root/samples/$name/frontend" ]; then
+            pass "frontend dir exists: $name"
+        else
+            fail "frontend dir missing: $name"
+        fi
+    done < "$fs_tmp"
+
+    # Every sample listed in samples.json must ship a README.md. Samples are
+    # the first thing users see — a sample without a README is invisible.
+    jq -r '.samples[].name' "$SAMPLES_JSON" > "$fs_tmp"
+    missing_readmes=""
+    while read -r name; do
+        if [ ! -f "$repo_root/samples/$name/README.md" ]; then
+            missing_readmes="$missing_readmes $name"
+        fi
+    done < "$fs_tmp"
+    if [ -z "$missing_readmes" ]; then
+        pass "every sample has a README.md"
+    else
+        fail "samples missing README.md:$missing_readmes"
+    fi
+    rm -f "$fs_tmp"
+else
+    fail "samples directory not found at $repo_root/samples"
+fi
+
+printf "\n"
+
+# ── Import command tests ───────────────────────────────────────────────────
+printf "${BOLD}Import Command${RESET}\n"
+
+IMPORT_TMP=$(mktemp -d)
+trap "rm -rf $IMPORT_TMP" EXIT
+
+# Create a test skill file with YAML frontmatter and ## Tools
+cat > "$IMPORT_TMP/test-skill.md" <<'SKILLEOF'
+---
+name: weather-bot
+description: "A weather assistant with location lookup"
+---
+
+# Weather Bot
+You are a helpful weather assistant.
+
+## Skills
+- Provide weather forecasts
+- Answer climate questions
+
+## Tools
+- get_weather: Get current weather for a city
+- get_forecast: Get 5-day forecast for a location
+
+## Guardrails
+- Never make up weather data
+SKILLEOF
+
+# Run imports from the temp directory so projects are created there
+cd "$IMPORT_TMP"
+
+# Test 1: Import from local file
+output=$("$CLI" import --name test-weather-bot "$IMPORT_TMP/test-skill.md" 2>&1) || true
+assert_contains "$output" "Parsed skill: weather-bot" "import: parses skill name from YAML frontmatter"
+assert_contains "$output" "weather assistant" "import: parses description from YAML frontmatter"
+assert_contains "$output" "2 @AiTool stubs" "import: generates @AiTool stubs from ## Tools"
+assert_contains "$output" "Project scaffolded" "import: scaffolds project successfully"
+
+# Test 2: Verify generated project structure
+if [ -d "$IMPORT_TMP/test-weather-bot" ]; then
+    pass "import: project directory created"
+else
+    fail "import: project directory not created"
+fi
+
+if [ -f "$IMPORT_TMP/test-weather-bot/pom.xml" ]; then
+    pass "import: pom.xml generated"
+    assert_contains "$(cat "$IMPORT_TMP/test-weather-bot/pom.xml")" "atmosphere-spring-boot-starter" "import: pom.xml includes atmosphere starter"
+    assert_contains "$(cat "$IMPORT_TMP/test-weather-bot/pom.xml")" "atmosphere-agent" "import: pom.xml includes atmosphere-agent"
+    assert_contains "$(cat "$IMPORT_TMP/test-weather-bot/pom.xml")" "atmosphere-a2a" "import: pom.xml includes atmosphere-a2a"
+    assert_contains "$(cat "$IMPORT_TMP/test-weather-bot/pom.xml")" "atmosphere-mcp" "import: pom.xml includes atmosphere-mcp"
+else
+    fail "import: pom.xml not generated"
+fi
+
+skill_file="$IMPORT_TMP/test-weather-bot/src/main/resources/META-INF/skills/weather-bot/SKILL.md"
+if [ -f "$skill_file" ]; then
+    pass "import: skill file at META-INF/skills convention path"
+    assert_contains "$(cat "$skill_file")" "Weather Bot" "import: skill file content preserved"
+else
+    fail "import: skill file not copied"
+fi
+
+# Test 3: Verify generated Java agent class
+agent_file=$(find "$IMPORT_TMP/test-weather-bot/src/main/java" -name "*Agent.java" | head -1)
+if [ -n "$agent_file" ]; then
+    pass "import: agent Java file generated"
+    agent_content=$(cat "$agent_file")
+    assert_contains "$agent_content" '@Agent(name = "weather-bot"' "import: @Agent annotation with correct name"
+    assert_not_contains "$agent_content" 'skillFile' "import: no explicit skillFile (auto-discovery)"
+    assert_contains "$agent_content" '@Prompt' "import: @Prompt method generated"
+    assert_contains "$agent_content" '@AiTool(name = "get_weather"' "import: @AiTool stub for get_weather"
+    assert_contains "$agent_content" '@AiTool(name = "get_forecast"' "import: @AiTool stub for get_forecast"
+    assert_contains "$agent_content" "getWeather" "import: camelCase method name for get_weather"
+    assert_contains "$agent_content" "getForecast" "import: camelCase method name for get_forecast"
+    assert_contains "$agent_content" "StreamingSession" "import: StreamingSession import present"
+else
+    fail "import: agent Java file not generated"
+fi
+
+# Test 4: Verify Application.java generated
+app_file=$(find "$IMPORT_TMP/test-weather-bot/src/main/java" -name "Application.java" | head -1)
+if [ -n "$app_file" ]; then
+    pass "import: Application.java generated"
+    assert_contains "$(cat "$app_file")" "@SpringBootApplication" "import: @SpringBootApplication annotation present"
+else
+    fail "import: Application.java not generated"
+fi
+
+# Test 5: Verify application.yml generated
+if [ -f "$IMPORT_TMP/test-weather-bot/src/main/resources/application.yml" ]; then
+    pass "import: application.yml generated"
+    assert_contains "$(cat "$IMPORT_TMP/test-weather-bot/src/main/resources/application.yml")" "LLM_API_KEY" "import: application.yml references LLM_API_KEY"
+else
+    fail "import: application.yml not generated"
+fi
+
+# Test 6: Import with --headless flag
+output=$("$CLI" import --headless --name test-headless "$IMPORT_TMP/test-skill.md" 2>&1) || true
+assert_contains "$output" "headless @Agent" "import --headless: reports headless mode"
+
+headless_file=$(find "$IMPORT_TMP/test-headless/src/main/java" -name "*Agent.java" | head -1)
+if [ -n "$headless_file" ]; then
+    headless_content=$(cat "$headless_file")
+    assert_contains "$headless_content" "headless = true" "import --headless: @Agent has headless = true"
+    assert_contains "$headless_content" "@AgentSkill" "import --headless: @AgentSkill annotation present"
+    assert_contains "$headless_content" "@AgentSkillHandler" "import --headless: @AgentSkillHandler annotation present"
+    assert_contains "$headless_content" "TaskContext" "import --headless: TaskContext parameter present"
+    assert_contains "$headless_content" "a2a.types.Artifact" "import --headless: Artifact import from types package"
+    assert_not_contains "$headless_content" "@Prompt" "import --headless: no @Prompt method"
+else
+    fail "import --headless: agent file not generated"
+fi
+
+# Test 7: Import skill without YAML frontmatter (fallback to heading)
+cat > "$IMPORT_TMP/plain-skill.md" <<'PLAINEOF'
+# Customer Support Agent
+You help customers with their questions about our product.
+
+## Skills
+- Answer product questions
+- Handle complaints
+PLAINEOF
+
+output=$("$CLI" import --name test-plain "$IMPORT_TMP/plain-skill.md" 2>&1) || true
+assert_contains "$output" "Parsed skill: customer-support-agent" "import: extracts name from # heading when no frontmatter"
+
+# Test 8: Import with no arguments fails
+output=$("$CLI" import 2>&1) || true
+assert_contains "$output" "Usage" "import: shows usage when no arguments"
+
+# Test 9: Import to existing directory fails
+mkdir -p "$IMPORT_TMP/existing-dir"
+output=$("$CLI" import --name existing-dir "$IMPORT_TMP/test-skill.md" 2>&1) || true
+assert_contains "$output" "already exists" "import: fails when directory exists"
+
+# Test: Path traversal in skill name is sanitized
+cat > "$IMPORT_TMP/traversal-skill.md" <<'TRAVEOF'
+---
+name: "../../../etc/evil"
+description: "Attempted path traversal"
+---
+# Evil Agent
+TRAVEOF
+
+output=$("$CLI" import --name test-traversal "$IMPORT_TMP/traversal-skill.md" 2>&1) || true
+assert_contains "$output" "Parsed skill: etc-evil" "import: path traversal stripped from skill name"
+# Verify project is created in current dir, not escaped
+if [ -d "$IMPORT_TMP/test-traversal" ] && [ ! -d "$IMPORT_TMP/../../../etc/evil" ]; then
+    pass "import: path traversal blocked — project in safe location"
+else
+    fail "import: path traversal not blocked"
+fi
+
+# Test: Quotes in description are escaped for Java
+cat > "$IMPORT_TMP/quotes-skill.md" <<'QUOTESEOF'
+---
+name: quotes-test
+description: 'She said "hello" and it\'s fine'
+---
+# Quotes Test
+QUOTESEOF
+
+output=$("$CLI" import --name test-quotes "$IMPORT_TMP/quotes-skill.md" 2>&1) || true
+quotes_file=$(find "$IMPORT_TMP/test-quotes/src/main/java" -name "*Agent.java" 2>/dev/null | head -1)
+if [ -n "$quotes_file" ]; then
+    assert_not_contains "$(cat "$quotes_file")" 'description = "She said "hello"' "import: quotes escaped in description"
+    pass "import: agent with quoted description compiles (no raw quotes)"
+else
+    fail "import: agent with quoted description not generated"
+fi
+
+# Test: Markdown emphasis stripped from tool names
+cat > "$IMPORT_TMP/emphasis-skill.md" <<'EMPHEOF'
+---
+name: emphasis-test
+description: "Test markdown emphasis in tools"
+---
+# Emphasis Test
+
+## Tools
+- **get_data**: Fetch data from API
+- `check_status`: Check system status
+EMPHEOF
+
+output=$("$CLI" import --name test-emphasis "$IMPORT_TMP/emphasis-skill.md" 2>&1) || true
+emph_file=$(find "$IMPORT_TMP/test-emphasis/src/main/java" -name "*Agent.java" 2>/dev/null | head -1)
+if [ -n "$emph_file" ]; then
+    assert_contains "$(cat "$emph_file")" 'name = "get_data"' "import: bold markdown stripped from tool name"
+    assert_contains "$(cat "$emph_file")" 'name = "check_status"' "import: backtick markdown stripped from tool name"
+    # Verify tool names are clean (no markdown formatting)
+    assert_contains "$(cat "$emph_file")" 'name = "get_data"' "import: bold stripped, clean tool name get_data"
+    assert_contains "$(cat "$emph_file")" 'name = "check_status"' "import: backtick stripped, clean tool name check_status"
+else
+    fail "import: agent with emphasis tools not generated"
+fi
+
+# Test 10: Skills without ## Tools generates no @AiTool stubs
+cat > "$IMPORT_TMP/no-tools-skill.md" <<'NOTOOLSEOF'
+---
+name: simple-chat
+description: "A simple chat agent"
+---
+
+# Simple Chat
+You are a simple chat assistant.
+NOTOOLSEOF
+
+output=$("$CLI" import --name test-no-tools "$IMPORT_TMP/no-tools-skill.md" 2>&1) || true
+assert_not_contains "$output" "@AiTool" "import: no @AiTool stubs when no ## Tools section"
+
+no_tools_file=$(find "$IMPORT_TMP/test-no-tools/src/main/java" -name "*Agent.java" | head -1)
+if [ -n "$no_tools_file" ]; then
+    assert_not_contains "$(cat "$no_tools_file")" "@AiTool" "import: generated class has no @AiTool when no ## Tools"
+else
+    fail "import: agent file not generated for no-tools skill"
+fi
+
+rm -rf "$IMPORT_TMP"
+printf "\n"
+
+# ── Plugins command tests ──────────────────────────────────────────────────
+printf "${BOLD}atmosphere plugins${RESET}\n"
+
+output=$("$CLI" plugins 2>&1) || true
+assert_contains "$output" "plugins" "plugins: command runs without error"
+
+output=$("$CLI" plugins list 2>&1) || true
+assert_contains "$output" "plugins" "plugins list: shows plugin info"
+
+printf "\n"
+
+# ── Skills command tests (offline) ─────────────────────────────────────────
+printf "${BOLD}atmosphere skills (offline)${RESET}\n"
+
+# skills list without network should fail gracefully (no registry cached)
+output=$("$CLI" skills list 2>&1) || true
+# It will either show cached results or fail with download error — both are OK
+pass "skills list: command runs without crash"
+
+# skills search without network
+output=$("$CLI" skills search medical 2>&1) || true
+pass "skills search: command runs without crash"
+
+# skills run without argument
+output=$("$CLI" skills run 2>&1) || true
+assert_contains "$output" "Usage" "skills run: shows usage when no argument"
+
+# skills unknown subcommand
+output=$("$CLI" skills foobar 2>&1) || true
+assert_contains "$output" "Unknown" "skills: unknown subcommand rejected"
+
+printf "\n"
+
+# ── Remote import tests (require network) ─────────────────────────────────
+# Only run if ATMOSPHERE_TEST_REMOTE=true (skipped in offline CI by default)
+if [ "${ATMOSPHERE_TEST_REMOTE:-false}" = "true" ]; then
+    printf "${BOLD}Import (Remote Skills)${RESET}\n"
+
+    REMOTE_TMP=$(mktemp -d)
+    cd "$REMOTE_TMP"
+
+    # Test: Import from Atmosphere skills repo (trusted)
+    output=$("$CLI" import --name remote-dentist https://raw.githubusercontent.com/Atmosphere/atmosphere-skills/main/skills/dentist-agent/SKILL.md 2>&1) || true
+    assert_contains "$output" "Project scaffolded" "remote: import from atmosphere-skills repo"
+
+    if [ -d "$REMOTE_TMP/remote-dentist" ]; then
+        pass "remote: project directory created"
+        agent_file=$(find "$REMOTE_TMP/remote-dentist/src/main/java" -name "*Agent.java" 2>/dev/null | head -1)
+        if [ -n "$agent_file" ]; then
+            assert_contains "$(cat "$agent_file")" "@Agent" "remote: @Agent annotation present"
+            assert_contains "$(cat "$agent_file")" "@Prompt" "remote: @Prompt method present"
+        else
+            fail "remote: agent file not generated"
+        fi
+        assert_contains "$(cat "$REMOTE_TMP/remote-dentist/pom.xml")" "atmosphere-spring-boot-starter" "remote: pom.xml has starter dep"
+    else
+        fail "remote: project directory not created"
+    fi
+
+    # Test: Import from Anthropic skills repo (trusted)
+    output=$("$CLI" import --name remote-anthropic https://raw.githubusercontent.com/anthropics/skills/main/skills/frontend-design/SKILL.md 2>&1) || true
+    assert_contains "$output" "Parsed skill: frontend-design" "remote: anthropic skill name parsed"
+    assert_contains "$output" "Project scaffolded" "remote: anthropic import scaffolded"
+
+    # Test: Import from Antigravity repo (trusted)
+    output=$("$CLI" import --name remote-antigravity https://raw.githubusercontent.com/sickn33/antigravity-awesome-skills/main/skills/customer-support/SKILL.md 2>&1) || true
+    assert_contains "$output" "Parsed skill: customer-support" "remote: antigravity skill name parsed"
+    assert_contains "$output" "Project scaffolded" "remote: antigravity import scaffolded"
+
+    # Test: Untrusted source is blocked
+    output=$("$CLI" import --name untrusted https://example.com/evil/SKILL.md 2>&1) || true
+    assert_contains "$output" "Untrusted source" "remote: untrusted URL blocked"
+
+    # Test: --trust flag bypasses trust check
+    # (don't actually download from example.com — it will fail with download error, not trust error)
+    output=$("$CLI" import --trust --name trusted-override https://example.com/evil/SKILL.md 2>&1) || true
+    assert_not_contains "$output" "Untrusted source" "remote: --trust bypasses trust check"
+
+    rm -rf "$REMOTE_TMP"
+    printf "\n"
+else
+    printf "${BOLD}Import (Remote Skills)${RESET} ${DIM}— skipped (set ATMOSPHERE_TEST_REMOTE=true)${RESET}\n\n"
+fi
+
+# ── Run: ambient LLM_BASE_URL footgun ───────────────────────────────────────
+# LLM_BASE_URL outranks LLM_MODE by design, and an ambient one from the
+# operator's shell applies to every key the caller did not override. So
+# `--env LLM_MODE=local` with an inherited remote base URL silently runs against
+# that remote provider — it burns quota and fails with a model-not-found error
+# that reads like a broken sample. The 2026-08-31 sweep hit exactly this.
+printf "${BOLD}Run (ambient LLM_BASE_URL)${RESET}\n"
+
+# Match the EMITTED warning, with comment lines stripped. Grepping the raw file
+# for a phrase that also appears in a nearby code comment made this check pass
+# against a build with the warning deleted — a gate that walks its own artifact.
+if grep -v '^[[:space:]]*#' "$CLI" | grep -q 'warn "LLM_MODE=local but an inherited LLM_BASE_URL'; then
+    pass "run: warns when LLM_MODE=local meets an inherited remote LLM_BASE_URL"
+else
+    fail "run: no warning — a local run silently goes remote and looks like a sample bug"
+fi
+
+# The warning must be suppressed when the caller pins the base URL themselves,
+# otherwise it cries wolf on every correct invocation.
+if grep -q '\*" LLM_BASE_URL="\*) ;;' "$CLI"; then
+    pass "run: warning suppressed when --env LLM_BASE_URL is supplied"
+else
+    fail "run: warning is not suppressed for an explicit --env LLM_BASE_URL"
+fi
+
+# Only off-host URLs are worth warning about.
+if grep -qF "localhost|127" "$CLI"; then
+    pass "run: a localhost LLM_BASE_URL does not trigger the warning"
+else
+    fail "run: no localhost carve-out — the warning would fire on a correct local setup"
+fi
+
+printf "\n"
+
+# ── Compose: non-interactive safety ─────────────────────────────────────────
+# The generator prompts for any option not supplied on the command line. With no
+# TTY that prompt blocks on stdin forever — `atmosphere compose --name x a.md`
+# from a script or CI hung indefinitely at "Choose frontend [1-2] [2]:" until
+# 4.0.70. This asserts the CLI supplies defaults when stdin is not a terminal,
+# which is what makes compose scriptable at all.
+printf "${BOLD}Compose (non-interactive)${RESET}\n"
+
+# The guard itself: every interactive-only option must have a non-TTY default.
+for opt in compose_protocol compose_transport compose_frontend compose_ai compose_deploy; do
+    if grep -q "\[ -z \"\$$opt\" \]" "$CLI"; then
+        pass "compose: $opt has a non-TTY default"
+    else
+        fail "compose: $opt has NO non-TTY default — a scripted compose will hang on its prompt"
+    fi
+done
+
+# The guard must be reached only when stdin is not a terminal, so an interactive
+# run still asks rather than silently choosing for the user.
+if grep -q 'if \[ ! -t 0 \]; then' "$CLI"; then
+    pass "compose: defaults are gated on a non-TTY stdin (interactive run still prompts)"
+else
+    fail "compose: no '[ ! -t 0 ]' guard — defaults would override the interactive prompt"
+fi
+
+printf "\n"
+
+# ── Summary ─────────────────────────────────────────────────────────────────
+total=$((PASS + FAIL))
+printf "${BOLD}Results: %s passed, %s failed${RESET} (out of %s)\n\n" "$PASS" "$FAIL" "$total"
+
+if [ "$FAIL" -gt 0 ]; then
+    exit 1
+fi

@@ -1,0 +1,318 @@
+/*
+ * Copyright 2008-2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package org.atmosphere.cpr;
+
+import org.atmosphere.util.DefaultEndpointMapper;
+import org.atmosphere.util.EndpointMapper;
+
+import jakarta.servlet.ServletConfig;
+import jakarta.servlet.ServletContext;
+import jakarta.servlet.ServletException;
+import java.io.IOException;
+import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.Map;
+
+import static org.mockito.Mockito.mock;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.fail;
+
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+public class UrlMappingTest {
+
+    private AtmosphereFramework framework;
+    private AtmosphereConfig config;
+    private AsynchronousProcessor processor;
+    private final AtmosphereHandler handler = mock(AtmosphereHandler.class);
+
+    @BeforeEach
+    public void create() throws Throwable {
+        framework = new AtmosphereFramework();
+        framework.setAsyncSupport(mock(AsyncSupport.class));
+        framework.init(new ServletConfig() {
+            @Override
+            public String getServletName() {
+                return "void";
+            }
+
+            @Override
+            public ServletContext getServletContext() {
+                return mock(ServletContext.class);
+            }
+
+            @Override
+            public String getInitParameter(String name) {
+                return null;
+            }
+
+            @Override
+            public Enumeration<String> getInitParameterNames() {
+                return null;
+            }
+        });
+        config = framework.getAtmosphereConfig();
+        processor = new AsynchronousProcessor(config) {
+            @Override
+            public Action service(AtmosphereRequest req, AtmosphereResponse res) throws IOException, ServletException {
+                return new Action(Action.TYPE.CREATED);
+            }
+        };
+    }
+
+    @AfterEach
+    public void unSet() throws Exception {
+        framework.destroy();
+    }
+
+    @Test
+    public void mathTest() throws ServletException {
+        EndpointMapper<String> mapper = new DefaultEndpointMapper<String>();
+
+        Map<String,String> mappingPoints = new HashMap<String, String>();
+
+        mappingPoints.put("/c", "/c");
+        mappingPoints.put("/{a}/{b}", "/{a}/{b}");
+
+        assertEquals(mapper.map("/c", mappingPoints), "/c");
+    }
+
+    @Test
+    public void mappingTest1() throws ServletException {
+        framework.addAtmosphereHandler("/a/", handler);
+        framework.addAtmosphereHandler("/a", handler);
+        framework.addAtmosphereHandler("/ab/", handler);
+        framework.addAtmosphereHandler("/abc/", handler);
+        framework.addAtmosphereHandler("/a/b", handler);
+        framework.addAtmosphereHandler("/a/b/", handler);
+        framework.addAtmosphereHandler("/a/b/c", handler);
+        framework.addAtmosphereHandler("/", handler);
+
+        AtmosphereRequest r = new AtmosphereRequestImpl.Builder().pathInfo("/a").build();
+        assertNotNull(processor.map(r));
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/a/").build();
+        assertNotNull(processor.map(r));
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/a").build();
+        assertNotNull(processor.map(r));
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/ab/").build();
+        assertNotNull(processor.map(r));
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/abc/").build();
+        assertNotNull(processor.map(r));
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/a/b").build();
+        assertNotNull(processor.map(r));
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/a/b/").build();
+        assertNotNull(processor.map(r));
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/a/b/c").build();
+        assertNotNull(processor.map(r));
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/").build();
+        assertNotNull(processor.map(r));
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/c").build();
+        try {
+            processor.map(r);
+        } catch (AtmosphereMappingException e) {
+            assertNotNull(e);
+        }
+    }
+
+    @Test
+    public void mappingTestServletPath() throws ServletException {
+        framework.addAtmosphereHandler("/com.zyxabc.abc.Abc/gwtCometEvent*", handler);
+
+        AtmosphereRequest r = new AtmosphereRequestImpl.Builder().servletPath("/com.zyxabc.abc.Abc/gwtCometEvent").build();
+        assertNotNull(processor.map(r));
+    }
+
+    @Test
+    public void mappingExactUrl() throws ServletException {
+        framework.addAtmosphereHandler("/foo/a/", handler);
+
+        AtmosphereRequest r = new AtmosphereRequestImpl.Builder().servletPath("/foo").pathInfo("/a").build();
+        assertNotNull(processor.map(r));
+    }
+
+    @Test
+    public void mappingSubWildcardPath() throws ServletException {
+        framework.addAtmosphereHandler("/foo/*", handler);
+
+        AtmosphereRequest r = new AtmosphereRequestImpl.Builder().servletPath("/foo").pathInfo("/a").build();
+        assertNotNull(processor.map(r));
+
+        r = new AtmosphereRequestImpl.Builder().servletPath("/foo").pathInfo("/a/b/c/d/////").build();
+        assertNotNull(processor.map(r));
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/a/b/c/d/////").build();
+        try {
+            assertNotNull(processor.map(r));
+        } catch (AtmosphereMappingException e) {
+            assertNotNull(e);
+        }
+    }
+
+    @Test
+    public void unmappedPathReturns404FromAction() throws Exception {
+        // Regression: an unmapped /atmosphere/* path used to escape from
+        // AsynchronousProcessor.action() as a raw AtmosphereMappingException,
+        // which Undertow / Tomcat translated to HTTP 500 with a stack-trace
+        // page. Per Correctness Invariant #4 the wire boundary must return
+        // 404 for unknown user input. Stale browser tabs reconnecting to
+        // ports owned by a different sample (the common case) trip this.
+        framework.addAtmosphereHandler("/atmosphere/chat", handler);
+
+        AtmosphereRequest req = new AtmosphereRequestImpl.Builder()
+                .pathInfo("/atmosphere/ai-chat")
+                .build();
+        AtmosphereResponse res = AtmosphereResponseImpl.newInstance();
+        Action result = processor.action(req, res);
+
+        assertNotNull(result, "action() must complete the response, not propagate the exception");
+        assertEquals(404, res.getStatus(),
+                "Unmapped /atmosphere/* path must return 404, not 500");
+        assertNotNull(res.getHeader(HeaderConfig.X_ATMOSPHERE_ERROR),
+                "404 response must carry X-Atmosphere-error explaining the miss");
+        // The header must not reflect the internal mapping-failure detail (which
+        // echoes the caller's request URI) — it carries a generic value only.
+        assertEquals("Not Found", res.getHeader(HeaderConfig.X_ATMOSPHERE_ERROR),
+                "X-Atmosphere-error must not leak the request path / internal detail");
+    }
+
+    @Test
+    public void mappingDotWildcard() throws ServletException {
+        framework.addAtmosphereHandler("/*", handler);
+
+        AtmosphereRequest r = new AtmosphereRequestImpl.Builder().pathInfo("/a.b/b").build();
+        assertNotNull(processor.map(r));
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/a/1.2").build();
+        assertNotNull(processor.map(r));
+    }
+
+    @Test
+    public void mappingWildcardPath() throws ServletException {
+        framework.addAtmosphereHandler("/*", handler);
+
+        AtmosphereRequest r = new AtmosphereRequestImpl.Builder().servletPath("/foo").pathInfo("/a").build();
+        assertNotNull(processor.map(r));
+
+        r = new AtmosphereRequestImpl.Builder().servletPath("/foo").pathInfo("/a/b/c/d/////").build();
+        assertNotNull(processor.map(r));
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/a/b/c/d/////").build();
+        assertNotNull(processor.map(r));
+    }
+
+    @Test
+    public void mappingTestTraillingHandler() throws ServletException {
+        // servlet-mapping : /a/*
+        framework.addAtmosphereHandler("/a", handler);
+
+        AtmosphereRequest r = new AtmosphereRequestImpl.Builder().pathInfo("/a/").build();
+        assertNotNull(processor.map(r));
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/a/1").build();
+        assertNotNull(processor.map(r));
+    }
+
+    @Test
+    public void batchMappingTest() throws ServletException {
+        framework.addAtmosphereHandler("/", new AH("/"));
+        framework.addAtmosphereHandler("/red", new AH("red"));
+        framework.addAtmosphereHandler("/red/*", new AH("red"));
+        framework.addAtmosphereHandler("/red/red/*", new AH("redred"));
+        framework.addAtmosphereHandler("/red/blue/*", new AH("redblue"));
+        framework.addAtmosphereHandler("/blue/*", new AH("blue"));
+        framework.addAtmosphereHandler("/blue/blue/*", new AH("blueblue"));
+
+        AtmosphereRequest r = new AtmosphereRequestImpl.Builder().pathInfo("/").build();
+        assertEquals("/", processor.map(r).atmosphereHandler().toString());
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/red").build();
+        assertEquals("red", processor.map(r).atmosphereHandler().toString());
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/red/1").build();
+        assertEquals("red", processor.map(r).atmosphereHandler().toString());
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/red/red").build();
+        assertEquals("red", processor.map(r).atmosphereHandler().toString());
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/red/red/1").build();
+        assertEquals("redred", processor.map(r).atmosphereHandler().toString());
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/red/blue/").build();
+        assertEquals("redblue", processor.map(r).atmosphereHandler().toString());
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/red/blue/1").build();
+        assertEquals("redblue", processor.map(r).atmosphereHandler().toString());
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/blue").build();
+        assertEquals("/", processor.map(r).atmosphereHandler().toString());
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/blue/blue").build();
+        assertEquals("blue", processor.map(r).atmosphereHandler().toString());
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/blue/blue/white").build();
+        assertEquals("blueblue", processor.map(r).atmosphereHandler().toString());
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/green").build();
+        assertEquals("/", processor.map(r).atmosphereHandler().toString());
+
+        framework.removeAtmosphereHandler("/");
+
+        r = new AtmosphereRequestImpl.Builder().pathInfo("/green").build();
+        try {
+            processor.map(r);
+            fail();
+        } catch (AtmosphereMappingException e) {
+            assertNotNull(e);
+        }
+    }
+
+    public final static class AH implements AtmosphereHandler {
+
+        private final String name;
+
+        public AH(String name) {
+            this.name = name;
+        }
+
+        public String toString() {
+            return name;
+        }
+
+        @Override
+        public void onRequest(AtmosphereResource resource) throws IOException {
+        }
+
+        @Override
+        public void onStateChange(AtmosphereResourceEvent event) throws IOException {
+        }
+
+        @Override
+        public void destroy() {
+        }
+    }
+}
