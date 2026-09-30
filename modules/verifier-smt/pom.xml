@@ -16,7 +16,7 @@
 
     <properties>
         <atmosphere.module.name>org.atmosphere.verifier.smt</atmosphere.module.name>
-        <javasmt.version>5.0.1</javasmt.version>
+        <javasmt.version>6.0.0</javasmt.version>
     </properties>
 
     <dependencies>
